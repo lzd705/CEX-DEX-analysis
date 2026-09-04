@@ -152,6 +152,17 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
             "route_cohort_id": COHORT_ID,
             "manifest_sha256": CORE_MANIFEST_SHA256,
         }
+        self.attach_typed = patch.object(
+            runner,
+            "attach_typed_source_lineage",
+            create=True,
+            side_effect=lambda cohort, **_kwargs: (
+                cohort,
+                {"typed_source_manifest_sha256": "d" * 64},
+            ),
+        )
+        self.attach_typed_mock = self.attach_typed.start()
+        self.addCleanup(self.attach_typed.stop)
 
     def _patch_happy_path(self, events):
         def build():
@@ -182,6 +193,14 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
             self.assertEqual(kwargs["core_root"], self.data_dir / "routes/core")
             return self.core_pointer
 
+        def attach(cohort, **kwargs):
+            events.append("attach_typed_source_lineage")
+            self.assertEqual(cohort, _cohort())
+            self.assertEqual(
+                kwargs, {"raw_root": self.data_dir / "raw/route-cohort"}
+            )
+            return cohort, {"typed_source_manifest_sha256": "d" * 64}
+
         def finalize(**kwargs):
             events.append("finalize_public_cex_research_opportunities")
             validator = kwargs.pop("_postcommit_validator")
@@ -204,6 +223,11 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
         return (
             patch.object(runner, "build_live_cex_research_universe", side_effect=build),
             patch.object(runner, "collect_route_cohort", side_effect=collect),
+            patch.object(
+                runner,
+                "attach_typed_source_lineage",
+                side_effect=attach,
+            ),
             patch.object(runner, "publish_route_cohort_bundle", side_effect=publish),
             patch.object(
                 runner,
@@ -216,7 +240,8 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
     def test_exact_pipeline_order_identity_binding_and_minimal_receipt(self):
         events = []
         patches = self._patch_happy_path(events)
-        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        with patches[0], patches[1], patches[2], \
+                patches[3], patches[4], patches[5]:
             receipt = runner.collect_and_publish_live_cex_research(
                 data_dir=self.data_dir,
                 public_fee_schedule_path=self.schedule,
@@ -227,6 +252,7 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
         self.assertEqual(events, [
             "build fixed universe",
             "collect_route_cohort",
+            "attach_typed_source_lineage",
             "publish_route_cohort_bundle",
             "finalize_public_cex_research_opportunities",
             "load_latest_complete_route_bundle",
@@ -242,6 +268,63 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
             "strict_eligible_count": 0,
             "served": False,
         })
+
+    def test_typed_lineage_attachment_failure_never_publishes(self):
+        with patch.object(
+            runner,
+            "build_live_cex_research_universe",
+            return_value=self.universe,
+        ), patch.object(
+            runner, "collect_route_cohort", return_value=_cohort(),
+        ), patch.object(
+            runner,
+            "attach_typed_source_lineage",
+            side_effect=ValueError("invalid typed evidence"),
+        ), patch.object(
+            runner, "publish_route_cohort_bundle"
+        ) as publish:
+            with self.assertRaisesRegex(
+                runner.LiveCexOpportunityRefreshError,
+                "collection_failed",
+            ):
+                runner.collect_and_publish_live_cex_research(
+                    data_dir=self.data_dir,
+                    public_fee_schedule_path=self.schedule,
+                    deadline_seconds=30,
+                    wall_clock=lambda: NOW,
+                )
+
+        publish.assert_not_called()
+
+    def test_typed_lineage_normalization_is_rechecked_before_publish(self):
+        with patch.object(
+            runner,
+            "build_live_cex_research_universe",
+            return_value=self.universe,
+        ), patch.object(
+            runner, "collect_route_cohort", return_value=_cohort(),
+        ), patch.object(
+            runner,
+            "attach_typed_source_lineage",
+            return_value=(
+                _cohort(second_status="failed"),
+                {"typed_source_manifest_sha256": "d" * 64},
+            ),
+        ), patch.object(
+            runner, "publish_route_cohort_bundle"
+        ) as publish:
+            with self.assertRaisesRegex(
+                runner.LiveCexOpportunityRefreshError,
+                "collection_failed",
+            ):
+                runner.collect_and_publish_live_cex_research(
+                    data_dir=self.data_dir,
+                    public_fee_schedule_path=self.schedule,
+                    deadline_seconds=30,
+                    wall_clock=lambda: NOW,
+                )
+
+        publish.assert_not_called()
 
     def test_incomplete_collection_never_publishes_or_finalizes(self):
         invalid_cohorts = (

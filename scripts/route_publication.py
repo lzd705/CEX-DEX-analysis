@@ -504,6 +504,13 @@ TIMING_COLUMNS = (
 _MAX_JSON_BYTES = 16 * 1024 * 1024
 _MAX_CSV_BYTES = 128 * 1024 * 1024
 _MAX_SQLITE_BYTES = 512 * 1024 * 1024
+_COLLECTOR_AUTHORITY_FILENAME = "attachment-authority.json"
+_COLLECTOR_AUTHORITY_MAX_BYTES = 40 * 1024 * 1024
+_COLLECTOR_AUTHORITY_FIELDS = frozenset({
+    "schema", "market_id", "market_type", "collection_input_generation",
+    "accepted_raw_response_sha256", "trusted_input", "collector_row",
+    "final_leg", "typed_members",
+})
 
 
 class RoutePublicationError(ValueError):
@@ -3958,14 +3965,44 @@ def _expected_complete_source_members(
 def _read_core_raw_members(
     raw_root: Path,
     cohort: Mapping[str, Any],
-) -> Dict[str, Tuple[Dict[str, Any], bytes, str]]:
+    *,
+    required_sidecar_limits: Optional[Mapping[str, int]] = None,
+    evidence_validator: Optional[
+        Callable[[str, Mapping[str, Any], bytes, str, Mapping[str, bytes]], None]
+    ] = None,
+) -> Dict[
+    str,
+    Tuple[Dict[str, Any], bytes, str, Tuple[Tuple[str, str], ...]],
+]:
+    sidecar_limits = dict(required_sidecar_limits or {})
+    if (
+        any(
+            _require_relative_basename(name, "route raw sidecar") != name
+            or name == "response.json"
+            or type(limit) is not int
+            or limit <= 0
+            for name, limit in sidecar_limits.items()
+        )
+        or bool(sidecar_limits) != callable(evidence_validator)
+    ):
+        raise RoutePublicationError(
+            "route raw sidecar validation policy is invalid"
+        )
     raw, raw_fd, raw_details = _open_verified_directory(
         Path(raw_root),
         "route raw root",
     )
     run_fd: Optional[int] = None
     accepted_fd: Optional[int] = None
-    members: Dict[str, Tuple[Dict[str, Any], bytes, str]] = {}
+    typed_fd: Optional[int] = None
+    typed_details: Optional[os.stat_result] = None
+    typed_manifest_snapshot: Optional[Tuple[bytes, os.stat_result]] = None
+    typed_member_bytes: Dict[str, bytes] = {}
+    descriptors: Optional[Dict[str, Dict[str, Any]]] = None
+    members: Dict[
+        str,
+        Tuple[Dict[str, Any], bytes, str, Tuple[Tuple[str, str], ...]],
+    ] = {}
     try:
         run_name = _require_relative_basename(
             str(cohort["raw_evidence_run_id"]),
@@ -3981,6 +4018,71 @@ def _read_core_raw_members(
             "accepted",
             "route accepted raw root",
         )
+        if sidecar_limits:
+            descriptors = _typed_source_descriptors_by_filename(cohort)
+            if descriptors is None:
+                raise RoutePublicationError(
+                    "route typed-source manifest requires core lineage"
+                )
+            expected_manifest_members = sorted(
+                descriptors.values(),
+                key=lambda row: (row["market_id"], row["role"]),
+            )
+            (
+                typed_manifest,
+                typed_manifest_bytes,
+                _typed_manifest_sha256,
+                typed_manifest_details,
+            ) = _read_canonical_object_at(
+                run_fd,
+                "typed-manifest.json",
+                limit=_MAX_JSON_BYTES,
+                label="route typed-source manifest",
+            )
+            if (
+                set(typed_manifest) != TYPED_SOURCE_MANIFEST_FIELDS
+                or typed_manifest.get("schema")
+                != TYPED_SOURCE_MANIFEST_SCHEMA
+                or typed_manifest.get("raw_evidence_run_id") != run_name
+                or type(typed_manifest.get("member_count")) is not int
+                or typed_manifest.get("member_count")
+                != len(expected_manifest_members)
+                or typed_manifest.get("members")
+                != expected_manifest_members
+            ):
+                raise RoutePublicationError(
+                    "route typed-source manifest differs from core lineage"
+                )
+            typed_manifest_snapshot = (
+                typed_manifest_bytes, typed_manifest_details
+            )
+            typed_fd, typed_details = _open_directory_at(
+                run_fd,
+                "typed",
+                "route typed-source root",
+            )
+            if set(os.listdir(typed_fd)) != set(descriptors):
+                raise RoutePublicationError(
+                    "route typed-source member inventory is invalid"
+                )
+            for filename, descriptor in descriptors.items():
+                member_bytes, member_sha256, _member_details = (
+                    _read_bounded_bytes_at(
+                        typed_fd,
+                        filename,
+                        limit=_MAX_JSON_BYTES,
+                        label="route typed-source member",
+                    )
+                )
+                if (
+                    len(member_bytes) != descriptor["size"]
+                    or member_sha256 != descriptor["sha256"]
+                ):
+                    raise RoutePublicationError(
+                        "route typed-source member differs from core lineage"
+                    )
+                if descriptor["role"] == "cex_raw_book_response":
+                    typed_member_bytes[filename] = member_bytes
         for leg in cohort["legs"]:
             if leg.get("status") not in {"observed", "partial"}:
                 continue
@@ -3992,7 +4094,17 @@ def _read_core_raw_members(
                 "route raw market member",
             )
             try:
-                if set(os.listdir(member_fd)) != {"response.json"}:
+                inventory = set(os.listdir(member_fd))
+                strict_inventory = {"response.json"}.union(sidecar_limits)
+                legacy_inventories = (
+                    {"response.json"},
+                    {"response.json", _COLLECTOR_AUTHORITY_FILENAME},
+                )
+                if (
+                    sidecar_limits and inventory != strict_inventory
+                ) or (
+                    not sidecar_limits and inventory not in legacy_inventories
+                ):
                     raise RoutePublicationError(
                         "route raw market member inventory is invalid"
                     )
@@ -4010,7 +4122,90 @@ def _read_core_raw_members(
                     value,
                     label="route raw response",
                 )
-                members[market_id] = (payload, value, physical_sha256)
+                sidecars: Dict[str, bytes] = {}
+                if sidecar_limits:
+                    sidecars = {
+                        name: _read_bounded_bytes_at(
+                            member_fd,
+                            name,
+                            limit=sidecar_limits[name],
+                            label="route raw sidecar",
+                        )[0]
+                        for name in sorted(sidecar_limits)
+                    }
+                elif _COLLECTOR_AUTHORITY_FILENAME in inventory:
+                    (
+                        authority,
+                        authority_bytes,
+                        _authority_sha256,
+                        _authority_details,
+                    ) = _read_canonical_object_at(
+                        member_fd,
+                        _COLLECTOR_AUTHORITY_FILENAME,
+                        limit=_COLLECTOR_AUTHORITY_MAX_BYTES,
+                        label="route collector attachment authority",
+                    )
+                    trusted_input = authority.get("trusted_input")
+                    final_leg = authority.get("final_leg")
+                    expected_final_leg = dict(leg)
+                    expected_final_leg.pop("typed_source_lineage", None)
+                    if (
+                        set(authority) != _COLLECTOR_AUTHORITY_FIELDS
+                        or authority.get("schema")
+                        != "route_attachment_authority/v1"
+                        or authority.get("market_id") != market_id
+                        or authority.get("market_type")
+                        != leg.get("market_type")
+                        or authority.get("collection_input_generation")
+                        != cohort.get("collection_input_generation")
+                        or authority.get("accepted_raw_response_sha256")
+                        != physical_sha256
+                        or not isinstance(trusted_input, Mapping)
+                        or trusted_input.get("candidate_source_generation")
+                        != cohort.get("candidate_source_generation")
+                        or not isinstance(final_leg, Mapping)
+                        or dict(final_leg) != expected_final_leg
+                    ):
+                        raise RoutePublicationError(
+                            "route collector attachment authority is invalid"
+                        )
+                    sidecars = {
+                        _COLLECTOR_AUTHORITY_FILENAME: authority_bytes,
+                    }
+                if evidence_validator is not None:
+                    evidence_validator(
+                        market_id,
+                        leg,
+                        value,
+                        physical_sha256,
+                        sidecars,
+                    )
+                if descriptors is not None and leg.get("market_type") == "cex":
+                    raw_descriptors = [
+                        descriptor
+                        for descriptor in descriptors.values()
+                        if descriptor["market_id"] == market_id
+                        and descriptor["role"] == "cex_raw_book_response"
+                    ]
+                    if (
+                        len(raw_descriptors) != 1
+                        or typed_member_bytes.get(
+                            raw_descriptors[0]["filename"]
+                        ) != value
+                    ):
+                        raise RoutePublicationError(
+                            "typed CEX raw book differs from accepted response"
+                        )
+                sidecar_fingerprint = tuple(
+                    (name, hashlib.sha256(sidecars[name]).hexdigest())
+                    for name in sorted(sidecars)
+                )
+                members[market_id] = (
+                    payload,
+                    value,
+                    physical_sha256,
+                    sidecar_fingerprint,
+                )
                 _verify_directory_entry(
                     accepted_fd,
                     entry,
@@ -4025,10 +4220,31 @@ def _read_core_raw_members(
             accepted_details,
             "route accepted raw root",
         )
+        if typed_fd is not None and typed_details is not None:
+            _verify_directory_entry(
+                run_fd,
+                "typed",
+                typed_details,
+                "route typed-source root",
+            )
+        if typed_manifest_snapshot is not None and not _pointer_snapshot_is_owned(
+            _optional_regular_snapshot_at(
+                run_fd,
+                "typed-manifest.json",
+                limit=_MAX_JSON_BYTES,
+                label="route typed-source manifest",
+            ),
+            typed_manifest_snapshot,
+        ):
+            raise RoutePublicationError(
+                "route typed-source manifest changed during validation"
+            )
         _verify_directory_entry(raw_fd, run_name, run_details, "route raw run")
         _verify_open_path_identity(raw, raw_details, "route raw root")
         return members
     finally:
+        if typed_fd is not None:
+            os.close(typed_fd)
         if accepted_fd is not None:
             os.close(accepted_fd)
         if run_fd is not None:
@@ -4062,7 +4278,20 @@ def _parse_cex_book_source(
         )
     except (TypeError, ValueError) as error:
         raise RoutePublicationError("typed CEX book source cannot be replayed") from error
-    observed_at = normalized.get("source_observed_at") or state_observed_at
+    source_observed_at = normalized.get("source_observed_at")
+    if source_observed_at:
+        if str(source_observed_at).endswith("Z"):
+            observed_at = _validate_timestamp(
+                source_observed_at, "typed CEX source_observed_at"
+            )
+        else:
+            source_observed_at = _validate_collector_timestamp(
+                source_observed_at, "typed CEX source_observed_at"
+            )
+            observed_at = parse_rfc3339_utc(source_observed_at).isoformat(
+            ).replace("+00:00", "Z")
+    else:
+        observed_at = state_observed_at
     observed_at = _validate_timestamp(observed_at, "typed CEX observed_at")
     market = {
         "token_symbol": instrument.split("/", 1)[0],
@@ -4235,7 +4464,12 @@ def _strict_cex_replay(
     replayed_quotes: Dict[str, QuantityQuote] = {}
     for direction in ("buy", "sell"):
         market_id = str(route[direction + "_market_id"])
-        raw_payload, raw_bytes, _raw_sha256 = raw_members[market_id]
+        (
+            raw_payload,
+            raw_bytes,
+            _raw_sha256,
+            _sidecar_fingerprint,
+        ) = raw_members[market_id]
         market, book = _parse_cex_book_source(
             raw_payload,
             raw_bytes,
@@ -4436,6 +4670,10 @@ def build_complete_route_bundle(
     fee_profile_path: Optional[Path] = None,
     fee_profile_id: Optional[str] = None,
     inventory_profile_path: Optional[Path] = None,
+    required_raw_sidecar_limits: Optional[Mapping[str, int]] = None,
+    raw_evidence_validator: Optional[
+        Callable[[str, Mapping[str, Any], bytes, str, Mapping[str, bytes]], None]
+    ] = None,
 ) -> Dict[str, Any]:
     """Replay one pinned core into a closed complete opportunity generation."""
     core, core_fd, core_details = _open_verified_directory(
@@ -4481,7 +4719,12 @@ def build_complete_route_bundle(
         if len(opportunity_now_values) != 1:
             raise RoutePublicationError("opportunity evaluation time is not exact")
         opportunity_now = next(iter(opportunity_now_values))
-        raw_members = _read_core_raw_members(raw_root, cohort)
+        raw_members = _read_core_raw_members(
+            raw_root,
+            cohort,
+            required_sidecar_limits=required_raw_sidecar_limits,
+            evidence_validator=raw_evidence_validator,
+        )
         routes_by_id = {str(row["route_id"]): row for row in cohort["routes"]}
         legs_by_market = {str(row["market_id"]): row for row in cohort["legs"]}
 
@@ -4635,7 +4878,12 @@ def build_complete_route_bundle(
         all_costs.sort(key=lambda row: (
             row["opportunity_id"], row["leg"], row["component_type"]
         ))
-        raw_members_after = _read_core_raw_members(raw_root, cohort)
+        raw_members_after = _read_core_raw_members(
+            raw_root,
+            cohort,
+            required_sidecar_limits=required_raw_sidecar_limits,
+            evidence_validator=raw_evidence_validator,
+        )
         if any(
             raw_members_after[key][1:] != value[1:]
             for key, value in raw_members.items()
@@ -6071,6 +6319,10 @@ def publish_complete_route_bundle(
     fee_profile_path: Optional[Path] = None,
     fee_profile_id: Optional[str] = None,
     inventory_profile_path: Optional[Path] = None,
+    required_raw_sidecar_limits: Optional[Mapping[str, int]] = None,
+    raw_evidence_validator: Optional[
+        Callable[[str, Mapping[str, Any], bytes, str, Mapping[str, bytes]], None]
+    ] = None,
     precommit_validator: Optional[Callable[[], None]] = None,
     postcommit_validator: Optional[
         Callable[[Mapping[str, Any]], None]
@@ -6091,6 +6343,8 @@ def publish_complete_route_bundle(
         fee_profile_path=fee_profile_path,
         fee_profile_id=fee_profile_id,
         inventory_profile_path=inventory_profile_path,
+        required_raw_sidecar_limits=required_raw_sidecar_limits,
+        raw_evidence_validator=raw_evidence_validator,
         opportunity_inputs=inputs,
     )
     bundle = _validate_complete_logical_bundle(bundle)

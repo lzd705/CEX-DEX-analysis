@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 if __package__ in {None, ""}:  # Support ``python scripts/<name>.py``.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -22,7 +22,14 @@ from scripts.cex_fee_facts import (
     collect_cex_fee_snapshot,
     load_validated_fee_profile,
 )
-from scripts.collect_route_cohort import _validated_typed_payload_inventory
+from scripts.collect_route_cohort import (
+    _ATTACHMENT_AUTHORITY_FILENAME,
+    _ATTACHMENT_AUTHORITY_MAX_BYTES,
+    _accepted_evidence_for_attachment,
+    _canonical_raw_path,
+    _validated_attachment_authority,
+    _validated_typed_payload_inventory,
+)
 from scripts.execution_cost_components import cost_component_row
 from scripts.fetch_cex_depth import (
     cex_quantity_state_id,
@@ -77,6 +84,7 @@ from scripts.route_quantity import (
     quote_v2_pool_quantity,
 )
 from scripts.route_shadow_inputs import (
+    TYPED_SOURCE_ROLE_CONTRACTS,
     TYPED_SOURCE_LINEAGE_SCHEMA_V2,
     typed_source_lineage_observed_members,
 )
@@ -270,8 +278,8 @@ def _profile_path(name: str) -> Path:
 
 def _source_members_by_market(
     cohort: Mapping[str, Any],
-) -> Dict[str, Dict[str, str]]:
-    result: Dict[str, Dict[str, str]] = {}
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    result: Dict[str, Dict[str, Dict[str, Any]]] = {}
     expected = {
         "cex_raw_book_response", "cex_market_rules", "quote_usd_conversion"
     }
@@ -284,13 +292,143 @@ def _source_members_by_market(
             raise RouteOpportunityPipelineError(
                 "CEX typed-source lineage is incomplete"
             ) from error
-        members = {row["role"]: row["filename"] for row in observed}
+        members = {row["role"]: dict(row) for row in observed}
         if set(members) != expected:
             raise RouteOpportunityPipelineError(
                 "CEX typed-source lineage is incomplete"
             )
         result[leg["market_id"]] = members
     return result
+
+
+def _hold_attachment_evidence(
+    *,
+    root: Path,
+    cohort: Mapping[str, Any],
+) -> Dict[str, Any]:
+    run_id = cohort.get("raw_evidence_run_id")
+    if not isinstance(run_id, str):
+        raise RouteOpportunityPipelineError(
+            "retained CEX attachment authority is invalid"
+        )
+    raw_run_root = _canonical_raw_path(
+        root / "raw/route-cohort"
+    ) / run_id
+    held: Dict[str, Any] = {}
+    try:
+        for leg in cohort.get("legs", ()):
+            if (
+                not isinstance(leg, Mapping)
+                or leg.get("status") not in {"observed", "partial"}
+            ):
+                continue
+            market_id = leg.get("market_id")
+            if not isinstance(market_id, str) or market_id in held:
+                raise RouteOpportunityPipelineError(
+                    "retained CEX attachment authority is invalid"
+                )
+            held[market_id] = _accepted_evidence_for_attachment(
+                raw_run_root, market_id
+            )
+        return held
+    except BaseException as error:
+        try:
+            _close_attachment_evidence_with_retry(held)
+        except BaseException:
+            pass
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, RouteOpportunityPipelineError):
+            raise
+        raise RouteOpportunityPipelineError(
+            "retained CEX attachment authority is invalid"
+        ) from error
+
+
+def _close_attachment_evidence(held: Mapping[str, Any]) -> None:
+    first_error: Optional[BaseException] = None
+    for evidence in held.values():
+        try:
+            evidence.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
+
+
+def _close_attachment_evidence_with_retry(
+    held: Mapping[str, Any],
+) -> None:
+    try:
+        _close_attachment_evidence(held)
+    except BaseException as first_error:
+        try:
+            _close_attachment_evidence(held)
+        except BaseException:
+            pass
+        raise first_error
+
+
+def _authority_lineage_projection(
+    *,
+    leg: Mapping[str, Any],
+    response_sha256: str,
+    response_size: int,
+    authority_specs: Iterable[Mapping[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    projected: Dict[str, Dict[str, Any]] = {}
+    for spec in authority_specs:
+        payload = spec.get("payload")
+        role = spec.get("role")
+        if not isinstance(payload, bytes) or not isinstance(role, str):
+            raise RouteOpportunityPipelineError(
+                "retained CEX attachment authority is invalid"
+            )
+        if role in projected:
+            raise RouteOpportunityPipelineError(
+                "retained CEX attachment authority is invalid"
+            )
+        projected[role] = {
+            "role": role,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+            "logical_generation": spec.get("logical_generation"),
+            "adapter_id": spec.get("adapter_id"),
+            "content_schema": spec.get("content_schema"),
+        }
+    raw_contract = TYPED_SOURCE_ROLE_CONTRACTS["cex_raw_book_response"]
+    projected["cex_raw_book_response"] = {
+        "role": "cex_raw_book_response",
+        "sha256": response_sha256,
+        "size": response_size,
+        "logical_generation": response_sha256,
+        "adapter_id": raw_contract["adapter_id"],
+        "content_schema": raw_contract["content_schema"],
+    }
+    try:
+        observed = typed_source_lineage_observed_members(
+            leg["typed_source_lineage"], market_type="cex"
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise RouteOpportunityPipelineError(
+            "retained CEX attachment authority is invalid"
+        ) from error
+    expected = {
+        member["role"]: {
+            key: member[key]
+            for key in (
+                "role", "sha256", "size", "logical_generation",
+                "adapter_id", "content_schema",
+            )
+        }
+        for member in observed
+    }
+    if projected != expected:
+        raise RouteOpportunityPipelineError(
+            "retained CEX authority differs from typed-source lineage"
+        )
+    return projected
 
 
 def _load_dex_sources(
@@ -578,6 +716,8 @@ def _load_cex_sources(
     cohort: Mapping[str, Any],
     source_root: Path,
     now: str,
+    required_raw_sidecar_limits: Optional[Mapping[str, int]] = None,
+    raw_evidence_validator: Optional[Callable[..., None]] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     members_by_market = _source_members_by_market(cohort)
     legs_by_market = {row["market_id"]: row for row in cohort["legs"]}
@@ -586,7 +726,10 @@ def _load_cex_sources(
 
     try:
         raw_members = _read_core_raw_members(
-            root / "raw/route-cohort", cohort
+            root / "raw/route-cohort",
+            cohort,
+            required_sidecar_limits=required_raw_sidecar_limits,
+            evidence_validator=raw_evidence_validator,
         )
         source_path, source_fd, source_details = _open_verified_directory(
             source_root, "route typed-source root"
@@ -598,27 +741,45 @@ def _load_cex_sources(
     sources: Dict[str, Dict[str, Any]] = {}
     try:
         for market_id, leg in legs_by_market.items():
-            payload, raw_bytes, _raw_sha = raw_members[market_id]
+            payload, raw_bytes, _raw_sha, _sidecar_fingerprint = (
+                raw_members[market_id]
+            )
             market, book = _parse_cex_book_source(
                 payload,
                 raw_bytes,
                 market_id=market_id,
                 state_observed_at=leg["state_observed_at"],
             )
-            filenames = members_by_market[market_id]
+            descriptors = members_by_market[market_id]
+            rules_descriptor = descriptors["cex_market_rules"]
             rules_payload, _rules_bytes, rules_sha = _read_member_from_root(
                 source_fd,
-                filenames["cex_market_rules"],
+                rules_descriptor["filename"],
                 label="CEX market-rules source",
             )
+            if (
+                len(_rules_bytes) != rules_descriptor["size"]
+                or rules_sha != rules_descriptor["sha256"]
+            ):
+                raise RouteOpportunityPipelineError(
+                    "CEX typed-source bytes differ from lineage"
+                )
             rules = _parse_market_rules_source(
                 rules_payload, rules_sha, market_id=market_id
             )
+            usd_descriptor = descriptors["quote_usd_conversion"]
             usd_payload, _usd_bytes, usd_sha = _read_member_from_root(
                 source_fd,
-                filenames["quote_usd_conversion"],
+                usd_descriptor["filename"],
                 label="CEX USD conversion source",
             )
+            if (
+                len(_usd_bytes) != usd_descriptor["size"]
+                or usd_sha != usd_descriptor["sha256"]
+            ):
+                raise RouteOpportunityPipelineError(
+                    "CEX typed-source bytes differ from lineage"
+                )
             usd_rate = _validated_usd_source(
                 usd_payload, quote_asset=rules.quote_asset, now=now
             )
@@ -637,7 +798,10 @@ def _load_cex_sources(
                 "usd": usd_payload,
                 "usd_rate": usd_rate,
                 "usd_sha": usd_sha,
-                "filenames": filenames,
+                "filenames": {
+                    role: descriptor["filename"]
+                    for role, descriptor in descriptors.items()
+                },
             }
         _verify_open_path_identity(
             source_path,
@@ -915,6 +1079,8 @@ def _build_public_cex_research_inputs(
     cohort: Mapping[str, Any],
     core_manifest_sha256: str,
     public_fee_schedule_snapshot: _PublicFeeScheduleSnapshot,
+    required_raw_sidecar_limits: Optional[Mapping[str, int]] = None,
+    raw_evidence_validator: Optional[Callable[..., None]] = None,
 ) -> List[Dict[str, Any]]:
     """Replay one current CEX core into non-strict public research inputs."""
     root = Path(data_dir)
@@ -929,6 +1095,8 @@ def _build_public_cex_research_inputs(
             cohort=cohort,
             source_root=source_root,
             now=cohort_now,
+            required_raw_sidecar_limits=required_raw_sidecar_limits,
+            raw_evidence_validator=raw_evidence_validator,
         )
     except (KeyError, OSError, TypeError, ValueError) as error:
         if isinstance(error, RouteOpportunityPipelineError):
@@ -1979,9 +2147,10 @@ def finalize_public_cex_research_opportunities(
         leg.get("market_id"): leg.get("token_symbol")
         for leg in legs if isinstance(leg, dict)
     }
+    fixed_generation = live_cex_research_generation()
     if (
-        cohort.get("candidate_source_generation")
-        != live_cex_research_generation()
+        cohort.get("candidate_source_generation") != fixed_generation
+        or cohort.get("collection_input_generation") != fixed_generation
         or cohort.get("selection_window")
         != fixed_universe["selection_window"]
         or cohort.get("requested_notionals_usd")
@@ -2005,18 +2174,113 @@ def finalize_public_cex_research_opportunities(
             "current public CEX inputs are invalid"
         ) from error
 
-    inputs = _build_public_cex_research_inputs(
-        data_dir=root,
-        cohort=cohort,
-        core_manifest_sha256=core_manifest_sha256,
-        public_fee_schedule_snapshot=schedule_snapshot,
-    )
+    held_evidence = _hold_attachment_evidence(root=root, cohort=cohort)
+    raw_sidecar_limits = {
+        _ATTACHMENT_AUTHORITY_FILENAME: _ATTACHMENT_AUTHORITY_MAX_BYTES,
+    }
+    eligible_market_ids = {
+        leg["market_id"] for leg in legs
+        if leg.get("status") in {"observed", "partial"}
+    }
+
+    def validate_held_evidence() -> None:
+        if set(held_evidence) != eligible_market_ids:
+            raise RouteOpportunityPipelineError(
+                "retained CEX attachment authority is invalid"
+            )
+        for evidence in held_evidence.values():
+            evidence.validate()
+
+    def validate_raw_evidence(
+        market_id: str,
+        leg: Mapping[str, Any],
+        response: bytes,
+        response_sha256: str,
+        sidecars: Mapping[str, bytes],
+    ) -> None:
+        evidence = held_evidence.get(market_id)
+        if evidence is None:
+            raise RouteOpportunityPipelineError(
+                "retained CEX attachment authority is invalid"
+            )
+        evidence.validate()
+        if (
+            response != evidence.response_payload
+            or response_sha256 != evidence.response_sha256
+            or sidecars != {
+                _ATTACHMENT_AUTHORITY_FILENAME: evidence.authority_payload
+            }
+        ):
+            raise RouteOpportunityPipelineError(
+                "retained CEX attachment authority changed during read"
+            )
+        try:
+            authoritative_leg, authority_specs = (
+                _validated_attachment_authority(
+                    evidence.authority_payload,
+                    market_id=market_id,
+                    market_type="cex",
+                    accepted_raw_sha256=response_sha256,
+                    candidate_source_generation=cohort[
+                        "candidate_source_generation"
+                    ],
+                    collection_input_generation=cohort[
+                        "collection_input_generation"
+                    ],
+                )
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise RouteOpportunityPipelineError(
+                "retained CEX attachment authority is invalid"
+            ) from error
+        core_leg = dict(leg)
+        core_leg.pop("typed_source_lineage", None)
+        if authoritative_leg != core_leg:
+            raise RouteOpportunityPipelineError(
+                "retained CEX authority differs from core leg"
+            )
+        _authority_lineage_projection(
+            leg=leg,
+            response_sha256=response_sha256,
+            response_size=len(response),
+            authority_specs=authority_specs,
+        )
+        evidence.validate()
+
+    def validate_complete_raw_evidence() -> None:
+        validate_held_evidence()
+        _load_cex_sources(
+            root=root,
+            cohort=cohort,
+            source_root=source_root,
+            now=cohort["collection_completed_at"],
+            required_raw_sidecar_limits=raw_sidecar_limits,
+            raw_evidence_validator=validate_raw_evidence,
+        )
+        validate_held_evidence()
+
+    try:
+        inputs = _build_public_cex_research_inputs(
+            data_dir=root,
+            cohort=cohort,
+            core_manifest_sha256=core_manifest_sha256,
+            public_fee_schedule_snapshot=schedule_snapshot,
+            required_raw_sidecar_limits=raw_sidecar_limits,
+            raw_evidence_validator=validate_raw_evidence,
+        )
+    except BaseException:
+        try:
+            _close_attachment_evidence_with_retry(held_evidence)
+        except BaseException:
+            pass
+        raise
     source_root = (
         root / "raw/route-cohort"
         / cohort["raw_evidence_run_id"] / "typed"
     )
 
     def validate_public_inputs() -> None:
+        validate_complete_raw_evidence()
         try:
             confirmed_schedule = _load_public_fee_schedule_snapshot(
                 schedule_path,
@@ -2037,13 +2301,14 @@ def finalize_public_cex_research_opportunities(
             raise RouteOpportunityPipelineError(
                 "public CEX inputs changed before pointer commit"
             )
+        validate_complete_raw_evidence()
 
-    validate_public_inputs()
     cold_loaded: Dict[str, Any] = {}
 
     def validate_committed_public_pointer(
         committed_pointer: Mapping[str, Any],
     ) -> None:
+        validate_complete_raw_evidence()
         loaded = load_latest_complete_route_bundle(
             root / "routes",
             core_root=root / "routes/core",
@@ -2055,14 +2320,19 @@ def finalize_public_cex_research_opportunities(
         cold_loaded["pointer"] = loaded["pointer"]
         if _postcommit_validator is not None:
             _postcommit_validator(committed_pointer)
+        validate_complete_raw_evidence()
+        _close_attachment_evidence_with_retry(held_evidence)
 
     try:
+        validate_public_inputs()
         pointer = publish_complete_route_bundle(
             core_root=root / "routes/core",
             routes_root=root / "routes",
             raw_root=root / "raw/route-cohort",
             opportunity_inputs=inputs,
             source_root=source_root,
+            required_raw_sidecar_limits=raw_sidecar_limits,
+            raw_evidence_validator=validate_raw_evidence,
             precommit_validator=validate_public_inputs,
             postcommit_validator=validate_committed_public_pointer,
         )
@@ -2070,6 +2340,14 @@ def finalize_public_cex_research_opportunities(
         raise RouteOpportunityPipelineError(
             "public CEX opportunity publication failed"
         ) from error
+    finally:
+        if sys.exc_info()[0] is None:
+            _close_attachment_evidence_with_retry(held_evidence)
+        else:
+            try:
+                _close_attachment_evidence_with_retry(held_evidence)
+            except BaseException:
+                pass
     if cold_loaded.get("pointer") != pointer:
         raise RouteOpportunityPipelineError(
             "published public CEX pointer failed cold reload"

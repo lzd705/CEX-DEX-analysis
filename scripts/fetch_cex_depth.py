@@ -2054,9 +2054,7 @@ def collect_cex_market_observation(
             try:
                 if deadline is not None:
                     deadline.require_remaining()
-                conversion_observed_at = (
-                    book.get("source_observed_at") or response_received_at
-                )
+                conversion_observed_at = response_received_at
 
                 def rules_request(url: str) -> tuple[Any, bytes]:
                     if request is request_json:

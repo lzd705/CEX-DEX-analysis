@@ -22,7 +22,10 @@ if __package__ in {None, ""}:  # pragma: no cover - direct script bootstrap
         sys.path.insert(0, _PROJECT_ROOT_TEXT)
 
 try:
-    from scripts.collect_route_cohort import collect_route_cohort
+    from scripts.collect_route_cohort import (
+        attach_typed_source_lineage,
+        collect_route_cohort,
+    )
     from scripts.fetch_cex_depth import collect_cex_market_observation
     from scripts.live_cex_research import (
         LIVE_CEX_TOKEN_PAIR,
@@ -42,7 +45,10 @@ try:
         serve_current_dashboard,
     )
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
-    from collect_route_cohort import collect_route_cohort  # type: ignore
+    from collect_route_cohort import (  # type: ignore
+        attach_typed_source_lineage,
+        collect_route_cohort,
+    )
     from fetch_cex_depth import collect_cex_market_observation  # type: ignore
     from live_cex_research import (  # type: ignore
         LIVE_CEX_TOKEN_PAIR,
@@ -325,6 +331,18 @@ def collect_and_publish_live_cex_research(
             )
         ):
             raise ValueError("fixed collection is incomplete")
+        cohort, _typed_publication = attach_typed_source_lineage(
+            cohort,
+            raw_root=root / "raw/route-cohort",
+        )
+        if (
+            not isinstance(cohort, Mapping)
+            or not _collection_is_publishable(
+                cohort,
+                expected_route_ids=expected_route_ids,
+            )
+        ):
+            raise ValueError("typed collection is incomplete")
     except KeyboardInterrupt:
         raise
     except Exception as error:

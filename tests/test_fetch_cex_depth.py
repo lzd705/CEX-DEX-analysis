@@ -750,14 +750,14 @@ class FetchCexDepthTest(unittest.TestCase):
                 else:
                     self.assertEqual(typed, [])
 
-    def test_conversion_uses_the_book_source_time_when_venue_supplies_one(self):
+    def test_conversion_uses_local_receive_time_when_source_clock_is_ahead(self):
         book_raw = json.dumps({
             "retCode": 0,
             "result": {
                 "s": "UNIUSDT",
                 "b": [["99", "2"]],
                 "a": [["101", "3"]],
-                "ts": 1785585600000,
+                "ts": 1785585603000,
             },
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")
         rules_raw = json.dumps({
@@ -803,7 +803,7 @@ class FetchCexDepthTest(unittest.TestCase):
 
         conversion = json.loads(typed[1]["payload"].decode("utf-8"))
         self.assertEqual(
-            conversion["observed_at"], "2026-08-01T12:00:00+00:00"
+            conversion["observed_at"], "2026-08-01T12:00:01+00:00"
         )
 
     def test_rules_http_body_is_read_with_an_explicit_bound(self):

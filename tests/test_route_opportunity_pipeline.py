@@ -26,6 +26,7 @@ from scripts.route_cost_evidence import (
     typed_sha256,
 )
 from scripts.cex_fee_facts import PUBLIC_FEE_SCHEDULE_COLUMNS
+from scripts.collect_route_cohort import _attachment_authority_bytes
 from scripts.live_cex_research import build_live_cex_research_universe
 from scripts.route_cohort import canonical_route_id
 from scripts.fetch_dex_depth import ROUTE_V2_FEE_PROOF_SHA256
@@ -41,6 +42,7 @@ from scripts.route_shadow_inputs import (
     TYPED_SOURCE_ROLE_CONTRACTS,
     TYPED_SOURCE_LINEAGE_SCHEMA_V2,
     _candidate_source_generation,
+    typed_source_lineage_observed_members,
     write_run_universe,
 )
 from scripts.route_quantity import (
@@ -2265,6 +2267,16 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
                 "leg_id": market_id,
                 "market_id": market_id,
                 "token_symbol": "UNI",
+                "execution_adapter_status": selected[
+                    "execution_adapter_status"
+                ],
+                "execution_adapter_supported": selected[
+                    "execution_adapter_supported"
+                ],
+                "source_endpoint": {
+                    "binance": "https://data-api.binance.vision",
+                    "bybit": "https://api.bybit.com",
+                }[venue],
                 "raw_response_sha256": hashlib.sha256(response).hexdigest(),
             })
             members = []
@@ -2327,6 +2339,12 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
         cohort["source_state"]["candidate_source_generation"] = universe[
             "candidate_source_generation"
         ]
+        cohort["collection_input_generation"] = universe[
+            "candidate_source_generation"
+        ]
+        cohort["source_state"]["collection_input_generation"] = universe[
+            "candidate_source_generation"
+        ]
         cohort["selection_window"] = copy.deepcopy(universe["selection_window"])
         cohort["requested_notionals_usd"] = copy.deepcopy(
             universe["requested_notionals_usd"]
@@ -2343,6 +2361,44 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
                 "reason_code": timing["reason_code"],
             })
         cohort["legs"] = fixed_legs
+        selected_by_market = {
+            leg["market_id"]: leg for leg in universe["selected_legs"]
+        }
+        for leg in fixed_legs:
+            market_id = leg["market_id"]
+            accepted = (
+                raw_root / run_id / "accepted"
+                / hashlib.sha256(market_id.encode("utf-8")).hexdigest()
+            )
+            response = (accepted / "response.json").read_bytes()
+            authority_specs = []
+            for member in typed_source_lineage_observed_members(
+                leg["typed_source_lineage"], market_type="cex"
+            ):
+                if member["role"] == "cex_raw_book_response":
+                    continue
+                authority_specs.append({
+                    "market_id": market_id,
+                    "role": member["role"],
+                    "payload": (typed_root / member["filename"]).read_bytes(),
+                    "logical_generation": member["logical_generation"],
+                    "adapter_id": member["adapter_id"],
+                    "content_schema": member["content_schema"],
+                })
+            authority = _attachment_authority_bytes(
+                market_id=market_id,
+                trusted_leg=selected_by_market[market_id],
+                collector_row={
+                    key: value for key, value in leg.items()
+                    if key != "typed_source_lineage"
+                },
+                accepted_raw_sha256=hashlib.sha256(response).hexdigest(),
+                collection_input_generation=cohort[
+                    "collection_input_generation"
+                ],
+                validated_specs=authority_specs,
+            )
+            (accepted / "attachment-authority.json").write_bytes(authority)
         cohort = _rehash(cohort)
         publish_route_cohort_bundle(cohort, core_root=core_root)
         latest.write_bytes(self.old_pointer_bytes)
@@ -2455,6 +2511,23 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
                 expected_route_cohort_id=current["cohort"]["route_cohort_id"],
                 expected_core_manifest_sha256=current["manifest_sha256"],
             )
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_collection_generation_mismatch_preserves_prior_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        core_root = data_dir / "routes/core"
+        current = opportunity_pipeline.load_latest_route_cohort(core_root)
+        cohort = copy.deepcopy(current["cohort"])
+        cohort["collection_input_generation"] = "0" * 64
+        cohort["source_state"]["collection_input_generation"] = "0" * 64
+        cohort = _rehash(cohort)
+        publish_route_cohort_bundle(cohort, core_root=core_root)
+        latest.write_bytes(self.old_pointer_bytes)
+
+        with self.assertRaises(RouteOpportunityPipelineError):
+            self._finalize_public(data_dir, schedule)
 
         self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
 
@@ -2607,6 +2680,45 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
             mutate=mutate,
         )
 
+    def test_transient_typed_source_swaps_cannot_feed_public_inputs(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        actual_build = opportunity_pipeline._build_public_cex_research_inputs
+        cases = (
+            ("cex_market_rules", "min_base_quantity", "0.02"),
+            ("quote_usd_conversion", "usd_per_quote", "1.01"),
+        )
+        for role, field, value in cases:
+            with self.subTest(role=role):
+                member = next(
+                    (
+                        data_dir
+                        / "raw/route-cohort/task7-source-run/typed"
+                    ).glob("*-{}.json".format(role))
+                )
+                original = member.read_bytes()
+                payload = json.loads(original.decode("utf-8"))
+                payload[field] = value
+                transient = _shadow_json_bytes(payload)
+                self.assertNotEqual(transient, original)
+
+                def build_during_transient_swap(**kwargs):
+                    member.write_bytes(transient)
+                    try:
+                        return actual_build(**kwargs)
+                    finally:
+                        member.write_bytes(original)
+
+                with patch(
+                    "scripts.route_opportunity_pipeline."
+                    "_build_public_cex_research_inputs",
+                    side_effect=build_during_transient_swap,
+                ):
+                    with self.assertRaises(RouteOpportunityPipelineError):
+                        self._finalize_public(data_dir, schedule)
+
+                self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
     def test_raw_book_mutation_preserves_prior_pointer(self):
         schedule = self._write_schedule()
 
@@ -2622,6 +2734,223 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
             schedule=schedule,
             mutate=mutate,
         )
+
+    def test_missing_attachment_authority_preserves_prior_pointer(self):
+        schedule = self._write_schedule()
+
+        def mutate(data_dir):
+            authority = next(
+                (data_dir / "raw/route-cohort/task7-source-run/accepted")
+                .glob("*/attachment-authority.json")
+            )
+            authority.unlink()
+
+        self._assert_failure_preserves_pointer(
+            schedule=schedule,
+            mutate=mutate,
+        )
+
+    def test_attachment_authority_candidate_mismatch_preserves_pointer(self):
+        schedule = self._write_schedule()
+
+        def mutate(data_dir):
+            authority = next(
+                (data_dir / "raw/route-cohort/task7-source-run/accepted")
+                .glob("*/attachment-authority.json")
+            )
+            payload = json.loads(authority.read_text(encoding="utf-8"))
+            payload["trusted_input"]["candidate_source_generation"] = (
+                "0" * 64
+            )
+            authority.write_bytes(_shadow_json_bytes(payload))
+
+        self._assert_failure_preserves_pointer(
+            schedule=schedule,
+            mutate=mutate,
+        )
+
+    def test_typed_manifest_drift_preserves_prior_pointer(self):
+        schedule = self._write_schedule()
+
+        def mutate(data_dir):
+            manifest = (
+                data_dir
+                / "raw/route-cohort/task7-source-run/typed-manifest.json"
+            )
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["members"][0]["logical_generation"] = "0" * 64
+            manifest.write_bytes(_shadow_json_bytes(payload))
+
+        self._assert_failure_preserves_pointer(
+            schedule=schedule,
+            mutate=mutate,
+        )
+
+    def test_typed_raw_book_mutation_preserves_prior_pointer(self):
+        schedule = self._write_schedule()
+
+        def mutate(data_dir):
+            member = next(
+                (data_dir / "raw/route-cohort/task7-source-run/typed").glob(
+                    "*-cex_raw_book_response.json"
+                )
+            )
+            member.write_bytes(b'{"tampered":true}')
+
+        self._assert_failure_preserves_pointer(
+            schedule=schedule,
+            mutate=mutate,
+        )
+
+    def test_same_bytes_authority_inode_swap_before_commit_preserves_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        authority = next(
+            (data_dir / "raw/route-cohort/task7-source-run/accepted")
+            .glob("*/attachment-authority.json")
+        )
+        actual_publish = opportunity_pipeline.publish_complete_route_bundle
+
+        def replace_then_publish(**kwargs):
+            original_validator = kwargs["precommit_validator"]
+
+            def replace_then_validate():
+                replacement = authority.with_name("replacement-authority.json")
+                replacement.write_bytes(authority.read_bytes())
+                os.replace(replacement, authority)
+                original_validator()
+
+            kwargs["precommit_validator"] = replace_then_validate
+            return actual_publish(**kwargs)
+
+        with patch(
+            "scripts.route_opportunity_pipeline.publish_complete_route_bundle",
+            side_effect=replace_then_publish,
+        ):
+            with self.assertRaises(RouteOpportunityPipelineError):
+                self._finalize_public(data_dir, schedule)
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_typed_manifest_drift_during_precommit_preserves_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        manifest = (
+            data_dir
+            / "raw/route-cohort/task7-source-run/typed-manifest.json"
+        )
+        actual_publish = opportunity_pipeline.publish_complete_route_bundle
+
+        def mutate_then_publish(**kwargs):
+            original_validator = kwargs["precommit_validator"]
+
+            def mutate_then_validate():
+                payload = json.loads(manifest.read_text(encoding="utf-8"))
+                payload["members"][0]["logical_generation"] = "0" * 64
+                manifest.write_bytes(_shadow_json_bytes(payload))
+                original_validator()
+
+            kwargs["precommit_validator"] = mutate_then_validate
+            return actual_publish(**kwargs)
+
+        with patch(
+            "scripts.route_opportunity_pipeline.publish_complete_route_bundle",
+            side_effect=mutate_then_publish,
+        ):
+            with self.assertRaises(RouteOpportunityPipelineError):
+                self._finalize_public(data_dir, schedule)
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_transient_typed_raw_drift_during_precommit_preserves_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        member = next(
+            (data_dir / "raw/route-cohort/task7-source-run/typed").glob(
+                "*-cex_raw_book_response.json"
+            )
+        )
+        original = member.read_bytes()
+        actual_publish = opportunity_pipeline.publish_complete_route_bundle
+
+        def mutate_then_publish(**kwargs):
+            original_validator = kwargs["precommit_validator"]
+
+            def mutate_then_validate():
+                member.write_bytes(b'{"tampered":true}')
+                try:
+                    original_validator()
+                finally:
+                    member.write_bytes(original)
+
+            kwargs["precommit_validator"] = mutate_then_validate
+            return actual_publish(**kwargs)
+
+        with patch(
+            "scripts.route_opportunity_pipeline.publish_complete_route_bundle",
+            side_effect=mutate_then_publish,
+        ):
+            with self.assertRaises(RouteOpportunityPipelineError):
+                self._finalize_public(data_dir, schedule)
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_typed_raw_drift_during_postcommit_restores_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        member = next(
+            (data_dir / "raw/route-cohort/task7-source-run/typed").glob(
+                "*-cex_raw_book_response.json"
+            )
+        )
+        current = opportunity_pipeline.load_latest_route_cohort(
+            data_dir / "routes/core"
+        )
+
+        def mutate_typed_raw(_pointer):
+            member.write_bytes(b'{"tampered":true}')
+
+        with self.assertRaises(RouteOpportunityPipelineError):
+            opportunity_pipeline.finalize_public_cex_research_opportunities(
+                data_dir=data_dir,
+                public_fee_schedule_path=schedule,
+                expected_route_cohort_id=current["cohort"][
+                    "route_cohort_id"
+                ],
+                expected_core_manifest_sha256=current["manifest_sha256"],
+                _postcommit_validator=mutate_typed_raw,
+            )
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_authority_inode_swap_during_postcommit_restores_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        authority = next(
+            (data_dir / "raw/route-cohort/task7-source-run/accepted")
+            .glob("*/attachment-authority.json")
+        )
+
+        def replace_authority(_pointer):
+            replacement = authority.with_name("replacement-authority.json")
+            replacement.write_bytes(authority.read_bytes())
+            os.replace(replacement, authority)
+
+        current = opportunity_pipeline.load_latest_route_cohort(
+            data_dir / "routes/core"
+        )
+        with self.assertRaises(RouteOpportunityPipelineError):
+            opportunity_pipeline.finalize_public_cex_research_opportunities(
+                data_dir=data_dir,
+                public_fee_schedule_path=schedule,
+                expected_route_cohort_id=current["cohort"][
+                    "route_cohort_id"
+                ],
+                expected_core_manifest_sha256=current["manifest_sha256"],
+                _postcommit_validator=replace_authority,
+            )
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
 
     def test_schedule_replacement_during_precommit_preserves_prior_pointer(self):
         data_dir, _fixture, latest = self._install_public_core()
@@ -2743,6 +3072,51 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
                 expected_core_manifest_sha256=current["manifest_sha256"],
                 _postcommit_validator=reject_loaded_bundle,
             )
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_cleanup_failure_does_not_mask_publication_failure(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        actual_close = opportunity_pipeline._close_attachment_evidence
+
+        class PrimaryFailure(RuntimeError):
+            pass
+
+        def close_then_fail(held):
+            actual_close(held)
+            raise OSError("injected cleanup failure")
+
+        with patch(
+            "scripts.route_opportunity_pipeline.publish_complete_route_bundle",
+            side_effect=PrimaryFailure("primary publication failure"),
+        ), patch(
+            "scripts.route_opportunity_pipeline._close_attachment_evidence",
+            side_effect=close_then_fail,
+        ), self.assertRaisesRegex(
+            PrimaryFailure, "primary publication failure"
+        ):
+            self._finalize_public(data_dir, schedule)
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_postcommit_cleanup_failure_restores_prior_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        actual_close = opportunity_pipeline._close_attachment_evidence
+
+        def close_then_fail(held):
+            actual_close(held)
+            raise OSError("injected cleanup failure")
+
+        with patch(
+            "scripts.route_opportunity_pipeline._close_attachment_evidence",
+            side_effect=close_then_fail,
+        ), self.assertRaisesRegex(
+            RouteOpportunityPipelineError,
+            "public CEX opportunity publication failed",
+        ):
+            self._finalize_public(data_dir, schedule)
 
         self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
 

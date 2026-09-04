@@ -426,6 +426,50 @@ def _third_cohort():
 
 
 class SharedCoreArtifactPrimitiveTests(unittest.TestCase):
+    def test_existing_canonical_z_cex_source_time_remains_valid(self):
+        normalized = {
+            "bids": [[Decimal("99"), Decimal("1000")]],
+            "asks": [[Decimal("101"), Decimal("1000")]],
+            "source_instrument": "UNI-USDT",
+            "source_sequence": "1",
+            "source_observed_at": "2026-09-04T10:47:24Z",
+        }
+        with patch.object(
+            route_publication, "parse_book", return_value=normalized
+        ):
+            _market, book = route_publication._parse_cex_book_source(
+                {},
+                b"{}",
+                market_id="cex:coinbase:UNI/USDT",
+                state_observed_at="2026-09-04T10:47:24Z",
+            )
+
+        self.assertEqual(
+            book["source_observed_at"], "2026-09-04T10:47:24Z"
+        )
+
+    def test_bybit_raw_source_time_is_bridged_to_canonical_public_utc(self):
+        raw = _json_member({
+            "retCode": 0,
+            "result": {
+                "s": "UNIUSDT",
+                "b": [["99", "1000"], ["98", "1000"]],
+                "a": [["101", "1000"], ["102", "1000"]],
+                "cts": 1788518846632,
+            },
+        })
+
+        _market, book = route_publication._parse_cex_book_source(
+            json.loads(raw.decode("utf-8")),
+            raw,
+            market_id="cex:bybit:UNI/USDT",
+            state_observed_at="2026-09-04T10:47:24.681982Z",
+        )
+
+        self.assertEqual(
+            book["source_observed_at"], "2026-09-04T10:47:26.632000Z"
+        )
+
     def test_shared_core_representation_bytes_match_live_publication(self):
         """Catch a shared primitive that serializes different live bytes."""
         self.assertTrue(

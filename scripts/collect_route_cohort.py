@@ -1430,6 +1430,7 @@ def _validated_attachment_authority(
     market_id: str,
     market_type: str,
     accepted_raw_sha256: str,
+    candidate_source_generation: Any,
     collection_input_generation: Any,
 ) -> Tuple[Dict[str, Any], Tuple[Mapping[str, Any], ...]]:
     """Rebuild attachment facts solely from one canonical disk authority."""
@@ -1474,6 +1475,10 @@ def _validated_attachment_authority(
     if (
         _market_type(trusted_input) != market_type
         or trusted_input.get("market_id") != market_id
+        or not isinstance(candidate_source_generation, str)
+        or not candidate_source_generation
+        or trusted_input.get("candidate_source_generation")
+        != candidate_source_generation
         or collector_row.get("market_id") != market_id
         or collector_row.get("market_type") != market_type
         or collector_row.get("status") not in {"observed", "partial"}
@@ -1724,7 +1729,15 @@ class _HeldAttachmentEvidence:
             )
 
     def validate(self) -> None:
-        if self.closed:
+        if self.closed or any(
+            descriptor is None
+            for descriptor in (
+                self.authority_descriptor,
+                self.response_descriptor,
+                self.entry_descriptor,
+                self.accepted_descriptor,
+            )
+        ):
             raise _UnsafeRawEvidence("accepted evidence handle is closed")
         _descriptor_directory_identity(
             self.accepted_descriptor, self.accepted_identity
@@ -1767,14 +1780,29 @@ class _HeldAttachmentEvidence:
     def close(self) -> None:
         if self.closed:
             return
-        self.closed = True
-        for descriptor in (
-            self.authority_descriptor,
-            self.response_descriptor,
-            self.entry_descriptor,
-            self.accepted_descriptor,
-        ):
-            os.close(descriptor)
+        first_error: Optional[BaseException] = None
+        descriptor_names = (
+            "authority_descriptor",
+            "response_descriptor",
+            "entry_descriptor",
+            "accepted_descriptor",
+        )
+        for name in descriptor_names:
+            descriptor = getattr(self, name)
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+            else:
+                setattr(self, name, None)
+        self.closed = all(
+            getattr(self, name) is None for name in descriptor_names
+        )
+        if first_error is not None:
+            raise first_error
 
 
 def _accepted_evidence_for_attachment(
@@ -1942,6 +1970,9 @@ def _attach_typed_source_lineage_with_evidence(
                         market_id=market_id,
                         market_type=market_type,
                         accepted_raw_sha256=actual_raw_sha256,
+                        candidate_source_generation=cohort.get(
+                            "candidate_source_generation"
+                        ),
                         collection_input_generation=cohort.get(
                             "collection_input_generation"
                         ),
@@ -3626,6 +3657,19 @@ def _final_route_leg_projection(
             if key in requested_leg
         },
     }
+    if market_type == "cex" and row.get("status") in {
+        "observed", "partial"
+    }:
+        state_observed_at = row.get("state_observed_at")
+        if state_observed_at not in (None, ""):
+            row["state_observed_at"] = _canonical_utc(
+                state_observed_at, field="CEX state_observed_at"
+            )
+        elif row.get("response_received_at") not in (None, ""):
+            row["state_observed_at"] = _canonical_utc(
+                row["response_received_at"],
+                field="CEX response_received_at",
+            )
     context = requested_leg.get("collector_context")
     if market_type == "dex" and isinstance(context, Mapping):
         row.update({
@@ -5063,7 +5107,10 @@ def collect_route_cohort(
                 try:
                     authority_payload = _attachment_authority_bytes(
                         market_id=market_id,
-                        trusted_leg=legs_by_market[market_id],
+                        trusted_leg={
+                            **dict(legs_by_market[market_id]),
+                            "candidate_source_generation": generation,
+                        },
                         collector_row=row,
                         accepted_raw_sha256=actual_sha256,
                         collection_input_generation=expected_source_generation,
