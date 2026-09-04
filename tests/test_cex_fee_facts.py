@@ -9,8 +9,10 @@ import stat
 import tempfile
 import traceback
 import unittest
+from datetime import datetime
 from decimal import Decimal, localcontext
 from pathlib import Path
+from urllib.parse import urlparse
 from unittest import mock
 
 import scripts.cex_fee_facts as fee_facts
@@ -727,7 +729,7 @@ class FeeCollectorTests(unittest.TestCase):
             writer.writerow(row)
         return path
 
-    def test_public_schedule_is_opt_in_bounded_upper_projection_only(self):
+    def test_public_schedule_is_opt_in_non_strict_reference_scenario_only(self):
         with tempfile.TemporaryDirectory() as directory:
             schedule = self.write_public_schedule(directory)
             row = collect_cex_fee_snapshot(
@@ -741,8 +743,16 @@ class FeeCollectorTests(unittest.TestCase):
         self.assertEqual(row["rate_bps"], "10")
         self.assertEqual(row["amount_usd"], "10")
         self.assertIn("[4.5,10] bps", row["basis"])
-        self.assertIn("upper bound", row["basis"])
-        self.assertNotIn("authenticated", row["basis"])
+        self.assertIn(
+            "maximum reviewed public reference rate projected for a non-strict "
+            "research scenario",
+            row["basis"],
+        )
+        self.assertIn(
+            "not an authenticated account, regional, or pair-specific fee",
+            row["basis"],
+        )
+        self.assertNotIn("conservative upper bound", row["basis"])
         self.assertIn("fee_asset=AAVE", row["basis"])
         serialized = json.dumps(row, sort_keys=True)
         for sentinel in SENTINELS:
@@ -854,29 +864,180 @@ class FeeCollectorTests(unittest.TestCase):
                             public_schedule_path=schedule,
                         )
 
-    def test_tracked_empty_public_schedule_loads_as_unavailable(self):
+    def test_public_schedule_rejects_wrong_official_host_and_overlong_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cases = (
+                (
+                    {
+                        "source_url": (
+                            "https://www.binance.com.attacker.test/fees"
+                        )
+                    },
+                    "source host",
+                ),
+                (
+                    {
+                        "source_url": (
+                            "https://www.bybit.com/en/help-center/article/"
+                            "Trading-Fee-Structure"
+                        )
+                    },
+                    "source host",
+                ),
+                (
+                    {"valid_until": "2026-08-31T12:00:01Z"},
+                    "30 days",
+                ),
+            )
+            for overrides, message in cases:
+                with self.subTest(overrides=overrides):
+                    schedule = self.write_public_schedule(directory, **overrides)
+                    with self.assertRaisesRegex(ValueError, message):
+                        collect_cex_fee_snapshot(
+                            **self.common(),
+                            allow_public_estimate=True,
+                            public_schedule_path=schedule,
+                        )
+
+            schedule = self.write_public_schedule(
+                directory,
+                valid_until="2026-08-31T12:00:00Z",
+            )
+            row = collect_cex_fee_snapshot(
+                **self.common(),
+                allow_public_estimate=True,
+                public_schedule_path=schedule,
+            )
+            self.assertEqual(row["value_status"], "bounded_estimate")
+
+    def test_public_schedule_accepts_each_approved_root_host(self):
+        cases = (
+            ("binance", "https://binance.com"),
+            ("bybit", "https://bybit.com"),
+            ("okx", "https://okx.com"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for venue, source_url in cases:
+                with self.subTest(venue=venue):
+                    schedule = self.write_public_schedule(
+                        directory,
+                        venue=venue,
+                        source_url=source_url,
+                    )
+                    common = self.common()
+                    common.update(
+                        venue=venue,
+                        market_id="cex:{}:AAVE/USDT".format(venue),
+                    )
+                    row = collect_cex_fee_snapshot(
+                        **common,
+                        allow_public_estimate=True,
+                        public_schedule_path=schedule,
+                    )
+                    self.assertEqual(row["value_status"], "bounded_estimate")
+
+    def test_tracked_live_research_schedule_is_reviewed_and_bounded(self):
         schedule = (
             Path(__file__).resolve().parents[1]
             / "config"
             / "cex_public_fee_schedules.csv"
         )
-        common = self.common()
-        common.update(
-            venue="bybit",
-            market_id="cex:bybit:AAVE/USDT",
-            now="2026-08-02T01:00:00Z",
+        with schedule.open("r", encoding="utf-8", newline="") as handle:
+            tracked = list(csv.DictReader(handle))
+
+        expected = {
+            "binance": {
+                "minimum": "10",
+                "maximum": "10",
+                "source": "https://www.binance.com/en-IN/fee/trading",
+            },
+            "bybit": {
+                "minimum": "10",
+                "maximum": "20",
+                "source": (
+                    "https://www.bybit.com/en/help-center/article/"
+                    "Trading-Fee-Structure"
+                ),
+            },
+        }
+        self.assertEqual([row["venue"] for row in tracked], ["binance", "bybit"])
+        checked_clock = datetime.strptime(
+            "2026-09-05T10:00:00Z", "%Y-%m-%dT%H:%M:%SZ"
         )
+        for raw in tracked:
+            with self.subTest(venue=raw["venue"], contract="tracked row"):
+                venue_expected = expected[raw["venue"]]
+                self.assertEqual(raw["instrument_pattern"], "UNI/USDT")
+                self.assertNotIn("*", raw["instrument_pattern"])
+                self.assertEqual(raw["side"], "both")
+                self.assertEqual(raw["min_taker_fee_bps"], venue_expected["minimum"])
+                self.assertEqual(raw["max_taker_fee_bps"], venue_expected["maximum"])
+                self.assertEqual(raw["fee_asset"], "received_asset")
+                self.assertEqual(raw["basis"], "official_spot_taker_fee_range")
+                self.assertEqual(raw["source_url"], venue_expected["source"])
+                self.assertIn(
+                    urlparse(raw["source_url"]).hostname,
+                    {"www.binance.com", "www.bybit.com"},
+                )
+                checked = datetime.strptime(
+                    raw["checked_at"], "%Y-%m-%dT%H:%M:%SZ"
+                )
+                valid_until = datetime.strptime(
+                    raw["valid_until"], "%Y-%m-%dT%H:%M:%SZ"
+                )
+                self.assertLessEqual(checked, checked_clock)
+                self.assertLess(checked_clock, valid_until)
+                self.assertGreater(valid_until, checked)
+                self.assertLessEqual(
+                    (valid_until - checked).total_seconds(),
+                    7 * 24 * 60 * 60,
+                )
+
+        for venue, venue_expected in expected.items():
+            for side, received_asset in (("buy", "UNI"), ("sell", "USDT")):
+                common = self.common()
+                common.update(
+                    venue=venue,
+                    market_id="cex:{}:UNI/USDT".format(venue),
+                    instrument="UNI/USDT",
+                    side=side,
+                    leg=side,
+                    now="2026-09-05T10:00:00Z",
+                )
+                row = collect_cex_fee_snapshot(
+                    **common,
+                    allow_public_estimate=True,
+                    public_schedule_path=schedule,
+                )
+
+                with self.subTest(venue=venue, side=side, contract="projection"):
+                    self.assertEqual(row["value_status"], "bounded_estimate")
+                    self.assertIs(row["strict_eligible"], False)
+                    self.assertEqual(row["rate_bps"], venue_expected["maximum"])
+                    self.assertEqual(row["amount_usd"], venue_expected["maximum"])
+                    self.assertEqual(row["source"], venue_expected["source"])
+                    self.assertEqual(row["observed_at"], "2026-09-04T10:00:00Z")
+                    self.assertEqual(row["valid_until"], "2026-09-11T10:00:00Z")
+                    self.assertIn("fee_asset={}".format(received_asset), row["basis"])
+
+        unmatched = self.common()
+        unmatched.update(now="2026-09-05T10:00:00Z")
         row = collect_cex_fee_snapshot(
-            **common,
+            **unmatched,
             allow_public_estimate=True,
             public_schedule_path=schedule,
         )
-
         self.assertEqual(row["value_status"], "unavailable")
         self.assertIs(row["strict_eligible"], False)
-        self.assertIsNone(row["rate_bps"])
-        self.assertIsNone(row["observed_at"])
         self.assertEqual(row["reason_code"], "cex_fee_public_bound_unavailable")
+        for field in (
+            "rate_bps",
+            "amount_usd",
+            "observed_at",
+            "valid_until",
+            "source_record_sha256",
+        ):
+            self.assertIsNone(row[field])
 
     def test_generic_private_profile_projects_authenticated_component(self):
         common = self.common()

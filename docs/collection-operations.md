@@ -218,17 +218,48 @@ never zero and never silently replaced by a default rate.
 
 The tracked `config/cex_public_fee_schedules.csv` is a separate, explicitly
 opt-in research source. Every row has an HTTPS source, check time, expiry, and
-minimum/maximum taker-fee bounds. Collection projects only the conservative
-upper bound and labels it `bounded_estimate`; the full interval remains in the
-basis, and `strict_eligible` is always false. Rows accept only the controlled
+minimum/maximum public taker-fee references. Collection projects the maximum
+reviewed public reference rate for a non-strict research scenario and labels
+it `bounded_estimate`; the full interval remains in the basis, and
+`strict_eligible` is always false. This is not an authenticated account,
+regional, or pair-specific fee. Rows accept only the controlled
 `official_spot_taker_fee_range` basis code and the literal
 `fee_asset=received_asset`; source URLs must use HTTPS without credentials,
-query strings, or fragments. The tracked file is intentionally header-only:
-no venue currently has a generic public row whose account, region, pair, fee
-Token, and special/tax conditions form an honest current bound. Therefore an
-opted-in lookup against the tracked file returns explicit `unavailable`, with
-no fabricated timestamp or rate. An operator may add a reviewed, expiring row
-only when all of those conditions are actually bounded.
+query strings, or fragments. Runtime validation maps every supported venue to
+its approved official root domain (`binance.com`, `bybit.com`, or `okx.com`),
+accepts only that root or a true subdomain, and rejects cross-venue or deceptive
+suffixes such as `binance.com.attacker.test`. A row must satisfy
+`checked_at < valid_until` and may span at most 30 days. An unknown public venue
+fails closed until its official domain is added through a code-reviewed change.
+The tracked live-research schedule uses the narrower seven-day review policy.
+
+The tracked schedule checked on `2026-09-04T10:00:00Z` contains two exact
+`UNI/USDT`, `side=both` rows and expires at `2026-09-11T10:00:00Z`:
+
+- Binance records the published regular-user public reference as `[10,10]`
+  bps from the
+  [official fee table](https://www.binance.com/en-IN/fee/trading). It is still
+  not proof of the current user's account rate.
+- Bybit records the official public category references as `[10,20]` bps and
+  uses 20 bps for scenario calculation. The
+  [official category table](https://www.bybit.com/en/help-center/article/Trading-Fee-Structure)
+  publishes 10 bps for standard crypto-to-crypto and 20 bps for Adventure
+  Zone/xStocks, but does not prove the user's region/account rate or that
+  `UNI/USDT` belongs to either category.
+
+The exact instrument in each row is the workflow's research target, not proof
+of an account or pair-specific fee. A missing exact current row remains
+`cex_fee_public_bound_unavailable`, with null amount, rate, and timestamps; no
+zero is inferred. An expired tracked row fails schedule validation, so an
+operator must manually re-review the official page and update or remove the row
+before the next run. The runtime never fetches the fee page or guesses a new
+rate; the domain check validates provenance syntax, not the page's current
+contents.
+
+Public schedule rows and paths must never contain API keys, authorization
+headers, account or profile identifiers, private endpoints, or raw
+authenticated responses. Account-specific evidence belongs only in the
+owner-only private fee profile described above.
 
 Funding rates are out of scope, and this fee layer does not change Upbit
 catalog identities or historical facts. CEX fee collection is attached to the
@@ -391,6 +422,51 @@ cost, and research net edge even when the result is negative. Omitting it keeps
 MEV unavailable and research net null. The option accepts canonical decimal
 text from 0 through 10000 with at most six decimal places and is rejected for
 the CEX finalizer.
+
+### Live public CEX Opportunity research refresh
+
+Run the fixed, read-only `UNI/USDT` workflow from the repository root:
+
+```bash
+python3 scripts/run_live_cex_opportunity.py \
+  --data-dir /absolute/local/path
+```
+
+The command collects current public Binance and Bybit books and instrument
+rules, publishes both venue directions at USD 1,000, 5,000, 10,000, 50,000,
+and 100,000, then cold-reloads the complete pointer. It uses the repository
+`config/cex_public_fee_schedules.csv` by default. A successful rerun creates a
+new immutable cohort; it does not mutate the prior cohort or reuse demo data.
+A negative net edge is a valid research result.
+
+To serve the verified result through the normal Current Opportunity page:
+
+```bash
+python3 scripts/run_live_cex_opportunity.py \
+  --data-dir /absolute/local/path \
+  --serve \
+  --port 8765
+```
+
+Serving begins only after successful publication and reload, binds only
+`127.0.0.1`, and prints the exact local URL. The public API evaluates route age
+against the wall clock; after 120 seconds the current economics become stale
+or unavailable. Run a new refresh to display a current cohort.
+
+This path reads no account, balance, wallet, or inventory data and cannot place
+orders, sign transactions, or transfer assets. Its route-mode input is an
+explicit non-strict pre-positioned-inventory scenario with assumed zero
+immediate transfer cost. The page labels fee components as one of:
+
+- `Authenticated account fee` for the separate private, validated path;
+- `Public fee reference scenario (account rate unknown)` for these tracked
+  public intervals; or
+- `Fee unavailable; no numeric fee inferred` when current evidence cannot
+  support a number.
+
+The live public workflow can publish only `research_estimate` or `unavailable`.
+It never upgrades a public reference or an assumed transfer cost into
+`executable_candidate`.
 
 ### Sealed local Current Opportunity workflow demo
 

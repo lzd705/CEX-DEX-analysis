@@ -1,9 +1,9 @@
-"""Account-specific and bounded public CEX taker-fee facts.
+"""Account-specific and public-reference CEX taker-fee facts.
 
 Authenticated responses are normalized at a narrow boundary that retains only
 fee evidence.  Credentials, account identifiers, arbitrary response fields,
-and private file paths are neither returned nor logged.  Public schedules are
-scenario bounds only and can never become strict fee facts.
+and private file paths are neither returned nor logged. Public schedules are
+non-strict reference-scenario inputs and can never become account fee facts.
 """
 
 from __future__ import annotations
@@ -110,6 +110,12 @@ _PRIVATE_BASIS = {
 _PUBLIC_BASIS = {
     "official_spot_taker_fee_range": "official public spot taker-fee range",
 }
+_PUBLIC_FEE_SOURCE_DOMAINS = {
+    "binance": "binance.com",
+    "bybit": "bybit.com",
+    "okx": "okx.com",
+}
+_PUBLIC_FEE_MAX_VALIDITY_SECONDS = 30 * 24 * 60 * 60
 
 
 def _required_text(value: Any, field: str) -> str:
@@ -733,10 +739,16 @@ def _parse_public_fee_schedule_bytes(
     keys = set()
     for raw in raw_rows:
         checked, valid = _validate_window(raw.get("checked_at"), raw.get("valid_until"))
-        if exact_rfc3339_epoch_seconds(checked) > now_epoch:
+        checked_epoch = exact_rfc3339_epoch_seconds(checked)
+        valid_epoch = exact_rfc3339_epoch_seconds(valid)
+        if checked_epoch > now_epoch:
             raise ValueError("public fee schedule check is in the future")
-        if exact_rfc3339_epoch_seconds(valid) <= now_epoch:
+        if valid_epoch <= now_epoch:
             raise ValueError("public fee schedule contains a stale bound")
+        if valid_epoch - checked_epoch > _PUBLIC_FEE_MAX_VALIDITY_SECONDS:
+            raise ValueError(
+                "public fee schedule validity must not exceed 30 days"
+            )
         lower = _decimal(raw.get("min_taker_fee_bps"), "min_taker_fee_bps")
         upper = _decimal(raw.get("max_taker_fee_bps"), "max_taker_fee_bps")
         if upper < lower:
@@ -744,6 +756,7 @@ def _parse_public_fee_schedule_bytes(
         pattern = _validated_text(
             raw.get("instrument_pattern"), "instrument_pattern", _PUBLIC_PATTERN
         )
+        venue = _venue(raw.get("venue"))
         source_url = _required_text(raw.get("source_url"), "source_url")
         parsed = urlparse(source_url)
         if (
@@ -757,13 +770,22 @@ def _parse_public_fee_schedule_bytes(
             raise ValueError(
                 "public fee schedule source_url must be a public HTTPS URL"
             )
+        source_domain = _PUBLIC_FEE_SOURCE_DOMAINS.get(venue)
+        source_host = parsed.hostname or ""
+        if source_domain is None or not (
+            source_host == source_domain
+            or source_host.endswith("." + source_domain)
+        ):
+            raise ValueError(
+                "public fee schedule source host is not approved for venue"
+            )
         fee_asset = _fee_asset(raw.get("fee_asset"), public=True)
         if fee_asset != "received_asset":
             raise ValueError(
                 "public fee schedule fee_asset must be received_asset"
             )
         row = {
-            "venue": _venue(raw.get("venue")),
+            "venue": venue,
             "instrument_pattern": pattern,
             "side": _side(raw.get("side"), allow_both=True),
             "min_taker_fee_bps": _decimal_text(lower),
@@ -1281,8 +1303,10 @@ def _collect_cex_fee_snapshot(
             notional = _decimal(requested_notional_usd, "requested_notional_usd")
             amount = _exact_product(notional, rate, Decimal("0.0001"))
             range_basis = (
-                "{}; public interval [{},{}] bps; conservative upper bound"
-                " projected; fee_asset={}"
+                "{}; public interval [{},{}] bps; maximum reviewed public "
+                "reference rate projected for a non-strict research scenario; "
+                "not an authenticated account, regional, or pair-specific fee; "
+                "fee_asset={}"
             ).format(
                 bound["basis"],
                 bound["min_taker_fee_bps"],
@@ -1325,7 +1349,10 @@ def _collect_cex_fee_snapshot(
             target_token_quantity=target_token_quantity,
             value_status="unavailable",
             reason_code="cex_fee_public_bound_unavailable",
-            basis="no current public fee bound matches the exact venue and instrument",
+            basis=(
+                "no current public fee reference matches the exact venue and "
+                "instrument; no numeric fee inferred"
+            ),
         )
         _safe_log(
             logger,

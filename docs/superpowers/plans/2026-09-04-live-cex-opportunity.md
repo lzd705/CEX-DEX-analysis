@@ -4,7 +4,7 @@
 
 **Goal:** Deliver one command that collects real public `UNI/USDT` Binance and Bybit books, publishes research-only Opportunity results, and optionally serves them through the normal Current Opportunity page.
 
-**Architecture:** A fixed pure universe feeds the existing bounded cohort collector and immutable core publisher. A separate public-research finalizer replays retained book/rule evidence with reviewed public fee bounds, forces non-strict classification, and uses the existing complete-bundle publisher and dashboard. The production Shadow authority and authenticated finalizer remain unchanged.
+**Architecture:** A fixed pure universe feeds the existing bounded cohort collector and immutable core publisher. A separate public-research finalizer replays retained book/rule evidence with reviewed public fee reference intervals, forces non-strict classification, and uses the existing complete-bundle publisher and dashboard. The production Shadow authority and authenticated finalizer remain unchanged.
 
 **Tech Stack:** Python 3.8-compatible standard library, `Decimal`/integer-lattice quantity math, existing route collectors/publication contracts, `unittest`, local HTTP smoke tests.
 
@@ -16,7 +16,9 @@
 - Requested notionals are exactly 1,000, 5,000, 10,000, 50,000, and 100,000 USD.
 - Network calls are public HTTPS GET requests through existing fixed adapters; no CLI URL, host, proxy, credential, profile, wallet, order, or RPC input is added.
 - Raw book and rule bytes, typed source lineage, state IDs, core hashes, opportunity bindings, and complete-bundle hashes remain validated by existing contracts.
-- Public fee estimates are opt-in, use the current upper bound, and are always `strict_eligible=false`.
+- Public fee estimates are opt-in, use the maximum reviewed public reference
+  rate in the interval, and are always `strict_eligible=false`; they are not
+  authenticated account, regional, or pair-specific fee facts.
 - Every result is `research_estimate` or `unavailable`; no result may carry a publication attestation or become `executable_candidate`.
 - The production route Shadow authority and authenticated CEX finalizer remain unchanged.
 - The server binds only `127.0.0.1` and imports the existing isolated Current Opportunity dashboard.
@@ -145,7 +147,11 @@ Expected: FAIL because `public_fee_semantics()` does not exist.
 
 - [ ] **Step 3: Implement public fee semantics**
 
-For `bounded_estimate`, build `FeeSemantics` from the component's upper-bound rate and source hash. For terminal `unavailable`, build only the zero-rate mechanics object needed to replay gross book cash flow; bind it to a canonical hash of the terminal component and never change the component to numeric or strict.
+For `bounded_estimate`, build `FeeSemantics` from the component's maximum
+reviewed public reference rate and source hash. For terminal `unavailable`,
+build only the zero-rate mechanics object needed to replay gross book cash
+flow; bind it to a canonical hash of the terminal component and never change
+the component to numeric or strict.
 
 - [ ] **Step 4: Run the fee semantics tests and verify GREEN**
 
@@ -335,13 +341,23 @@ git commit -m "feat(opportunities): add one-command live CEX refresh"
 git push origin codex/historical-foundry-opportunity
 ```
 
-### Task 4: Reviewed public fee bounds and operator documentation
+### Task 4: Reviewed public fee references and operator documentation
 
 **Files:**
 - Modify: `config/cex_public_fee_schedules.csv`
 - Modify: `README.md`
 - Modify: `docs/collection-operations.md`
 - Modify: `tests/test_cex_fee_facts.py`
+- Modify: `scripts/cex_fee_facts.py`
+- Modify: `scripts/live_cex_research.py`
+- Modify: `dashboard/static/app.js`
+- Modify: `dashboard/static/index.html`
+- Modify: `tests/test_opportunity_frontend.py`
+- Modify: `tests/test_live_cex_research.py`
+- Modify: `tests/test_route_opportunity_pipeline.py`
+- Modify: `deploy/dashboard.env.example`
+- Modify: `docs/superpowers/specs/2026-09-04-live-cex-opportunity-design.md`
+- Modify: `docs/superpowers/plans/2026-09-04-live-cex-opportunity.md`
 
 **Interfaces:**
 - The tracked schedule supplies one exact `both` side row for Binance and one for Bybit, each matching only `UNI/USDT`.
@@ -349,21 +365,44 @@ git push origin codex/historical-foundry-opportunity
 
 - [ ] **Step 1: Verify official fee sources**
 
-Use only current official Binance and Bybit pages. Record the public standard spot taker-fee interval supported by each page, the check time in UTC, a validity window no longer than 30 days, `fee_asset=received_asset`, and `basis=official_spot_taker_fee_range`. If an official page does not support a defensible bound, leave that venue unmatched; do not use a blog, aggregator, or invented value.
+Use only current official Binance and Bybit pages. Record Binance's 10 bps
+regular-user public reference and Bybit's 10..20 bps public category interval,
+the check time in UTC, a validity window no longer than seven days,
+`fee_asset=received_asset`, and `basis=official_spot_taker_fee_range`. The Bybit
+20 bps calculation rate is only the maximum reviewed public reference for a
+non-strict scenario; do not call it a universal, regional, pair-specific, or
+account fee.
 
 - [ ] **Step 2: Write failing tracked-schedule behavior tests**
 
-At a fixed clock inside the declared window, assert the tracked schedule produces either the exact reviewed `bounded_estimate` maximum for each supported venue or the explicit `cex_fee_public_bound_unavailable` terminal state. Assert no tracked row uses a wildcard instrument, non-official host, validity longer than 30 days, or future `checked_at`.
+At a fixed clock inside the declared window, assert the tracked schedule
+produces the exact reviewed `bounded_estimate` maximum for Binance and Bybit.
+Assert an unmatched exact instrument produces
+`cex_fee_public_bound_unavailable` with no numeric inference. Assert no tracked
+row uses a wildcard instrument, non-official host, validity longer than seven
+days, or future `checked_at`.
+
+Also test the generic custom-schedule parser: reject a deceptive official-domain
+suffix, a source hosted on another supported venue's domain, and a validity
+window longer than 30 days; accept the exact 30-day boundary. Runtime domain
+validation is a local allowlist check and must not fetch the source URL. The
+tracked two-row schedule remains subject to the narrower seven-day policy.
 
 - [ ] **Step 3: Run the schedule tests and verify RED**
 
 Run: `python3 -m unittest tests.test_cex_fee_facts.FeeCollectorTests.test_tracked_live_research_schedule_is_reviewed_and_bounded -v`
 
-Expected: FAIL because the tracked schedule currently contains only its header.
+Expected: FAIL because the tracked schedule does not yet contain both required
+reviewed exact rows.
 
 - [ ] **Step 4: Add only source-supported rows and documentation**
 
-Edit the CSV through `apply_patch`. Document that public fees are conservative research inputs, account fees may differ, no inventory is observed, negative output is valid, the page ages out after 120 seconds, and rerunning the command creates a new immutable cohort.
+Edit the CSV through `apply_patch`. Document the three fee evidence states:
+authenticated account fee, public fee reference scenario with account rate
+unknown, and unavailable with no numeric inference. Document that no inventory
+is observed, negative output is valid, the page ages out after 120 seconds, and
+rerunning the command creates a new immutable cohort. The frontend must not
+render any terminal fee state as 0 bps.
 
 - [ ] **Step 5: Run schedule and documentation-adjacent regressions**
 
@@ -373,16 +412,24 @@ Run:
 python3 -m unittest \
   tests.test_cex_fee_facts \
   tests.test_route_opportunity_pipeline.PublicCexResearchFinalizerTests \
+  tests.test_opportunity_frontend \
+  tests.test_run_live_cex_opportunity \
+  tests.test_live_cex_research \
   -v
 ```
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit and push Task 4**
+- [ ] **Step 6: Commit Task 4; root task pushes after independent review**
 
 ```bash
-git add config/cex_public_fee_schedules.csv README.md docs/collection-operations.md tests/test_cex_fee_facts.py
+git add config/cex_public_fee_schedules.csv README.md docs/collection-operations.md deploy/dashboard.env.example scripts/cex_fee_facts.py scripts/live_cex_research.py dashboard/static/app.js dashboard/static/index.html tests/test_cex_fee_facts.py tests/test_live_cex_research.py tests/test_opportunity_frontend.py tests/test_route_opportunity_pipeline.py docs/superpowers/specs/2026-09-04-live-cex-opportunity-design.md docs/superpowers/plans/2026-09-04-live-cex-opportunity.md
 git commit -m "docs(opportunities): document live CEX research refresh"
+```
+
+After the implementation and independent review are clean, the root task runs:
+
+```bash
 git push origin codex/historical-foundry-opportunity
 ```
 

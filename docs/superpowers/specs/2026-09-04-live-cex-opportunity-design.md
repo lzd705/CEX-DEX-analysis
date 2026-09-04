@@ -24,7 +24,8 @@ This increment includes:
 - one bounded synchronized collection window;
 - public order-book and public instrument-rule evidence;
 - exact common-quantity level walking using the retained books;
-- optional, reviewed public taker-fee upper bounds;
+- reviewed public taker-fee reference intervals used only for a non-strict
+  research scenario;
 - immutable core and complete-bundle publication;
 - the existing `/api/markets/opportunities` API and `/opportunities` page;
 - a manual refresh command and an optional loopback-only server.
@@ -87,7 +88,7 @@ Every published row from this workflow must satisfy all of the following:
 - `strict_eligible` is `false`;
 - `strict_ready_for_publication` is `false`;
 - `publication_attestation_sha256` is `null`;
-- missing public fee bounds remain unavailable rather than zero;
+- missing public fee references remain unavailable rather than zero;
 - missing or stale book/rule evidence suppresses economic values rather than
   reusing old or synthetic data.
 
@@ -107,7 +108,7 @@ fixed UNI/USDT research universe
        -> replay retained book/rule/USD evidence
        -> derive one exact common UNI quantity per route/notional
        -> walk both books for that same quantity
-       -> attach public fee upper-bound components when available
+       -> attach non-strict public fee reference components when available
        -> keep inventory evidence unavailable and mark immediate transfer cost
           as an explicit non-strict zero-cost research assumption
   -> existing complete-bundle publication and cold reload validation
@@ -166,30 +167,54 @@ lattices. The buy and sell book walkers receive that identical target.
 
 ### Book cash flow
 
-When a current public fee bound exists, the quantity quote uses that same
-conservative maximum rate, received-asset basis, rounding rule, and public
-fee-record hash. The matching cost component carries the identical rate and
-hash, so the existing opportunity validator recognizes the fee as already
-reflected in the leg cash flow and does not subtract it twice.
+When a current reviewed public fee reference exists, the quantity quote uses
+the maximum rate in that public reference interval, received-asset basis,
+rounding rule, and public fee-record hash. This is a non-strict scenario input,
+not an authenticated account, regional, or pair-specific fee. The matching
+cost component carries the identical rate and hash, so the existing
+opportunity validator recognizes the fee as already reflected in the leg cash
+flow and does not subtract it twice.
 
-When no current public fee bound exists, the book is still replayed with an
+When no current public fee reference exists, the book is still replayed with an
 explicit zero-rate mechanics object so the retained book/rule evidence remains
 auditable. The fee component remains `unavailable`, the published opportunity
 row is unavailable with research net and economic fields suppressed, and zero
 is never presented as the venue fee. The normal UI does not display gross
 economics for this failure case.
 
-### Public taker-fee bounds
+### Public taker-fee reference scenario
 
 The existing `collect_cex_fee_snapshot(..., allow_public_estimate=True)` path
 is used. A tracked schedule row must contain one unambiguous venue/instrument/
 side match, a checked time, a finite validity window, an HTTPS official source,
-and a minimum/maximum interval. Calculation uses the maximum taker-fee bps.
+and a minimum/maximum interval. Calculation uses the maximum reviewed public
+reference rate in that interval.
+
+The public-schedule parser independently binds each supported venue to an
+approved official root domain (`binance.com`, `bybit.com`, or `okx.com`). It
+accepts only the root or a true subdomain, rejects credentials, query strings,
+fragments, cross-venue sources, deceptive suffixes, and unknown venue/domain
+mappings, and requires `checked_at < valid_until` with a window no longer than
+30 days. The tracked live-research rows use a stricter seven-day window. This
+is local provenance validation only: the runtime does not fetch or attest the
+current contents of the cited page.
 
 The resulting component is `bounded_estimate`, is never strict eligible, and
 is reflected exactly once in the research net edge. If no current exact row
-matches, the component is `unavailable`; the workflow still publishes
-source-backed gross book results, but research net remains unavailable.
+matches, the component is `unavailable`; the workflow retains source-backed
+gross book replay evidence, but published opportunity economics and research
+net remain unavailable.
+
+The tracked schedule checked at `2026-09-04T10:00:00Z` contains only exact
+`UNI/USDT`, `side=both` entries and expires at
+`2026-09-11T10:00:00Z`. Binance's public regular-user reference interval is
+`[10,10]` bps. Bybit publishes 10 bps for standard crypto-to-crypto and 20 bps
+for Adventure Zone/xStocks, so its tracked public category interval is
+`[10,20]` bps and the scenario uses 20 bps. The Bybit source does not establish
+the user's region/account rate or prove the category of `UNI/USDT`; the exact
+instrument match is the research target, not pair-specific fee evidence.
+Expired evidence must be manually re-reviewed. Runtime collection does not
+fetch fee pages or infer an updated rate.
 
 ### Route mode and inventory
 
@@ -321,6 +346,10 @@ The result should visibly identify:
 - research/unavailable classification and reason;
 - source timestamps, age, skew, and freshness state.
 
+Fee component labels must distinguish `Authenticated account fee`, `Public fee
+reference scenario (account rate unknown)`, and `Fee unavailable; no numeric
+fee inferred`. Terminal fee states must never render as 0 bps.
+
 No demo banner, fixture hash, or synthetic-token copy is shown for this path.
 
 ## Test and acceptance contract
@@ -336,7 +365,7 @@ Implementation is complete only when all of these pass:
    pointer is rejected without replacing the previous current pointer.
    Complete-pointer rollback tests also cover same-bytes/new-inode concurrent
    replacement during postcommit validation and post-replace fsync.
-4. Missing/stale/ambiguous fee bounds never become zero and never yield an
+4. Missing/stale/ambiguous fee references never become zero and never yield an
    executable candidate.
 5. Every successful public research result has strict fields forced false/null
    as defined above.
@@ -358,7 +387,8 @@ tests. Tests never contact public hosts.
 1. Add the fixed research universe and TDD contract.
 2. Add the separate public-research input builder and its fail-closed tests.
 3. Add the one-command collector/publisher/server orchestration and tests.
-4. Add reviewed public fee bounds only after official source verification.
+4. Add reviewed public fee reference intervals only after official source
+   verification.
 5. Run focused and regression tests.
 6. Run one real bounded collection, verify the normal API/UI, then publish the
    verified commits.

@@ -2366,6 +2366,13 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
 
     @staticmethod
     def _schedule_row(venue, maximum, **overrides):
+        source_urls = {
+            "binance": "https://www.binance.com/en/fee/trading",
+            "bybit": (
+                "https://www.bybit.com/en/help-center/article/"
+                "Trading-Fee-Structure"
+            ),
+        }
         row = {
             "venue": venue,
             "instrument_pattern": "UNI/USDT",
@@ -2376,7 +2383,7 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
             "basis": "official_spot_taker_fee_range",
             "checked_at": "2026-08-01T11:55:00Z",
             "valid_until": "2026-08-01T13:00:00Z",
-            "source_url": "https://{}.example.test/spot-fees".format(venue),
+            "source_url": source_urls[venue],
         }
         row.update(overrides)
         return row

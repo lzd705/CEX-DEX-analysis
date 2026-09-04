@@ -73,6 +73,60 @@ npm --prefix dashboard install
 ./scripts/run_dashboard.sh
 ```
 
+### Live read-only Current Opportunity research
+
+From the repository root, collect current public `UNI/USDT` order books and
+instrument rules from Binance and Bybit, then publish both venue directions at
+the five fixed USD notionals:
+
+```bash
+python3 scripts/run_live_cex_opportunity.py \
+  --data-dir /absolute/local/path
+```
+
+To publish, cold-reload the result, and then serve the normal read-only Current
+Opportunity page on loopback:
+
+```bash
+python3 scripts/run_live_cex_opportunity.py \
+  --data-dir /absolute/local/path \
+  --serve \
+  --port 8765
+```
+
+The second command prints the exact `127.0.0.1` URL after publication succeeds.
+Each run collects a new source-backed cohort and publishes a new immutable
+complete bundle; it does not reuse the sealed demo fixture. Net edge may be
+negative. Current Opportunity rows age out after 120 seconds, so rerun the
+command to create a fresh cohort rather than treating an old row as current.
+Neither command places orders, signs transactions, transfers assets, or reads
+wallets, balances, or account inventory.
+
+The tracked public fee schedule is a non-strict research scenario, not an
+authenticated account-fee source. It was checked at `2026-09-04T10:00:00Z` and
+expires at `2026-09-11T10:00:00Z`. The
+[Binance public regular-user reference](https://www.binance.com/en-IN/fee/trading)
+is recorded as 10 bps. The
+[Bybit public category table](https://www.bybit.com/en/help-center/article/Trading-Fee-Structure)
+publishes 10 bps for standard crypto-to-crypto and 20 bps for Adventure
+Zone/xStocks; the workflow projects 20 bps as the maximum reviewed public
+reference rate for this scenario. That Bybit source does not establish the
+user's region, account tier, or the category of `UNI/USDT`. Both components are
+therefore `bounded_estimate` with `strict_eligible=false`. If an exact current
+reference is absent, the fee is `unavailable` and no numeric fee is inferred.
+Before running after the schedule expires, manually re-review the official
+pages and update or remove the expired rows; the command does not fetch fee
+pages or guess a replacement rate. Custom public schedules also fail closed
+unless each source host is the approved official domain for its venue and each
+row expires no more than 30 days after its check time; the tracked research
+schedule uses the stricter seven-day review window above.
+
+No account inventory is observed. The route model uses an explicitly
+non-strict hypothetical pre-positioned-inventory scenario with zero immediate
+transfer cost; this is an assumption for comparing the two public books, not a
+claim that the assets or balances exist. Consequently this workflow publishes
+only `research_estimate` or `unavailable`, never `executable_candidate`.
+
 ### Local Historical Opportunity demo
 
 From the repository root, start the self-contained, loopback-only demo with:
@@ -173,10 +227,12 @@ are `deploy/systemd/cex-dex-dashboard.service.in`,
 - TVL is a source-reported point-in-time pool snapshot. CEX order-book depth
   and DEX pool-state depth are separately collected point-in-time snapshots.
   None is historical daily liquidity, and TVL is never converted into depth.
-- Fixed-notional quoted cost walks the original CEX levels or executes the
+- The ordinary Liquidity & Execution fixed-notional quote walks the original
+  CEX levels or executes the
   supported DEX V2 invariant captured by those collectors. DEX V3 execution is
   explicitly unsupported in this release. Cost is never interpolated from the
-  four depth bands. Every CEX row explicitly marks its numeric trading fee as
+  four depth bands. Every CEX row in that ordinary quote view explicitly marks
+  its numeric trading fee as
   `excluded_unknown_account_tier`; the value remains null rather than being
   treated as zero. Supported DEX V2 rows include the pool's swap fee in the
   invariant calculation. This is a pool swap fee, not a claim about protocol
@@ -192,10 +248,10 @@ are `deploy/systemd/cex-dex-dashboard.service.in`,
 
 ## Future scope
 
-Funding rates, numeric CEX account fees, gas/MEV-aware quotes, DEX V3
-fixed-notional execution, event-study returns/impact, additional DEX protocol
-adapters, anomaly rules, historical TVL backfills, historical depth
-reconstruction, and automatic CEX mapping for runtime Tokens require separate
-data contracts and acceptance tests. Unsupported facts remain null or
-explicitly `unsupported`; the dashboard does not estimate them from adjacent
-facts.
+Funding rates, authenticated CEX account-fee integration in the ordinary
+Liquidity & Execution quote view, gas/MEV-aware quotes, DEX V3 fixed-notional
+execution, event-study returns/impact, additional DEX protocol adapters,
+anomaly rules, historical TVL backfills, historical depth reconstruction, and
+automatic CEX mapping for runtime Tokens require separate data contracts and
+acceptance tests. Unsupported facts remain null or explicitly `unsupported`;
+the dashboard does not estimate them from adjacent facts.

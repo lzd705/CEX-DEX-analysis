@@ -252,6 +252,8 @@ const OPPORTUNITY_REASON_LABELS = Object.freeze({
   cost_components_incomplete: "Required route costs are incomplete.",
   cost_component_stale: "At least one route cost component is stale.",
   cost_component_estimated: "At least one route cost component is estimated.",
+  cex_fee_authentication_missing: "Authenticated account fee unavailable; no numeric fee inferred.",
+  cex_fee_public_bound_unavailable: "Fee unavailable; no numeric fee inferred.",
   non_positive_net_edge: "The proved net edge is not positive.",
   publication_evidence_unverified: "Strict publication attestation is not verified.",
 });
@@ -2225,8 +2227,24 @@ function opportunityComponentReason(component, route) {
 
 function opportunityComponentEvidence(component) {
   const status = String(component?.value_status || "status unavailable");
+  const isVenueFee = component?.component_type === "venue_taker_fee";
+  let statusLabel = status;
+  if (isVenueFee && status === "authenticated") {
+    statusLabel = "Authenticated account fee · status authenticated";
+  } else if (isVenueFee && status === "bounded_estimate") {
+    statusLabel = (
+      "Public fee reference scenario (account rate unknown)"
+      + " · status bounded_estimate"
+    );
+  } else if (
+    isVenueFee
+    && ["unavailable", "unsupported", "failed", "stale"].includes(status)
+  ) {
+    statusLabel = `Fee unavailable; no numeric fee inferred · status ${status}`;
+  }
   const rate = opportunityNumber(component?.rate_bps);
   const rateText = rate === null
+    || ["unavailable", "unsupported", "failed", "stale"].includes(status)
     ? ""
     : ` · ${String(component.rate_bps).trim()} bps`;
   const strictness = component?.strict_eligible === true
@@ -2238,7 +2256,7 @@ function opportunityComponentEvidence(component) {
   const reason = component?.reason_code
     ? ` · reason ${component.reason_code}`
     : "";
-  return `${status}${rateText} · ${strictness} · ${reflection}${reason}`;
+  return `${statusLabel}${rateText} · ${strictness} · ${reflection}${reason}`;
 }
 
 function formatOpportunityTimestamp(value) {

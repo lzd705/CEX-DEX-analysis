@@ -282,6 +282,15 @@ console.log(JSON.stringify({
         self.assertIn("Unavailable routes", page)
         self.assertIn("Daily Price Gap", page)
         self.assertIn("not an executable route", page)
+        self.assertIn("an authenticated account fee", page)
+        self.assertIn(
+            "a public fee reference scenario with the account rate unknown",
+            page,
+        )
+        self.assertIn(
+            "an unavailable fee for which no numeric value is inferred",
+            page,
+        )
         self.assertIn('id="current-opportunity-demo-label"', page)
         self.assertIn("LOCAL CURRENT DEMO FIXTURE", page)
         self.assertIn("AAA/WETH", page)
@@ -618,6 +627,68 @@ console.log(JSON.stringify({ assumed, absent }));
         self.assertIn("0.000001 bps", result["assumed"])
         self.assertNotIn(" bps", result["absent"])
         self.assertNotIn("0 bps", result["absent"])
+
+    def test_fee_evidence_distinguishes_account_reference_and_unavailable(self):
+        result = run_app_javascript(
+            r"""
+const authenticated = opportunityComponentEvidence({
+  component_type: "venue_taker_fee", value_status: "authenticated",
+  strict_eligible: true, reflected_or_embedded: true, rate_bps: "10",
+});
+const publicReference = opportunityComponentEvidence({
+  component_type: "venue_taker_fee", value_status: "bounded_estimate",
+  strict_eligible: false, reflected_or_embedded: true, rate_bps: "20",
+});
+const unavailable = opportunityComponentEvidence({
+  component_type: "venue_taker_fee", value_status: "unavailable",
+  strict_eligible: false, reflected_or_embedded: false, rate_bps: "0",
+  reason_code: "cex_fee_public_bound_unavailable",
+});
+const unavailableReason = opportunityComponentReason({
+  component_type: "venue_taker_fee", value_status: "unavailable",
+  strict_eligible: false, reflected_or_embedded: false, rate_bps: null,
+  reason_code: "cex_fee_public_bound_unavailable",
+}, {});
+const terminalFees = Object.fromEntries(
+  ["unavailable", "stale", "failed", "unsupported"].map((status) => [
+    status,
+    opportunityComponentEvidence({
+      component_type: "venue_taker_fee", value_status: status,
+      strict_eligible: false, reflected_or_embedded: false, rate_bps: "0",
+      reason_code: `fee_${status}`,
+    }),
+  ]),
+);
+console.log(JSON.stringify({
+  authenticated, publicReference, unavailable, unavailableReason, terminalFees,
+}));
+""",
+        )
+
+        self.assertIn("Authenticated account fee", result["authenticated"])
+        self.assertIn("10 bps", result["authenticated"])
+        self.assertIn(
+            "Public fee reference scenario (account rate unknown)",
+            result["publicReference"],
+        )
+        self.assertIn("20 bps", result["publicReference"])
+        self.assertIn(
+            "Fee unavailable; no numeric fee inferred",
+            result["unavailable"],
+        )
+        self.assertNotIn("0 bps", result["unavailable"])
+        self.assertEqual(
+            result["unavailableReason"],
+            "Fee unavailable; no numeric fee inferred.",
+        )
+        for status, evidence in result["terminalFees"].items():
+            with self.subTest(status=status):
+                self.assertIn(
+                    "Fee unavailable; no numeric fee inferred",
+                    evidence,
+                )
+                self.assertNotIn("0 bps", evidence)
+                self.assertIn("reason fee_{}".format(status), evidence)
 
     def test_current_demo_negative_result_and_mev_rate_remain_visible(self):
         result = run_app_javascript(

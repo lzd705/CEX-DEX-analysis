@@ -1,1 +1,3 @@
 venue,instrument_pattern,side,min_taker_fee_bps,max_taker_fee_bps,fee_asset,basis,checked_at,valid_until,source_url
+binance,UNI/USDT,both,10,10,received_asset,official_spot_taker_fee_range,2026-09-04T10:00:00Z,2026-09-11T10:00:00Z,https://www.binance.com/en-IN/fee/trading
+bybit,UNI/USDT,both,10,20,received_asset,official_spot_taker_fee_range,2026-09-04T10:00:00Z,2026-09-11T10:00:00Z,https://www.bybit.com/en/help-center/article/Trading-Fee-Structure

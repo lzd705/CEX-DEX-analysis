@@ -51,7 +51,7 @@ def public_fee_semantics(
     rules: MarketRules,
     now: str,
 ) -> FeeSemantics:
-    """Bind a public fee component to conservative quote mechanics."""
+    """Bind a non-strict public-reference component to quote mechanics."""
     if not isinstance(component, Mapping):
         raise ValueError("public fee component must be a mapping")
     validate_cost_components([component])
@@ -91,9 +91,11 @@ def public_fee_semantics(
                 <= evaluated
                 < exact_rfc3339_epoch_seconds(valid_until)
             ):
-                raise ValueError("public fee bound does not cover evaluation time")
+                raise ValueError(
+                    "public fee reference does not cover evaluation time"
+                )
         except (InvalidOperation, KeyError, TypeError, ValueError) as error:
-            raise ValueError("public fee bound is invalid") from error
+            raise ValueError("public fee reference is invalid") from error
     elif status == "unavailable":
         rate = Decimal(0)
         observed_at = rules.observed_at

@@ -46,10 +46,13 @@ class PublicFeeSemanticsTests(unittest.TestCase):
             "amount_usd": None if unavailable else "1",
             "rate_bps": None if unavailable else "10",
             "basis": (
-                "no current public fee bound matches the exact venue and instrument"
+                "no current public fee reference matches the exact venue and "
+                "instrument; no numeric fee inferred"
                 if unavailable else
                 "official public spot taker-fee range; public interval [4,10] "
-                "bps; conservative upper bound projected; fee_asset=UNI"
+                "bps; maximum reviewed public reference rate projected for a "
+                "non-strict research scenario; not an authenticated account, "
+                "regional, or pair-specific fee; fee_asset=UNI"
             ),
             "strict_eligible": False,
             "embedded_in_leg_quote": False,
@@ -65,7 +68,7 @@ class PublicFeeSemanticsTests(unittest.TestCase):
             ),
         }
 
-    def test_bounded_estimate_uses_upper_bound_received_asset_semantics(self):
+    def test_bounded_estimate_uses_maximum_public_reference_rate(self):
         buy_component = self.component()
         buy = public_fee_semantics(
             buy_component,
