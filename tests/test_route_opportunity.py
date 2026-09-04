@@ -970,6 +970,50 @@ class _RouteOpportunityTopologyTests:
 
 
 class _TerminalRouteOpportunityContractTests:
+    def test_terminal_builder_replays_future_state_against_evaluation_time(self):
+        kwargs = terminal_route_fixture()
+        for direction in ("buy", "sell"):
+            kwargs[direction + "_leg"] = {
+                **kwargs[direction + "_leg"],
+                "status": "observed",
+                "available": True,
+                "reason_code": None,
+                "state_observed_at": "2026-08-01T12:02:01Z",
+            }
+        kwargs["route_timing"] = {
+            "route_id": kwargs["route"]["route_id"],
+            "skew_seconds": None,
+            "timing_status": "unavailable",
+            "reason_code": "invalid_state_timestamp",
+        }
+        kwargs["cost_components"] = [
+            {**row, "reason_code": "invalid_state_timestamp"}
+            for row in kwargs["cost_components"]
+        ]
+
+        result = route_opportunity.build_terminal_route_opportunity(**kwargs)
+
+        self.assertEqual(result["primary_reason"], "invalid_state_timestamp")
+        self.assertIsNone(result["skew_seconds"])
+
+    def test_terminal_builder_rejects_forged_cost_semantics(self):
+        for label, field, value in (
+            ("basis", "basis", "invented external proof"),
+            ("source", "source", "authenticated exchange fee feed"),
+            ("status", "value_status", "failed"),
+        ):
+            with self.subTest(label=label):
+                kwargs = terminal_route_fixture()
+                kwargs["cost_components"] = [
+                    ({**row, field: value} if index == 0 else row)
+                    for index, row in enumerate(kwargs["cost_components"])
+                ]
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "terminal CEX cost component",
+                ):
+                    route_opportunity.build_terminal_route_opportunity(**kwargs)
+
     def test_terminal_builder_emits_exact_null_contract_and_rejects_mutations(self):
         self.assertTrue(
             hasattr(route_opportunity, "build_terminal_route_opportunity"),

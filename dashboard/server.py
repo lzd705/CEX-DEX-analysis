@@ -6659,6 +6659,7 @@ def build_route_opportunities(
             cost_components=loaded["cost_components"],
             route_candidates=loaded["bundle"]["routes"],
             manifest_sha256=loaded["manifest_sha256"],
+            core_context=loaded["bundle"]["core_context"],
             **arguments,
         )
     except OpportunityQueryError as error:

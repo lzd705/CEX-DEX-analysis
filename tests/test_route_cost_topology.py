@@ -9,7 +9,7 @@ import unittest
 
 from dashboard import opportunity_facts
 from scripts import check_dashboard_release, route_cost_topology
-from scripts import route_opportunity, route_publication
+from scripts import route_opportunity, route_opportunity_pipeline, route_publication
 from scripts.route_cost_topology import (
     _validate_historical_atomic_cost_component_matrix,
     live_complete_cost_component_keys,
@@ -182,6 +182,98 @@ def validate(rows, **changes):
 
 
 class LiveCostTopologyTests(unittest.TestCase):
+    def test_terminal_cex_cost_rows_have_one_canonical_literal_shape(self):
+        self.assertTrue(hasattr(
+            route_cost_topology,
+            "build_terminal_cex_cost_components",
+        ))
+        route = {
+            "buy_market_id": "cex:binance:CAKE/USDT",
+            "sell_market_id": "cex:bybit:CAKE/USDT",
+        }
+        rows = route_cost_topology.build_terminal_cex_cost_components(
+            cohort_id=COHORT_ID,
+            opportunity_id=OPPORTUNITY_ID,
+            route=route,
+            requested_notional_usd="1000",
+            reason_code="invalid_state_timestamp",
+        )
+
+        self.assertEqual(
+            [
+                (
+                    row["leg"], row["market_id"], row["direction"],
+                    row["component_type"], row["value_status"],
+                    row["basis"], row["source"], row["reason_code"],
+                )
+                for row in rows
+            ],
+            [
+                (
+                    "buy", "cex:binance:CAKE/USDT", "buy_token",
+                    "venue_taker_fee", "unavailable",
+                    "retained route timing proves route unavailable",
+                    "retained route timing", "invalid_state_timestamp",
+                ),
+                (
+                    "route", "", "route", "rebalancing_or_transfer",
+                    "unavailable",
+                    "retained route timing proves route unavailable",
+                    "retained route timing", "invalid_state_timestamp",
+                ),
+                (
+                    "sell", "cex:bybit:CAKE/USDT", "sell_token",
+                    "venue_taker_fee", "unavailable",
+                    "retained route timing proves route unavailable",
+                    "retained route timing", "invalid_state_timestamp",
+                ),
+            ],
+        )
+        self.assertTrue(all(
+            row["target_token_quantity"] is None
+            and row["amount_usd"] is None
+            and row["rate_bps"] is None
+            and row["strict_eligible"] is False
+            and row["embedded_in_leg_quote"] is False
+            and row["observed_at"] is None
+            and row["valid_until"] is None
+            and row["source_record_sha256"] is None
+            for row in rows
+        ))
+
+    def test_terminal_cex_cost_validator_rejects_semantic_mutations(self):
+        self.assertTrue(hasattr(
+            route_cost_topology,
+            "validate_terminal_cex_cost_components",
+        ))
+        route = {
+            "buy_market_id": "cex:binance:CAKE/USDT",
+            "sell_market_id": "cex:bybit:CAKE/USDT",
+        }
+        arguments = {
+            "cohort_id": COHORT_ID,
+            "opportunity_id": OPPORTUNITY_ID,
+            "route": route,
+            "requested_notional_usd": "1000",
+            "reason_code": "invalid_state_timestamp",
+        }
+        baseline = route_cost_topology.build_terminal_cex_cost_components(
+            **arguments
+        )
+        for label, field, value in (
+            ("basis", "basis", "caller asserted terminal basis"),
+            ("source", "source", "caller asserted terminal source"),
+            ("status", "value_status", "failed"),
+        ):
+            with self.subTest(label=label):
+                mutated = copy.deepcopy(baseline)
+                mutated[0][field] = value
+                with self.assertRaises(ValueError):
+                    route_cost_topology.validate_terminal_cex_cost_components(
+                        mutated,
+                        **arguments,
+                    )
+
     def test_dex_dex_inventory_is_the_existing_ten_key_contract(self):
         self.assertEqual(
             live_complete_cost_component_keys(ROUTE), LIVE_DEX_DEX_KEYS
@@ -392,6 +484,7 @@ class CostTopologyBoundaryTests(unittest.TestCase):
     def test_consumers_expose_no_divergent_topology_copies(self):
         copied_names = (
             (route_opportunity, "_expected_component_keys"),
+            (route_opportunity_pipeline, "_terminal_cex_cost_components"),
             (route_publication, "_expected_component_keys_for_complete_route"),
             (opportunity_facts, "_expected_component_keys"),
             (check_dashboard_release, "_route_expected_component_keys"),
@@ -403,6 +496,14 @@ class CostTopologyBoundaryTests(unittest.TestCase):
 
     def test_live_wrapper_signatures_remain_frozen(self):
         expected = {
+            route_cost_topology.build_terminal_cex_cost_components: (
+                "cohort_id", "opportunity_id", "route",
+                "requested_notional_usd", "reason_code",
+            ),
+            route_cost_topology.validate_terminal_cex_cost_components: (
+                "rows", "cohort_id", "opportunity_id", "route",
+                "requested_notional_usd", "reason_code",
+            ),
             route_opportunity.build_route_opportunity: (
                 "cohort_id", "route", "requested_notional_usd", "common_target",
                 "buy_leg", "sell_leg", "buy_quote", "sell_quote",
@@ -461,6 +562,7 @@ class CostTopologyBoundaryTests(unittest.TestCase):
                 "-c",
                 (
                     "import route_cost_topology; import route_opportunity; "
+                    "import route_opportunity_pipeline; "
                     "import route_publication; import check_dashboard_release"
                 ),
             ],
@@ -480,6 +582,7 @@ class CostTopologyBoundaryTests(unittest.TestCase):
                 "py_compile",
                 "scripts/route_cost_topology.py",
                 "scripts/route_opportunity.py",
+                "scripts/route_opportunity_pipeline.py",
                 "scripts/route_publication.py",
                 "dashboard/opportunity_facts.py",
                 "scripts/check_dashboard_release.py",

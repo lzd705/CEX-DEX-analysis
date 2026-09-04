@@ -40,7 +40,6 @@ try:
     from scripts.execution_cost_components import (
         COST_COMPONENT_CONTRACT_VERSION,
         COST_COMPONENT_COLUMNS,
-        TERMINAL_VALUE_STATUSES,
         validate_cost_components,
     )
     from scripts.fetch_cex_depth import (
@@ -74,11 +73,13 @@ try:
         _publication_binding_sha256,
         build_route_opportunity,
         build_terminal_route_opportunity,
+        classify_terminal_route_timing,
         route_opportunity_id,
     )
     from scripts.route_cost_topology import (
         HISTORICAL_ATOMIC_COMPONENT_MATRIX,
         live_complete_cost_component_keys,
+        validate_terminal_cex_cost_components,
     )
     from scripts.route_quantity import FeeSemantics, MarketRules, QuantityQuote
     from scripts.route_shadow_inputs import (
@@ -113,7 +114,6 @@ except ModuleNotFoundError:
     from execution_cost_components import (  # type: ignore[no-redef]
         COST_COMPONENT_CONTRACT_VERSION,
         COST_COMPONENT_COLUMNS,
-        TERMINAL_VALUE_STATUSES,
         validate_cost_components,
     )
     from fetch_cex_depth import (  # type: ignore[no-redef]
@@ -147,11 +147,13 @@ except ModuleNotFoundError:
         _publication_binding_sha256,
         build_route_opportunity,
         build_terminal_route_opportunity,
+        classify_terminal_route_timing,
         route_opportunity_id,
     )
     from route_cost_topology import (  # type: ignore[no-redef]
         HISTORICAL_ATOMIC_COMPONENT_MATRIX,
         live_complete_cost_component_keys,
+        validate_terminal_cex_cost_components,
     )
     from route_quantity import (  # type: ignore[no-redef]
         FeeSemantics,
@@ -1120,8 +1122,6 @@ def _validate_leg_rows(
             observed_at = _validate_timestamp(
                 observed_at_value, "route leg state_observed_at"
             )
-            if exact_rfc3339_epoch_seconds(observed_at) > completed_epoch:
-                raise RoutePublicationError("route leg state timestamp is in the future")
         raw_hash = row.get("raw_response_sha256")
         if raw_hash not in (None, "") and (
             not isinstance(raw_hash, str)
@@ -4402,6 +4402,13 @@ def _validated_prepublication_input(
         or set(build_inputs) != expected_build_fields
     ):
         raise RoutePublicationError("opportunity build input schema is invalid")
+    if (
+        terminal_input
+        and build_inputs.get("now") != cohort["collection_completed_at"]
+    ):
+        raise RoutePublicationError(
+            "terminal opportunity replay time does not match core"
+        )
     if not isinstance(classified, Mapping) or set(classified) != OPPORTUNITY_FIELDS:
         raise RoutePublicationError("classified opportunity schema is invalid")
     if (
@@ -4505,20 +4512,41 @@ def _validated_prepublication_input(
             raise RoutePublicationError("opportunity quote lineage mismatch")
 
     raw_costs = build_inputs.get("cost_components")
-    if isinstance(raw_costs, (str, bytes, Mapping)):
-        raise RoutePublicationError("opportunity cost inventory is invalid")
-    costs = [dict(row) for row in raw_costs]
-    try:
-        validate_cost_components(costs)
-    except (TypeError, ValueError) as error:
-        raise RoutePublicationError("opportunity cost inventory is invalid") from error
+    if terminal_input:
+        try:
+            costs = validate_terminal_cex_cost_components(
+                raw_costs,
+                cohort_id=classified["cohort_id"],
+                opportunity_id=classified["opportunity_id"],
+                route=route,
+                requested_notional_usd=build_inputs[
+                    "requested_notional_usd"
+                ],
+                reason_code=classified["primary_reason"],
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise RoutePublicationError(
+                "terminal opportunity cost inventory is invalid"
+            ) from error
+    else:
+        if isinstance(raw_costs, (str, bytes, Mapping)):
+            raise RoutePublicationError("opportunity cost inventory is invalid")
+        try:
+            costs = [dict(row) for row in raw_costs]
+            validate_cost_components(costs)
+        except (TypeError, ValueError) as error:
+            raise RoutePublicationError(
+                "opportunity cost inventory is invalid"
+            ) from error
     keys = {(str(row["leg"]), str(row["component_type"])) for row in costs}
     expected_keys = live_complete_cost_component_keys(route)
     if len(keys) != len(costs) or keys != expected_keys:
         raise RoutePublicationError("opportunity cost component set is not exact")
     if classified.get("cost_component_set_sha256") != _canonical_cost_set_sha256(costs):
         raise RoutePublicationError("opportunity cost component binding mismatch")
-    return dict(classified), dict(build_inputs), costs
+    canonical_build_inputs = dict(build_inputs)
+    canonical_build_inputs["cost_components"] = costs
+    return dict(classified), canonical_build_inputs, costs
 
 
 def _strict_cex_replay(
@@ -5543,6 +5571,8 @@ def _validate_complete_terminal_opportunity(
     component_rows: Sequence[Mapping[str, Any]],
     route: Mapping[str, Any],
     legs_by_market: Mapping[str, Mapping[str, Any]],
+    *,
+    validated_at: str,
 ) -> None:
     """Validate the sole source-less, null-target complete-bundle shape."""
     reason = row.get("primary_reason")
@@ -5570,7 +5600,12 @@ def _validate_complete_terminal_opportunity(
     if buy_leg is None or sell_leg is None:
         raise RoutePublicationError("terminal route opportunity leg is absent")
     try:
-        timing = classify_route_timing(route, buy_leg, sell_leg)
+        timing = classify_terminal_route_timing(
+            route,
+            buy_leg,
+            sell_leg,
+            validated_at=validated_at,
+        )
     except (TypeError, ValueError) as error:
         raise RoutePublicationError(
             "terminal route opportunity timing is invalid"
@@ -5583,29 +5618,19 @@ def _validate_complete_terminal_opportunity(
         raise RoutePublicationError(
             "terminal route opportunity timing does not recompute"
         )
-    if len(component_rows) != 3 or any(
-        component.get("cohort_id") != row.get("cohort_id")
-        or component.get("opportunity_id") != row.get("opportunity_id")
-        or component.get("requested_notional_usd")
-        != row.get("requested_notional_usd")
-        or component.get("market_id") != (
-            ""
-            if component.get("leg") == "route"
-            else route.get(str(component.get("leg")) + "_market_id")
+    try:
+        validate_terminal_cex_cost_components(
+            component_rows,
+            cohort_id=row["cohort_id"],
+            opportunity_id=row["opportunity_id"],
+            route=route,
+            requested_notional_usd=row["requested_notional_usd"],
+            reason_code=reason,
         )
-        or component.get("target_token_quantity") is not None
-        or component.get("value_status") not in TERMINAL_VALUE_STATUSES
-        or component.get("amount_usd") is not None
-        or component.get("rate_bps") is not None
-        or component.get("strict_eligible") is not False
-        or component.get("embedded_in_leg_quote") is not False
-        or component.get("observed_at") is not None
-        or component.get("valid_until") is not None
-        or component.get("source_record_sha256") is not None
-        or component.get("reason_code") != reason
-        for component in component_rows
-    ):
-        raise RoutePublicationError("terminal route opportunity costs are invalid")
+    except (KeyError, TypeError, ValueError) as error:
+        raise RoutePublicationError(
+            "terminal route opportunity costs are invalid"
+        ) from error
 
 
 def _validate_complete_logical_bundle_shared(
@@ -5861,6 +5886,7 @@ def _validate_complete_logical_bundle_shared(
                 component_rows,
                 route,
                 legs_by_market,
+                validated_at=context["collection_completed_at"],
             )
         if row.get("strict_eligible"):
             strict_cex_route = _strict_cex_route_identity(route)

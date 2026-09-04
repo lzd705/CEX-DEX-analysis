@@ -418,6 +418,7 @@ class CurrentOpportunityDemoFixture:
             cost_components=loaded["cost_components"],
             route_candidates=loaded["bundle"]["routes"],
             manifest_sha256=loaded["manifest_sha256"],
+            core_context=loaded["bundle"]["core_context"],
             token=token,
             venue=venue,
             notional_usd=notional_usd,

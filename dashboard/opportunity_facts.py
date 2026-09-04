@@ -32,19 +32,19 @@ from scripts.route_publication import (
     RoutePublicationError,
     load_latest_complete_route_bundle,
 )
-from scripts.execution_cost_components import validate_cost_components
 from scripts.route_opportunity import (
     OPPORTUNITY_FIELDS,
     ROUTE_OPPORTUNITY_CONTRACT_VERSION,
     ROUTE_OPPORTUNITY_MODES,
     ROUTE_OPPORTUNITY_REASON_CODES,
+    classify_terminal_route_timing,
     route_opportunity_id,
 )
 from scripts.route_cost_topology import (
     HISTORICAL_ATOMIC_COMPONENT_MATRIX,
     live_complete_cost_component_keys,
+    validate_terminal_cex_cost_components,
 )
-from scripts.route_cohort import classify_route_timing
 from scripts.timestamp_contract import parse_rfc3339_utc
 
 
@@ -137,9 +137,6 @@ _KNOWN_COST_STATUSES = _STRICT_COST_STATUSES | {
     "stale",
 }
 _SCENARIO_COST_STATUSES = frozenset({"bounded_estimate", "assumed"})
-_TERMINAL_COST_STATUSES = frozenset({
-    "unavailable", "unsupported", "failed", "stale"
-})
 _DYNAMIC_COST_STATUSES = (
     (_STRICT_COST_STATUSES - {"not_applicable"})
     | _SCENARIO_COST_STATUSES
@@ -645,6 +642,8 @@ def _validate_terminal_opportunity(
     component_rows: Sequence[Mapping[str, Any]],
     legs_by_market: Mapping[str, Mapping[str, Any]],
     core_manifest_sha256: Any,
+    *,
+    validated_at: Any,
 ) -> None:
     """Accept null targets only for the exact retained terminal route shape."""
     reason = row.get("primary_reason")
@@ -658,12 +657,13 @@ def _validate_terminal_opportunity(
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
-        validate_cost_components(component_rows)
-        canonical_costs = sorted(
-            (dict(component) for component in component_rows),
-            key=lambda component: (
-                component["leg"], component["component_type"]
-            ),
+        canonical_costs = validate_terminal_cex_cost_components(
+            component_rows,
+            cohort_id=str(row.get("cohort_id")),
+            opportunity_id=str(row.get("opportunity_id")),
+            route=row,
+            requested_notional_usd=row.get("requested_notional_usd"),
+            reason_code=str(reason),
         )
         expected_cost_hash = hashlib.sha256(json.dumps(
             canonical_costs,
@@ -710,7 +710,12 @@ def _validate_terminal_opportunity(
     if buy_leg is None or sell_leg is None:
         raise OpportunityBundleInvalid()
     try:
-        timing = classify_route_timing(row, buy_leg, sell_leg)
+        timing = classify_terminal_route_timing(
+            row,
+            buy_leg,
+            sell_leg,
+            validated_at=validated_at,
+        )
     except (TypeError, ValueError):
         raise OpportunityBundleInvalid() from None
     if (
@@ -720,25 +725,6 @@ def _validate_terminal_opportunity(
         or timing.get("skew_seconds") != row.get("skew_seconds")
     ):
         raise OpportunityBundleInvalid()
-    if len(component_rows) != 3:
-        raise OpportunityBundleInvalid()
-    for component in component_rows:
-        leg = component.get("leg")
-        expected_direction = "route" if leg == "route" else str(leg) + "_token"
-        if (
-            component.get("direction") != expected_direction
-            or component.get("target_token_quantity") is not None
-            or component.get("value_status") not in _TERMINAL_COST_STATUSES
-            or component.get("amount_usd") is not None
-            or component.get("rate_bps") is not None
-            or component.get("strict_eligible") is not False
-            or component.get("embedded_in_leg_quote") is not False
-            or component.get("observed_at") is not None
-            or component.get("valid_until") is not None
-            or component.get("source_record_sha256") is not None
-            or component.get("reason_code") != reason
-        ):
-            raise OpportunityBundleInvalid()
 
 
 def _validate_ratio(
@@ -1014,6 +1000,7 @@ def _validate_inventory(
     costs: Sequence[Mapping[str, Any]],
     *,
     legs_by_market: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    core_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, List[Mapping[str, Any]]]:
     cohort_id = manifest.get("route_cohort_id")
     if not isinstance(cohort_id, str):
@@ -1163,11 +1150,17 @@ def _validate_inventory(
         opportunity = rows_by_id[opportunity_id]
         _validate_component_inventory(opportunity, component_rows)
         if opportunity.get("target_token_quantity") is None:
+            if not isinstance(core_context, Mapping):
+                raise OpportunityBundleInvalid()
+            validated_at = core_context.get("collection_completed_at")
+            if not isinstance(validated_at, str) or not validated_at:
+                raise OpportunityBundleInvalid()
             _validate_terminal_opportunity(
                 opportunity,
                 component_rows,
                 legs_by_market or {},
                 manifest.get("core_manifest_sha256"),
+                validated_at=validated_at,
             )
             continue
         if opportunity["opportunity_class"] == "research_estimate":
@@ -1504,6 +1497,7 @@ def build_opportunity_payload(
     direction: Optional[str] = None,
     now: Optional[datetime] = None,
     manifest_sha256: Optional[str] = None,
+    core_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build one compact, filtered view from an already validated generation."""
 
@@ -1532,6 +1526,7 @@ def build_opportunity_payload(
         manifest,
         cost_inventory,
         legs_by_market=legs_by_market,
+        core_context=core_context,
     )
     allowed_notionals = {
         _canonical_decimal_text(item, "manifest notional")
@@ -2306,6 +2301,11 @@ def opportunity_publication_health(
             loaded["manifest"],
             loaded["cost_components"],
             legs_by_market=legs_by_market,
+            core_context=(
+                loaded.get("bundle", {}).get("core_context")
+                if isinstance(loaded.get("bundle"), Mapping)
+                else None
+            ),
         )
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         evaluations = []

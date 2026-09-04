@@ -1355,10 +1355,22 @@ class TerminalOpportunityPublicationTests(TemporaryRouteRootTestCase):
             for component in component_rows:
                 component["requested_notional_usd"] = "7777"
 
+        def drift_basis(component_rows):
+            component_rows[0]["basis"] = "invented external proof"
+
+        def drift_source(component_rows):
+            component_rows[0]["source"] = "authenticated exchange fee feed"
+
+        def drift_status(component_rows):
+            component_rows[0]["value_status"] = "failed"
+
         for label, mutate in (
             ("market ID", drift_market),
             ("cohort ID", drift_cohort),
             ("requested notional", drift_notional),
+            ("basis", drift_basis),
+            ("source", drift_source),
+            ("status", drift_status),
         ):
             with self.subTest(label=label):
                 candidate = copy.deepcopy(complete)
@@ -1386,6 +1398,25 @@ class TerminalOpportunityPublicationTests(TemporaryRouteRootTestCase):
                     route_publication._validate_complete_logical_bundle(
                         candidate
                     )
+
+    def test_terminal_replay_time_is_bound_to_core_completion(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _terminal_publication_inputs(self.root, raw_root)
+        supplied = copy.deepcopy(fixture["opportunity_inputs"])
+        for item in supplied:
+            item["build_inputs"]["now"] = "2026-08-01T12:00:04Z"
+            replay_inputs = dict(item["build_inputs"])
+            replay_inputs.pop("input_kind")
+            item["classified_opportunity"] = (
+                build_terminal_route_opportunity(**replay_inputs)
+            )
+
+        with self.assertRaises(route_publication.RoutePublicationError):
+            route_publication.build_complete_route_bundle(
+                core_root=self.root,
+                raw_root=raw_root,
+                opportunity_inputs=supplied,
+            )
 
     def test_standard_and_terminal_contract_mutations_are_rejected(self):
         raw_root = Path(self.temporary.name) / "raw/route-cohort"
@@ -3390,8 +3421,45 @@ class RoutePublicationFailureTests(TemporaryRouteRootTestCase):
         for row in future_state["route_rows"]:
             row["validated_at"] = "2026-08-01T12:00:00.5Z"
         future_state = _rehash(future_state)
-        with self.assertRaisesRegex(ValueError, "state timestamp is in the future"):
+        with self.assertRaisesRegex(ValueError, "timing classification"):
             publish_route_cohort_bundle(future_state, core_root=self.root)
+
+    def test_future_state_with_exact_terminal_timing_is_retained(self):
+        cohort = _cohort()
+        cohort["collection_completed_at"] = "2026-08-01T12:00:00.5Z"
+        legs_by_market = {
+            leg["market_id"]: leg for leg in cohort["legs"]
+        }
+        routes_by_id = {
+            route["route_id"]: route for route in cohort["routes"]
+        }
+        for row in cohort["route_rows"]:
+            row["validated_at"] = cohort["collection_completed_at"]
+            timing = route_publication.classify_route_timing(
+                {
+                    **routes_by_id[row["route_id"]],
+                    "validated_at": cohort["collection_completed_at"],
+                    "skew_sla_seconds": cohort["skew_sla_seconds"],
+                },
+                legs_by_market[row["buy_market_id"]],
+                legs_by_market[row["sell_market_id"]],
+            )
+            row.update({
+                "skew_seconds": timing["skew_seconds"],
+                "timing_status": timing["timing_status"],
+                "reason_code": timing["reason_code"],
+            })
+        cohort = _rehash(cohort)
+
+        pointer = publish_route_cohort_bundle(cohort, core_root=self.root)
+        loaded = route_publication.load_latest_route_cohort(self.root)
+
+        self.assertEqual(pointer["route_cohort_id"], cohort["route_cohort_id"])
+        self.assertTrue(all(
+            row["timing_status"] == "unavailable"
+            and row["reason_code"] == "invalid_state_timestamp"
+            for row in loaded["cohort"]["route_rows"]
+        ))
 
     def test_candidate_and_collection_source_generation_conflicts_fail_closed(self):
         candidate_conflict = _cohort()

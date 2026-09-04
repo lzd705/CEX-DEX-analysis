@@ -491,6 +491,9 @@ class TerminalOpportunityBundleTests(unittest.TestCase):
                 legs=[build_inputs["buy_leg"], build_inputs["sell_leg"]],
                 cost_components=build_inputs["cost_components"],
                 route_candidates=[route_candidate],
+                core_context={
+                    "collection_completed_at": build_inputs["now"]
+                },
                 now=NOW,
             )
         except OpportunityBundleInvalid as error:
@@ -508,6 +511,51 @@ class TerminalOpportunityBundleTests(unittest.TestCase):
             item["amount_usd"] is None and item["rate_bps"] is None
             for item in projected["cost_components"]
         ))
+
+    def test_terminal_shape_requires_complete_core_context(self):
+        build_inputs, row, route_candidate = self._terminal()
+
+        with self.assertRaises(OpportunityBundleInvalid):
+            build_opportunity_payload(
+                [row],
+                manifest=_manifest(
+                    [row],
+                    core_manifest_sha256=build_inputs[
+                        "core_manifest_sha256"
+                    ],
+                ),
+                legs=[build_inputs["buy_leg"], build_inputs["sell_leg"]],
+                cost_components=build_inputs["cost_components"],
+                route_candidates=[route_candidate],
+                now=NOW,
+            )
+
+    def test_terminal_health_replays_complete_core_context(self):
+        build_inputs, row, _route_candidate = self._terminal()
+        loaded = {
+            "manifest": _manifest(
+                [row],
+                core_manifest_sha256=build_inputs["core_manifest_sha256"],
+            ),
+            "manifest_sha256": "a" * 64,
+            "opportunities": [row],
+            "cost_components": build_inputs["cost_components"],
+            "legs": [build_inputs["buy_leg"], build_inputs["sell_leg"]],
+            "bundle": {
+                "core_context": {
+                    "collection_completed_at": build_inputs["now"]
+                }
+            },
+        }
+
+        with patch(
+            "dashboard.opportunity_facts.load_latest_opportunities",
+            return_value=loaded,
+        ):
+            health = opportunity_publication_health(now=NOW)
+
+        self.assertEqual(health["status"], "unavailable")
+        self.assertEqual(health["reason"], "route_timestamp_absent")
 
     def test_terminal_identity_and_core_lineage_are_trusted(self):
         build_inputs, row, _route_candidate = self._terminal()
@@ -570,8 +618,105 @@ class TerminalOpportunityBundleTests(unittest.TestCase):
                         manifest=manifest,
                         legs=baseline_legs,
                         cost_components=costs,
+                        core_context={
+                            "collection_completed_at": build_inputs["now"]
+                        },
                         now=NOW,
                     )
+
+    def test_terminal_cost_semantics_cannot_be_rehashed_into_dashboard(self):
+        build_inputs, row, route_candidate = self._terminal()
+        legs = [build_inputs["buy_leg"], build_inputs["sell_leg"]]
+        manifest = _manifest(
+            [row],
+            core_manifest_sha256=build_inputs["core_manifest_sha256"],
+        )
+        for label, field, value in (
+            ("basis", "basis", "invented external proof"),
+            ("source", "source", "authenticated exchange fee feed"),
+            ("status", "value_status", "failed"),
+        ):
+            with self.subTest(label=label):
+                costs = copy.deepcopy(build_inputs["cost_components"])
+                costs[0][field] = value
+                canonical_costs = sorted(
+                    costs,
+                    key=lambda component: (
+                        component["leg"], component["component_type"]
+                    ),
+                )
+                mutated = {
+                    **row,
+                    "cost_component_set_sha256": hashlib.sha256(json.dumps(
+                        canonical_costs,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")).hexdigest(),
+                }
+                with self.assertRaises(OpportunityBundleInvalid):
+                    build_opportunity_payload(
+                        [_rehash_terminal_row(mutated)],
+                        manifest=manifest,
+                        legs=legs,
+                        cost_components=costs,
+                        route_candidates=[route_candidate],
+                        core_context={
+                            "collection_completed_at": build_inputs["now"]
+                        },
+                        now=NOW,
+                    )
+
+    def test_invalid_state_terminal_uses_core_time_not_request_time(self):
+        build_inputs, row, route_candidate = self._terminal()
+        legs = []
+        for leg in (build_inputs["buy_leg"], build_inputs["sell_leg"]):
+            legs.append({
+                **leg,
+                "status": "observed",
+                "available": True,
+                "reason_code": None,
+                "state_observed_at": "2026-08-01T12:02:00.000000001Z",
+            })
+        costs = [
+            {**component, "reason_code": "invalid_state_timestamp"}
+            for component in build_inputs["cost_components"]
+        ]
+        canonical_costs = sorted(
+            costs,
+            key=lambda component: (
+                component["leg"], component["component_type"]
+            ),
+        )
+        terminal = _rehash_terminal_row({
+            **row,
+            "primary_reason": "invalid_state_timestamp",
+            "reason_codes": ["invalid_state_timestamp"],
+            "cost_component_set_sha256": hashlib.sha256(json.dumps(
+                canonical_costs,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
+        })
+
+        payload = build_opportunity_payload(
+            [terminal],
+            manifest=_manifest(
+                [terminal],
+                core_manifest_sha256=build_inputs["core_manifest_sha256"],
+            ),
+            legs=legs,
+            cost_components=costs,
+            route_candidates=[route_candidate],
+            core_context={"collection_completed_at": "2026-08-01T12:02:00Z"},
+            now=datetime(2026, 8, 1, 12, 10, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(
+            payload["routes"][0]["availability"],
+            {"status": "unavailable", "reason": "invalid_state_timestamp"},
+        )
 
     def test_standard_null_target_and_terminal_mutations_fail_closed(self):
         build_inputs, row, route_candidate = self._terminal()
@@ -632,6 +777,9 @@ class TerminalOpportunityBundleTests(unittest.TestCase):
                             if label != "standard null target"
                             else None
                         ),
+                        core_context={
+                            "collection_completed_at": build_inputs["now"]
+                        },
                         now=NOW,
                     )
 
@@ -1103,6 +1251,9 @@ class OpportunityPayloadTests(unittest.TestCase):
                 opportunity_class="all",
                 sort="net_edge_usd",
                 direction=direction,
+                core_context={
+                    "collection_completed_at": terminal_inputs["now"]
+                },
                 now=NOW,
             )
             for direction in ("asc", "desc")
@@ -1116,6 +1267,9 @@ class OpportunityPayloadTests(unittest.TestCase):
             opportunity_class="all",
             sort="net_edge_usd",
             direction="asc",
+            core_context={
+                "collection_completed_at": terminal_inputs["now"]
+            },
             now=NOW,
         )
         cake_only = build_opportunity_payload(
@@ -1127,6 +1281,9 @@ class OpportunityPayloadTests(unittest.TestCase):
             opportunity_class="all",
             sort="net_edge_usd",
             direction="desc",
+            core_context={
+                "collection_completed_at": terminal_inputs["now"]
+            },
             now=NOW,
         )
 
@@ -1686,6 +1843,34 @@ class OpportunityServerTests(unittest.TestCase):
                 ("sort", "net_edge_usd"),
                 ("dir", "desc"),
             ),
+        )
+
+    def test_route_builder_passes_complete_core_context_to_dashboard(self):
+        core_context = {
+            "collection_completed_at": "2026-08-01T12:02:00Z"
+        }
+        loaded = {
+            "opportunities": [],
+            "manifest": {},
+            "legs": [],
+            "cost_components": [],
+            "bundle": {"routes": [], "core_context": core_context},
+            "manifest_sha256": "a" * 64,
+        }
+        with patch.object(
+            server,
+            "load_latest_opportunities",
+            return_value=loaded,
+        ), patch.object(
+            server,
+            "build_opportunity_payload",
+            return_value={"routes": []},
+        ) as build_payload:
+            server.build_route_opportunities()
+
+        self.assertEqual(
+            build_payload.call_args.kwargs["core_context"],
+            core_context,
         )
 
     def test_invalid_query_enums_and_numbers_are_bounded_client_errors(self):

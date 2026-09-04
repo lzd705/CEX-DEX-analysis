@@ -26,7 +26,10 @@ try:
     )
     from scripts.fetch_cex_depth import route_quantity_quote_for_book
     from scripts.route_cohort import canonical_route_id, classify_route_timing
-    from scripts.route_cost_topology import live_complete_cost_component_keys
+    from scripts.route_cost_topology import (
+        live_complete_cost_component_keys,
+        validate_terminal_cex_cost_components,
+    )
     from scripts.route_quantity import (
         CommonTarget,
         FeeSemantics,
@@ -52,6 +55,7 @@ except ModuleNotFoundError:
     )
     from route_cost_topology import (  # type: ignore
         live_complete_cost_component_keys,
+        validate_terminal_cex_cost_components,
     )
     from route_quantity import (  # type: ignore
         CommonTarget,
@@ -349,6 +353,29 @@ def _timestamp(value: Any, field: str) -> Tuple[str, Fraction]:
     except (OverflowError, ValueError) as error:
         raise ValueError("{} must be RFC 3339 text".format(field)) from error
     return text, Fraction(epoch)
+
+
+def classify_terminal_route_timing(
+    route: Mapping[str, Any],
+    buy_leg: Mapping[str, Any],
+    sell_leg: Mapping[str, Any],
+    *,
+    validated_at: Any,
+) -> Dict[str, Any]:
+    """Replay terminal timing against the immutable cohort evaluation time."""
+    validated_text, _epoch = _timestamp(
+        validated_at,
+        "terminal timing validated_at",
+    )
+    return classify_route_timing(
+        {
+            **dict(route),
+            "validated_at": validated_text,
+            "skew_sla_seconds": _decimal_text(MAX_ROUTE_SKEW_SECONDS),
+        },
+        buy_leg,
+        sell_leg,
+    )
 
 
 def _canonical_json_sha256(value: Any) -> str:
@@ -1284,47 +1311,13 @@ def _terminal_cost_component_hash(
     requested_notional: Decimal,
     reason_code: str,
 ) -> str:
-    if isinstance(rows, (str, bytes, Mapping)):
-        raise ValueError("terminal cost component inventory is invalid")
-    inventory = [dict(row) for row in rows]
-    validate_cost_components(inventory)
-    expected_keys = live_complete_cost_component_keys(route)
-    observed_keys = {
-        (str(row["leg"]), str(row["component_type"]))
-        for row in inventory
-    }
-    if (
-        len(inventory) != 3
-        or len(observed_keys) != len(inventory)
-        or observed_keys != expected_keys
-    ):
-        raise ValueError("terminal CEX cost component set is not exact")
-    expected_notional = _decimal_text(requested_notional)
-    for row in inventory:
-        leg = str(row["leg"])
-        expected_market = "" if leg == "route" else route[leg + "_market_id"]
-        expected_direction = "route" if leg == "route" else leg + "_token"
-        if (
-            row["cohort_id"] != cohort_id
-            or row["opportunity_id"] != opportunity_id
-            or row["requested_notional_usd"] != expected_notional
-            or row["target_token_quantity"] is not None
-            or row["market_id"] != expected_market
-            or row["direction"] != expected_direction
-            or row["value_status"] not in TERMINAL_VALUE_STATUSES
-            or row["amount_usd"] is not None
-            or row["rate_bps"] is not None
-            or row["strict_eligible"] is not False
-            or row["embedded_in_leg_quote"] is not False
-            or row["observed_at"] is not None
-            or row["valid_until"] is not None
-            or row["source_record_sha256"] is not None
-            or row["reason_code"] != reason_code
-        ):
-            raise ValueError("terminal CEX cost component is inconsistent")
-    canonical_rows = sorted(
-        inventory,
-        key=lambda row: (row["leg"], row["component_type"]),
+    canonical_rows = validate_terminal_cex_cost_components(
+        rows,
+        cohort_id=cohort_id,
+        opportunity_id=opportunity_id,
+        route=route,
+        requested_notional_usd=_decimal_text(requested_notional),
+        reason_code=reason_code,
     )
     return _canonical_json_sha256(canonical_rows)
 
@@ -1366,10 +1359,12 @@ def build_terminal_route_opportunity(
         != {"route_id", "skew_seconds", "timing_status", "reason_code"}
     ):
         raise ValueError("terminal route timing schema is invalid")
-    expected_timing = classify_route_timing(
+    now_text, _now_epoch = _timestamp(now, "now")
+    expected_timing = classify_terminal_route_timing(
         normalized_route,
         buy_leg,
         sell_leg,
+        validated_at=now_text,
     )
     if dict(route_timing) != dict(expected_timing):
         raise ValueError("terminal route timing does not recompute")
@@ -1385,7 +1380,6 @@ def build_terminal_route_opportunity(
         "requested_notional_usd",
         positive=True,
     )
-    _timestamp(now, "now")
     core_hash = _hash(core_manifest_sha256, "core_manifest_sha256")
     opportunity_id = route_opportunity_id(
         normalized_route["route_id"],

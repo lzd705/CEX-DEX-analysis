@@ -51,7 +51,10 @@ from scripts.route_cost_evidence import (
     typed_sha256,
     validate_retained_v2_pool_state_member,
 )
-from scripts.route_cost_topology import live_complete_cost_component_keys
+from scripts.route_cost_topology import (
+    build_terminal_cex_cost_components,
+    live_complete_cost_component_keys,
+)
 from scripts.route_inventory import (
     classify_route_mode_evidence,
     inventory_capacity_for_route,
@@ -955,43 +958,6 @@ def _load_cex_sources(
     return sources, legs_by_market
 
 
-def _terminal_cex_cost_components(
-    *,
-    cohort_id: str,
-    route: Mapping[str, Any],
-    requested_notional_usd: Decimal,
-    reason_code: str,
-) -> List[Dict[str, Any]]:
-    opportunity_id = route_opportunity_id(
-        route["route_id"], requested_notional_usd
-    )
-    rows = []
-    for leg, component_type in sorted(
-        live_complete_cost_component_keys(route)
-    ):
-        rows.append(cost_component_row(
-            cohort_id=cohort_id,
-            opportunity_id=opportunity_id,
-            leg=leg,
-            market_id=("" if leg == "route" else route[leg + "_market_id"]),
-            direction=("route" if leg == "route" else leg + "_token"),
-            requested_notional_usd=requested_notional_usd,
-            target_token_quantity=None,
-            component_type=component_type,
-            value_status="unavailable",
-            amount_usd=None,
-            rate_bps=None,
-            basis="retained route timing proves route unavailable",
-            strict_eligible=False,
-            observed_at=None,
-            valid_until=None,
-            source="retained route timing",
-            source_record_sha256=None,
-            reason_code=reason_code,
-        ))
-    return rows
-
-
 def _build_inputs(
     *,
     root: Path,
@@ -1319,8 +1285,11 @@ def _build_public_cex_research_inputs(
                 mode = classify_route_mode_evidence(route, now=cohort_now)
                 for raw_notional in cohort["requested_notionals_usd"]:
                     notional = Decimal(str(raw_notional))
-                    costs = _terminal_cex_cost_components(
+                    costs = build_terminal_cex_cost_components(
                         cohort_id=cohort["route_cohort_id"],
+                        opportunity_id=route_opportunity_id(
+                            route["route_id"], notional
+                        ),
                         route=route,
                         requested_notional_usd=notional,
                         reason_code=terminal_timing["reason_code"],

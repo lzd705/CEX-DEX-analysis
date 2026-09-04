@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import http.client
@@ -2231,7 +2231,14 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
         latest.write_bytes(self.old_pointer_bytes)
         return data_dir, fixture, latest
 
-    def _install_public_core(self, *, failed_market_id=None):
+    def _install_public_core(
+        self,
+        *,
+        failed_market_id=None,
+        future_market_id=None,
+    ):
+        if failed_market_id is not None and failed_market_id == future_market_id:
+            raise ValueError("one market cannot be failed and future-dated")
         data_dir, fixture, latest = self._install_aave_core()
         core_root = data_dir / "routes/core"
         raw_root = data_dir / "raw/route-cohort"
@@ -2240,6 +2247,12 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
         universe = build_live_cex_research_universe()
         run_id = cohort["raw_evidence_run_id"]
         typed_root = raw_root / run_id / "typed"
+        completed_at = datetime.fromisoformat(
+            cohort["collection_completed_at"].replace("Z", "+00:00")
+        )
+        future_state_observed_at = (
+            completed_at + timedelta(microseconds=1)
+        ).isoformat().replace("+00:00", "Z")
 
         old_legs = {
             leg["market_id"].split(":", 2)[1]: leg
@@ -2290,6 +2303,8 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
                 }[venue],
                 "raw_response_sha256": hashlib.sha256(response).hexdigest(),
             })
+            if market_id == future_market_id:
+                leg["state_observed_at"] = future_state_observed_at
             if market_id == failed_market_id:
                 leg = {
                     "leg_id": market_id,
@@ -2474,6 +2489,11 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
     def _install_terminal_cake_core(self):
         return self._install_public_core(
             failed_market_id="cex:bybit:CAKE/USDT"
+        )
+
+    def _install_future_cake_core(self):
+        return self._install_public_core(
+            future_market_id="cex:bybit:CAKE/USDT"
         )
 
     def _write_schedule(self, rows=None):
@@ -2754,6 +2774,66 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
                 and component["amount_usd"] is None
                 and component["rate_bps"] is None
                 and component["reason_code"] == reason
+                for component in build["cost_components"]
+            ))
+
+    def test_future_cake_state_publishes_ten_isolated_terminal_rows(self):
+        data_dir, _fixture, latest = self._install_future_cake_core()
+        schedule = self._write_schedule()
+        captured = {}
+        actual_publish = opportunity_pipeline.publish_complete_route_bundle
+
+        def capture_and_publish(**kwargs):
+            captured["inputs"] = kwargs["opportunity_inputs"]
+            return actual_publish(**kwargs)
+
+        with patch(
+            "scripts.route_opportunity_pipeline.publish_complete_route_bundle",
+            side_effect=capture_and_publish,
+        ):
+            pointer = self._finalize_public(data_dir, schedule)
+
+        self.assertNotEqual(latest.read_bytes(), self.old_pointer_bytes)
+        loaded = load_latest_complete_route_bundle(
+            data_dir / "routes",
+            core_root=data_dir / "routes/core",
+        )
+        self.assertEqual(pointer, loaded["pointer"])
+        rows = loaded["bundle"]["opportunities"]
+        uni = [row for row in rows if row["token_symbol"] == "UNI"]
+        cake = [row for row in rows if row["token_symbol"] == "CAKE"]
+        self.assertEqual((len(uni), len(cake)), (10, 10))
+        self.assertTrue(all(
+            row["opportunity_class"] == "research_estimate"
+            and row["research_net_edge_usd"] is not None
+            for row in uni
+        ))
+        self.assertTrue(all(
+            row["opportunity_class"] == "unavailable"
+            and row["primary_reason"] == "invalid_state_timestamp"
+            and row["target_token_quantity"] is None
+            and row["research_net_edge_usd"] is None
+            for row in cake
+        ))
+        terminal_inputs = [
+            item for item in captured["inputs"]
+            if item["classified_opportunity"]["token_symbol"] == "CAKE"
+        ]
+        self.assertEqual(len(terminal_inputs), 10)
+        validated_at = loaded["bundle"]["core_context"][
+            "collection_completed_at"
+        ]
+        for item in terminal_inputs:
+            build = item["build_inputs"]
+            self.assertEqual(build["input_kind"], "terminal_route")
+            self.assertEqual(build["now"], validated_at)
+            self.assertEqual(item["source_members"], {})
+            self.assertTrue(all(
+                component["value_status"] == "unavailable"
+                and component["basis"]
+                == "retained route timing proves route unavailable"
+                and component["source"] == "retained route timing"
+                and component["reason_code"] == "invalid_state_timestamp"
                 for component in build["cost_components"]
             ))
 

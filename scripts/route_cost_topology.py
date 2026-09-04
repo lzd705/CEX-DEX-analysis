@@ -4,18 +4,21 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
+import json
 import re
-from typing import Any, FrozenSet, Mapping, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Sequence, Tuple
 
 try:
     from scripts.execution_cost_components import (
         COST_COMPONENT_COLUMNS,
         COST_COMPONENT_CONTRACT_VERSION,
+        cost_component_row,
     )
 except ModuleNotFoundError:
     from execution_cost_components import (  # type: ignore[no-redef]
         COST_COMPONENT_COLUMNS,
         COST_COMPONENT_CONTRACT_VERSION,
+        cost_component_row,
     )
 
 
@@ -90,6 +93,95 @@ def live_complete_cost_component_keys(
     if has_dex:
         expected.add(("route", "mev_buffer"))
     return frozenset(expected)
+
+
+def build_terminal_cex_cost_components(
+    *,
+    cohort_id: str,
+    opportunity_id: str,
+    route: Mapping[str, Any],
+    requested_notional_usd: Any,
+    reason_code: str,
+) -> List[Dict[str, Any]]:
+    """Derive the sole source-less three-row CEX terminal cost inventory."""
+    if not isinstance(route, Mapping) or any(
+        _market_kind(route.get(leg + "_market_id")) != "cex"
+        for leg in ("buy", "sell")
+    ):
+        raise ValueError("terminal cost route must be CEX to CEX")
+    rows: List[Dict[str, Any]] = []
+    for leg, component_type in sorted(
+        live_complete_cost_component_keys(route)
+    ):
+        rows.append(cost_component_row(
+            cohort_id=cohort_id,
+            opportunity_id=opportunity_id,
+            leg=leg,
+            market_id=("" if leg == "route" else route[leg + "_market_id"]),
+            direction=("route" if leg == "route" else leg + "_token"),
+            requested_notional_usd=requested_notional_usd,
+            target_token_quantity=None,
+            component_type=component_type,
+            value_status="unavailable",
+            amount_usd=None,
+            rate_bps=None,
+            basis="retained route timing proves route unavailable",
+            strict_eligible=False,
+            embedded_in_leg_quote=False,
+            observed_at=None,
+            valid_until=None,
+            source="retained route timing",
+            source_record_sha256=None,
+            reason_code=reason_code,
+        ))
+    return rows
+
+
+def validate_terminal_cex_cost_components(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    cohort_id: str,
+    opportunity_id: str,
+    route: Mapping[str, Any],
+    requested_notional_usd: Any,
+    reason_code: str,
+) -> List[Dict[str, Any]]:
+    """Return canonical terminal rows only after exact byte-level comparison."""
+    if isinstance(rows, (str, bytes, Mapping)):
+        raise ValueError("terminal CEX cost component inventory is invalid")
+    expected = build_terminal_cex_cost_components(
+        cohort_id=cohort_id,
+        opportunity_id=opportunity_id,
+        route=route,
+        requested_notional_usd=requested_notional_usd,
+        reason_code=reason_code,
+    )
+    try:
+        supplied = sorted(
+            (dict(row) for row in rows),
+            key=lambda row: (row["leg"], row["component_type"]),
+        )
+        supplied_bytes = json.dumps(
+            supplied,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        expected_bytes = json.dumps(
+            expected,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "terminal CEX cost component inventory is invalid"
+        ) from error
+    if supplied_bytes != expected_bytes:
+        raise ValueError("terminal CEX cost component inventory is inconsistent")
+    return expected
 
 
 def _canonical_nonnegative_decimal(value: Any, label: str) -> Tuple[str, Fraction]:
