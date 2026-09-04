@@ -208,6 +208,7 @@ MAX_RETRIES = 3
 STRICT_CEX_TYPED_RULE_VENUES = frozenset({"binance", "bybit"})
 STRICT_CEX_TYPED_VALIDITY_SECONDS = 60
 MAX_CEX_TYPED_RULE_RESPONSE_BYTES = 256 * 1024
+MAX_CEX_BOOK_RESPONSE_BYTES = 2 * 1024 * 1024
 
 # Public REST limits differ by venue.  A completeness flag prevents a limited
 # response from being represented as the venue's complete depth.
@@ -857,13 +858,11 @@ def request_json(
     deadline: CollectionDeadline | None = None,
     timeout_seconds: float = 30,
     max_retries: int = MAX_RETRIES,
-    max_bytes: int | None = None,
+    max_bytes: int = MAX_CEX_BOOK_RESPONSE_BYTES,
 ) -> tuple[Any, bytes]:
     if max_retries < 1:
         raise ValueError("max_retries must be at least 1")
-    if max_bytes is not None and (
-        type(max_bytes) is not int or max_bytes < 1
-    ):
+    if type(max_bytes) is not int or max_bytes < 1:
         raise ValueError("max_bytes must be a positive integer")
     request = urllib.request.Request(
         url,
@@ -880,12 +879,8 @@ def request_json(
                 else timeout_seconds
             )
             with open_public_json_request(request, timeout=timeout) as response:
-                raw = (
-                    response.read()
-                    if max_bytes is None
-                    else response.read(max_bytes + 1)
-                )
-                if max_bytes is not None and len(raw) > max_bytes:
+                raw = response.read(max_bytes + 1)
+                if len(raw) > max_bytes:
                     raise ValueError("HTTP response exceeds its byte limit")
                 return json.loads(raw.decode("utf-8")), raw
         except urllib.error.HTTPError as error:
@@ -923,6 +918,7 @@ def open_public_json_request(
 ) -> Any:
     """Open one public JSON request without widening its endpoint by redirect."""
     opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
         _NoRedirectHandler(),
         urllib.request.HTTPSHandler(context=TLS_CONTEXT),
     )

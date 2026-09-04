@@ -3771,7 +3771,7 @@ class FakeResponse:
     def __exit__(self, exc_type, exc_value, traceback):
         return False
 
-    def read(self):
+    def read(self, _size=-1):
         return self.payload
 
 

@@ -93,6 +93,94 @@ def write_snapshot_rows(path, rows):
 
 
 class FetchCexDepthTest(unittest.TestCase):
+    def test_public_json_request_ignores_inherited_proxy_configuration(self):
+        request = fetch_cex_depth.urllib.request.Request(
+            "https://api.binance.com/api/v3/exchangeInfo?symbol=UNIUSDT"
+        )
+        response = object()
+        with patch(
+            "urllib.request.getproxies",
+            return_value={
+                "https": "http://proxy-user:proxy-secret@proxy.invalid:8123"
+            },
+        ) as getproxies, patch.object(
+            fetch_cex_depth.urllib.request.OpenerDirector,
+            "open",
+            return_value=response,
+        ) as open_request:
+            returned = fetch_cex_depth.open_public_json_request(
+                request,
+                timeout=1.5,
+            )
+
+        self.assertIs(returned, response)
+        getproxies.assert_not_called()
+        open_request.assert_called_once_with(request, timeout=1.5)
+
+    def test_order_book_http_body_uses_a_fixed_default_bound(self):
+        self.assertEqual(
+            fetch_cex_depth.MAX_CEX_BOOK_RESPONSE_BYTES,
+            2 * 1024 * 1024,
+        )
+
+        class BoundedResponse:
+            def __init__(self):
+                self.read_sizes = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, size=-1):
+                self.read_sizes.append(size)
+                return b"{}"
+
+        response = BoundedResponse()
+        with patch(
+            "scripts.fetch_cex_depth.open_public_json_request",
+            return_value=response,
+        ):
+            payload, raw = fetch_cex_depth.request_json(
+                "https://data-api.binance.vision/api/v3/depth"
+                "?symbol=UNIUSDT&limit=100",
+                max_retries=1,
+            )
+
+        self.assertEqual((payload, raw), ({}, b"{}"))
+        self.assertEqual(
+            response.read_sizes,
+            [fetch_cex_depth.MAX_CEX_BOOK_RESPONSE_BYTES + 1],
+        )
+
+    def test_order_book_http_body_one_byte_over_default_bound_is_rejected(self):
+        self.assertEqual(
+            fetch_cex_depth.MAX_CEX_BOOK_RESPONSE_BYTES,
+            2 * 1024 * 1024,
+        )
+
+        class OversizedResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, size=-1):
+                return b"{" + b" " * (size - 1)
+
+        with patch(
+            "scripts.fetch_cex_depth.open_public_json_request",
+            return_value=OversizedResponse(),
+        ):
+            with self.assertRaisesRegex(ValueError, "response exceeds"):
+                fetch_cex_depth.request_json(
+                    "https://api.bybit.com/v5/market/orderbook"
+                    "?category=spot&symbol=CAKEUSDT&limit=1000",
+                    max_retries=1,
+                )
+
     def test_request_json_does_not_follow_redirects(self):
         from scripts.fetch_cex_depth import request_json
 
