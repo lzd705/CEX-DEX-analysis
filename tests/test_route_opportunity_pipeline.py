@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack, redirect_stdout
 from unittest.mock import patch
 
 from scripts.route_cost_evidence import (
@@ -74,6 +76,144 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("--shadow-run-id", completed.stdout)
         self.assertIn("--expected-joint-pointer-sha256", completed.stdout)
+
+    def test_cli_serve_publishes_then_execs_read_only_loopback_dashboard(self):
+        data_dir, fixture, joint = self._install_real_cex_run()
+        output = io.StringIO()
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {
+                "MARKET_CEX_PRIVATE_FEE_PROFILE": str(
+                    fixture["fee_profile_path"]
+                ),
+                "MARKET_ROUTE_PRIVATE_INVENTORY_PROFILE": str(
+                    fixture["inventory_profile_path"]
+                ),
+                "ADMIN_JOB_DIR": "/ambient/admin/jobs",
+                "TOKEN_REGISTRY_PATH": "/ambient/admin/registry.json",
+            }, clear=False))
+            dashboard_exec = stack.enter_context(patch.object(
+                opportunity_pipeline.os,
+                "execve",
+                side_effect=RuntimeError("dashboard exec sentinel"),
+            ))
+            stack.enter_context(redirect_stdout(output))
+            stack.enter_context(self.assertRaisesRegex(
+                RuntimeError, "dashboard exec sentinel"
+            ))
+            opportunity_pipeline.main([
+                "--data-dir", str(data_dir),
+                "--shadow-run-id", joint["pointer"]["run_id"],
+                "--expected-joint-pointer-sha256", joint["pointer_sha256"],
+                "--serve",
+                "--port", "43210",
+            ])
+
+        loaded = load_latest_complete_route_bundle(
+            data_dir / "routes", core_root=data_dir / "routes/core"
+        )
+        self.assertEqual(len(loaded["bundle"]["opportunities"]), 5)
+        self.assertEqual(
+            json.loads(output.getvalue().splitlines()[0]), loaded["pointer"]
+        )
+        executable, arguments, environment = dashboard_exec.call_args.args
+        project_root = Path(opportunity_pipeline.__file__).resolve().parents[1]
+        self.assertEqual(executable, sys.executable)
+        self.assertEqual(arguments, [
+            sys.executable,
+            str(project_root / "scripts/run_current_opportunity_dashboard.py"),
+            "--data-dir", str(data_dir.resolve()),
+            "--port", "43210",
+        ])
+        self.assertEqual(environment["DASHBOARD_SKIP_LOCAL_ENV"], "true")
+        self.assertEqual(
+            environment["MARKET_ROUTE_DATA_DIR"],
+            str((data_dir / "routes").resolve()),
+        )
+        for name in (
+            "ADMIN_ENABLED",
+            "PUBLIC_ADD_TOKEN_ENABLED",
+            "PUBLIC_QUALITY_RETRY_ENABLED",
+            "PUBLIC_FACT_REFRESH_ENABLED",
+        ):
+            self.assertEqual(environment[name], "false")
+        for name in (
+            "MARKET_CEX_PRIVATE_FEE_PROFILE",
+            "MARKET_ROUTE_PRIVATE_INVENTORY_PROFILE",
+            "ADMIN_JOB_DIR",
+            "TOKEN_REGISTRY_PATH",
+        ):
+            self.assertNotIn(name, environment)
+
+    def test_cli_never_serves_when_published_bundle_cannot_be_reloaded(self):
+        data_dir, fixture, joint = self._install_real_cex_run()
+        actual_finalizer = opportunity_pipeline.finalize_cex_route_opportunities
+
+        def finalize_then_corrupt(**kwargs):
+            pointer = actual_finalizer(**kwargs)
+            (data_dir / "routes/latest.json").write_bytes(b"corrupt\n")
+            return pointer
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {
+                "MARKET_CEX_PRIVATE_FEE_PROFILE": str(
+                    fixture["fee_profile_path"]
+                ),
+                "MARKET_ROUTE_PRIVATE_INVENTORY_PROFILE": str(
+                    fixture["inventory_profile_path"]
+                ),
+            }, clear=False))
+            stack.enter_context(patch.object(
+                opportunity_pipeline,
+                "finalize_cex_route_opportunities",
+                side_effect=finalize_then_corrupt,
+            ))
+            dashboard_exec = stack.enter_context(
+                patch.object(opportunity_pipeline.os, "execve")
+            )
+            stack.enter_context(self.assertRaisesRegex(
+                RouteOpportunityPipelineError,
+                "cannot be reloaded",
+            ))
+            opportunity_pipeline.main([
+                "--data-dir", str(data_dir),
+                "--shadow-run-id", joint["pointer"]["run_id"],
+                "--expected-joint-pointer-sha256", joint["pointer_sha256"],
+                "--serve",
+                "--port", "43210",
+            ])
+
+        dashboard_exec.assert_not_called()
+
+    def test_cli_without_serve_keeps_pointer_output_and_does_not_exec(self):
+        data_dir, fixture, joint = self._install_real_cex_run()
+        output = io.StringIO()
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {
+                "MARKET_CEX_PRIVATE_FEE_PROFILE": str(
+                    fixture["fee_profile_path"]
+                ),
+                "MARKET_ROUTE_PRIVATE_INVENTORY_PROFILE": str(
+                    fixture["inventory_profile_path"]
+                ),
+            }, clear=False))
+            dashboard_exec = stack.enter_context(
+                patch.object(opportunity_pipeline.os, "execve")
+            )
+            stack.enter_context(redirect_stdout(output))
+            result = opportunity_pipeline.main([
+                "--data-dir", str(data_dir),
+                "--shadow-run-id", joint["pointer"]["run_id"],
+                "--expected-joint-pointer-sha256", joint["pointer_sha256"],
+            ])
+
+        loaded = load_latest_complete_route_bundle(
+            data_dir / "routes", core_root=data_dir / "routes/core"
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue()), loaded["pointer"])
+        dashboard_exec.assert_not_called()
 
     def _install_real_cex_run(self, *, sell_quantity="10000"):
         data_dir = Path(self.temporary.name) / "real-data"
@@ -360,21 +500,20 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
             mutate(data_dir, fixture, joint)
             return actual_publisher(**kwargs)
 
-        with (
-            patch.dict(os.environ, {
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {
                 "MARKET_CEX_PRIVATE_FEE_PROFILE": str(
                     fixture["fee_profile_path"]
                 ),
                 "MARKET_ROUTE_PRIVATE_INVENTORY_PROFILE": str(
                     fixture["inventory_profile_path"]
                 ),
-            }, clear=False),
-            patch(
+            }, clear=False))
+            stack.enter_context(patch(
                 "scripts.route_opportunity_pipeline."
                 "publish_complete_route_bundle",
                 side_effect=mutate_then_publish,
-            ),
-        ):
+            ))
             with self.assertRaises(RouteOpportunityPipelineError):
                 finalize_cex_route_opportunities(
                     data_dir=data_dir,
@@ -386,19 +525,18 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
 
     def test_dex_core_is_rejected_before_finalizer_and_preserves_pointer(self):
         shadow, latest_core = self._pinned_views(dex=True)
-        with (
-            patch(
+        with ExitStack() as stack:
+            stack.enter_context(patch(
                 "scripts.route_opportunity_pipeline.load_shadow_result",
                 return_value=shadow,
-            ),
-            patch(
+            ))
+            stack.enter_context(patch(
                 "scripts.route_opportunity_pipeline.load_latest_route_cohort",
                 return_value=latest_core,
-            ),
-            patch(
+            ))
+            publisher = stack.enter_context(patch(
                 "scripts.route_opportunity_pipeline.publish_complete_route_bundle"
-            ) as publisher,
-        ):
+            ))
             with self.assertRaisesRegex(
                 RouteOpportunityPipelineError, "CEX-only"
             ):
@@ -428,16 +566,16 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
                 else:
                     shadow["pointer_sha256"] = "f" * 64
 
-                with (
-                    patch(
+                with ExitStack() as stack:
+                    stack.enter_context(patch(
                         "scripts.route_opportunity_pipeline.load_shadow_result",
                         return_value=shadow,
-                    ),
-                    patch(
+                    ))
+                    stack.enter_context(patch(
                         "scripts.route_opportunity_pipeline.load_latest_route_cohort",
                         return_value=latest_core,
-                    ),
-                    patch(
+                    ))
+                    stack.enter_context(patch(
                         "scripts.route_opportunity_pipeline."
                         "_read_shadow_run_evidence",
                         side_effect=lambda _root, _run_id: {
@@ -451,12 +589,11 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
                                 / "route-cost-evidence.json"
                             ).read_bytes(),
                         },
-                    ),
-                    patch(
+                    ))
+                    publisher = stack.enter_context(patch(
                         "scripts.route_opportunity_pipeline."
                         "publish_complete_route_bundle"
-                    ) as publisher,
-                ):
+                    ))
                     with self.assertRaisesRegex(
                         RouteOpportunityPipelineError,
                         "evidence|lineage|hash|sidecar",
@@ -579,24 +716,23 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
             sidecar.write_bytes(sidecar.read_bytes() + b"\n")
             return result
 
-        with (
-            patch.dict(os.environ, {
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {
                 "MARKET_CEX_PRIVATE_FEE_PROFILE": str(
                     fixture["fee_profile_path"]
                 ),
                 "MARKET_ROUTE_PRIVATE_INVENTORY_PROFILE": str(
                     fixture["inventory_profile_path"]
                 ),
-            }, clear=False),
-            patch(
+            }, clear=False))
+            stack.enter_context(patch(
                 "scripts.route_opportunity_pipeline._build_inputs",
                 side_effect=build_then_mutate,
-            ),
-            patch(
+            ))
+            publisher = stack.enter_context(patch(
                 "scripts.route_opportunity_pipeline."
                 "publish_complete_route_bundle"
-            ) as publisher,
-        ):
+            ))
             with self.assertRaises(RouteOpportunityPipelineError):
                 finalize_cex_route_opportunities(
                     data_dir=data_dir,

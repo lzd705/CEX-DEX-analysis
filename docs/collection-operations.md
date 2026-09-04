@@ -339,6 +339,29 @@ bytes, and only then replaces `MARKET_DATA_DIR/routes/latest.json` with a
 `route_opportunity_pointer/v1` pointer. A failed finalization leaves the prior
 complete pointer and its original timestamp intact.
 
+For an explicitly pinned CEX-only Shadow run, the production finalizer can
+publish, reload-validate, and then start the read-only Current Opportunity
+page in one process lifecycle:
+
+```bash
+MARKET_CEX_PRIVATE_FEE_PROFILE=/absolute/private/fee.csv \
+MARKET_ROUTE_PRIVATE_INVENTORY_PROFILE=/absolute/private/inventory.csv \
+python3 scripts/route_opportunity_pipeline.py \
+  --data-dir /absolute/local-data \
+  --shadow-run-id RUN_ID \
+  --expected-joint-pointer-sha256 64_HEX_SHA256 \
+  --serve \
+  --port 8765
+```
+
+The server is fixed to `127.0.0.1`; this command offers no external-host
+option. It strips the private fee and inventory profile paths before replacing
+the finalizer process with the dashboard, disables administrator and public
+write surfaces, and skips ambient local-environment loading. The dashboard is
+started only after `routes/latest.json` and its complete bundle have passed a
+fresh full reload against the pinned core. This entry point does not collect
+market data, select a Shadow run, submit an order, or support DEX finalization.
+
 Each sealed route candidate also carries its two ranking-volume inputs and a
 derived `route_volume_usd`. CEX legs bind the route-universe selected-window
 USD volume; DEX legs bind latest 24-hour USD volume. The route value is the

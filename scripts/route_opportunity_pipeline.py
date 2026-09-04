@@ -49,6 +49,7 @@ from scripts.route_publication import (
     _read_shadow_run_evidence,
     _verify_open_path_identity,
     load_latest_route_cohort,
+    load_latest_complete_route_bundle,
     load_shadow_result,
     publish_complete_route_bundle,
 )
@@ -63,6 +64,68 @@ class RouteOpportunityPipelineError(ValueError):
 
 _FEE_PROFILE_ENV = "MARKET_CEX_PRIVATE_FEE_PROFILE"
 _INVENTORY_PROFILE_ENV = "MARKET_ROUTE_PRIVATE_INVENTORY_PROFILE"
+
+
+def _loopback_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("port must be an integer") from error
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(
+            "port must be between 1 and 65535"
+        )
+    return port
+
+
+def _exec_read_only_dashboard(*, data_dir: Path, port: int) -> None:
+    root = Path(data_dir).resolve()
+    project_root = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    for name in (
+        _FEE_PROFILE_ENV,
+        _INVENTORY_PROFILE_ENV,
+        "MARKET_DATABASE",
+        "MARKET_CEX_DATA",
+        "MARKET_DEX_DATA",
+        "MARKET_TVL_DATA",
+        "MARKET_CEX_DEPTH_DATA",
+        "MARKET_DEX_DEPTH_DATA",
+        "MARKET_CEX_EXECUTION_COST_DATA",
+        "MARKET_DEX_EXECUTION_COST_DATA",
+        "MARKET_EVENT_DATA_DIR",
+        "MARKET_CEX_INSTRUMENT_LIFECYCLE",
+        "ADMIN_JOB_DIR",
+        "TOKEN_REGISTRY_PATH",
+        "ADMIN_USERNAME",
+        "ADMIN_PASSWORD_HASH",
+    ):
+        environment.pop(name, None)
+    environment.update({
+        "DASHBOARD_SKIP_LOCAL_ENV": "true",
+        "MARKET_DATA_DIR": str(root),
+        "MARKET_ROUTE_DATA_DIR": str((root / "routes").resolve()),
+        "ADMIN_ENABLED": "false",
+        "ADMIN_LOGIN_REQUIRED": "true",
+        "ADMIN_ALLOW_OPEN_LOCAL": "false",
+        "PUBLIC_ADD_TOKEN_ENABLED": "false",
+        "PUBLIC_QUALITY_RETRY_ENABLED": "false",
+        "PUBLIC_FACT_REFRESH_ENABLED": "false",
+        "TRUST_LOOPBACK_PROXY_CLIENT_IP": "false",
+    })
+    os.execve(
+        sys.executable,
+        [
+            sys.executable,
+            str(
+                project_root
+                / "scripts/run_current_opportunity_dashboard.py"
+            ),
+            "--data-dir", str(root),
+            "--port", str(port),
+        ],
+        environment,
+    )
 
 
 def _profile_path(name: str) -> Path:
@@ -688,6 +751,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--shadow-run-id", required=True)
     parser.add_argument("--expected-joint-pointer-sha256", required=True)
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help=(
+            "after publication verification, run the read-only Current "
+            "Opportunity dashboard on 127.0.0.1"
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=_loopback_port,
+        default=8765,
+        help="loopback dashboard port used with --serve (default: 8765)",
+    )
     arguments = parser.parse_args(argv)
     pointer = finalize_cex_route_opportunities(
         data_dir=arguments.data_dir,
@@ -696,7 +773,28 @@ def main(argv: Optional[List[str]] = None) -> int:
             arguments.expected_joint_pointer_sha256
         ),
     )
-    print(json.dumps(pointer, ensure_ascii=False, sort_keys=True))
+    try:
+        loaded = load_latest_complete_route_bundle(
+            Path(arguments.data_dir) / "routes",
+            core_root=Path(arguments.data_dir) / "routes/core",
+        )
+    except (OSError, TypeError, ValueError) as error:
+        raise RouteOpportunityPipelineError(
+            "published complete route bundle cannot be reloaded"
+        ) from error
+    if loaded.get("pointer") != pointer:
+        raise RouteOpportunityPipelineError(
+            "published complete route bundle cannot be reloaded"
+        )
+    print(
+        json.dumps(pointer, ensure_ascii=False, sort_keys=True),
+        flush=arguments.serve,
+    )
+    if arguments.serve:
+        _exec_read_only_dashboard(
+            data_dir=arguments.data_dir,
+            port=arguments.port,
+        )
     return 0
 
 
