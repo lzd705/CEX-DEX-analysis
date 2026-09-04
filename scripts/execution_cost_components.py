@@ -263,14 +263,20 @@ def _validate_row(row: Mapping[str, Any]) -> None:
     requested_notional = _stored_decimal(
         row, "requested_notional_usd", positive=True
     )
-    _stored_decimal(row, "target_token_quantity", positive=True)
-
     component_type = _required_text(row.get("component_type"), "component_type")
     if component_type not in COMPONENT_TYPES:
         raise ValueError("component_type is invalid")
     value_status = _required_text(row.get("value_status"), "value_status")
     if value_status not in VALUE_STATUSES:
         raise ValueError("value_status is invalid")
+    target_value = row.get("target_token_quantity")
+    if target_value is None:
+        if value_status not in TERMINAL_VALUE_STATUSES:
+            raise ValueError(
+                "null target_token_quantity requires a terminal value_status"
+            )
+    else:
+        _stored_decimal(row, "target_token_quantity", positive=True)
 
     strict_eligible = row.get("strict_eligible")
     embedded = row.get("embedded_in_leg_quote")
@@ -406,8 +412,14 @@ def cost_component_row(
         "requested_notional_usd": _normalized_decimal(
             requested_notional_usd, "requested_notional_usd", positive=True
         ),
-        "target_token_quantity": _normalized_decimal(
-            target_token_quantity, "target_token_quantity", positive=True
+        "target_token_quantity": (
+            None
+            if target_token_quantity is None
+            else _normalized_decimal(
+                target_token_quantity,
+                "target_token_quantity",
+                positive=True,
+            )
         ),
         "component_type": component_type,
         "value_status": value_status,
@@ -435,6 +447,8 @@ def validate_cost_components(rows: Iterable[Mapping[str, Any]]) -> None:
     inventory = list(rows)
     keys: Set[Tuple[str, str, str, str]] = set()
     scenario_values: Dict[Tuple[str, str], Set[Tuple[str, str]]] = defaultdict(set)
+    scenario_target_kinds: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+    terminal_reasons: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
     leg_values: Dict[Tuple[str, str, str], Set[Tuple[str, str]]] = defaultdict(set)
     for row in inventory:
         if not isinstance(row, Mapping):
@@ -456,6 +470,11 @@ def validate_cost_components(rows: Iterable[Mapping[str, Any]]) -> None:
                 str(row["target_token_quantity"]),
             )
         )
+        scenario_target_kinds[scenario_key].add(
+            "null" if row["target_token_quantity"] is None else "numeric"
+        )
+        if row["target_token_quantity"] is None:
+            terminal_reasons[scenario_key].add(str(row["reason_code"]))
         leg_values[(scenario_key[0], scenario_key[1], str(row["leg"]))].add(
             (str(row["market_id"]), str(row["direction"]))
         )
@@ -463,6 +482,18 @@ def validate_cost_components(rows: Iterable[Mapping[str, Any]]) -> None:
         raise ValueError(
             "one opportunity must retain one requested_notional_usd and "
             "target_token_quantity"
+        )
+    if any(len(values) != 1 for values in scenario_target_kinds.values()):
+        raise ValueError(
+            "one opportunity cannot mix null and numeric target_token_quantity"
+        )
+    if any(
+        target_kinds == {"null"}
+        and len(terminal_reasons[scenario_key]) != 1
+        for scenario_key, target_kinds in scenario_target_kinds.items()
+    ):
+        raise ValueError(
+            "one terminal opportunity must retain one shared reason_code"
         )
     if any(len(values) != 1 for values in leg_values.values()):
         raise ValueError("one opportunity leg must retain one market_id and direction")

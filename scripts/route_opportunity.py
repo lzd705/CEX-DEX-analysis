@@ -25,7 +25,7 @@ try:
         validate_cost_components,
     )
     from scripts.fetch_cex_depth import route_quantity_quote_for_book
-    from scripts.route_cohort import canonical_route_id
+    from scripts.route_cohort import canonical_route_id, classify_route_timing
     from scripts.route_cost_topology import live_complete_cost_component_keys
     from scripts.route_quantity import (
         CommonTarget,
@@ -46,7 +46,10 @@ except ModuleNotFoundError:
         validate_cost_components,
     )
     from fetch_cex_depth import route_quantity_quote_for_book  # type: ignore
-    from route_cohort import canonical_route_id  # type: ignore
+    from route_cohort import (  # type: ignore
+        canonical_route_id,
+        classify_route_timing,
+    )
     from route_cost_topology import (  # type: ignore
         live_complete_cost_component_keys,
     )
@@ -1238,6 +1241,230 @@ def _ratio_fields(edge: Optional[Fraction], buy_cost: Optional[Fraction]) -> Tup
     )
 
 
+def _validated_terminal_mode_evidence(
+    route: Mapping[str, Any], evidence: Any
+) -> str:
+    fields = {
+        "route_id",
+        "route_mode",
+        "classification",
+        "mode_evidence_eligible",
+        "reason_code",
+        "reason_codes",
+        "inventory_profile_hash",
+        "maximum_proved_capacity_quantity",
+    }
+    if not isinstance(evidence, Mapping) or set(evidence) != fields:
+        raise ValueError("terminal mode evidence schema is invalid")
+    reasons = evidence.get("reason_codes")
+    allowed_reasons = _MODE_REASON_CODES_BY_MODE[route["route_mode"]]
+    if (
+        evidence.get("route_id") != route["route_id"]
+        or evidence.get("route_mode") != route["route_mode"]
+        or evidence.get("classification") != "research_estimate"
+        or evidence.get("mode_evidence_eligible") is not False
+        or not isinstance(reasons, list)
+        or not reasons
+        or len(reasons) != len(set(reasons))
+        or any(reason not in allowed_reasons for reason in reasons)
+        or evidence.get("reason_code") != reasons[0]
+        or evidence.get("inventory_profile_hash") is not None
+        or evidence.get("maximum_proved_capacity_quantity") is not None
+    ):
+        raise ValueError("terminal mode evidence is inconsistent")
+    return _canonical_json_sha256(dict(evidence))
+
+
+def _terminal_cost_component_hash(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    cohort_id: str,
+    opportunity_id: str,
+    route: Mapping[str, Any],
+    requested_notional: Decimal,
+    reason_code: str,
+) -> str:
+    if isinstance(rows, (str, bytes, Mapping)):
+        raise ValueError("terminal cost component inventory is invalid")
+    inventory = [dict(row) for row in rows]
+    validate_cost_components(inventory)
+    expected_keys = live_complete_cost_component_keys(route)
+    observed_keys = {
+        (str(row["leg"]), str(row["component_type"]))
+        for row in inventory
+    }
+    if (
+        len(inventory) != 3
+        or len(observed_keys) != len(inventory)
+        or observed_keys != expected_keys
+    ):
+        raise ValueError("terminal CEX cost component set is not exact")
+    expected_notional = _decimal_text(requested_notional)
+    for row in inventory:
+        leg = str(row["leg"])
+        expected_market = "" if leg == "route" else route[leg + "_market_id"]
+        expected_direction = "route" if leg == "route" else leg + "_token"
+        if (
+            row["cohort_id"] != cohort_id
+            or row["opportunity_id"] != opportunity_id
+            or row["requested_notional_usd"] != expected_notional
+            or row["target_token_quantity"] is not None
+            or row["market_id"] != expected_market
+            or row["direction"] != expected_direction
+            or row["value_status"] not in TERMINAL_VALUE_STATUSES
+            or row["amount_usd"] is not None
+            or row["rate_bps"] is not None
+            or row["strict_eligible"] is not False
+            or row["embedded_in_leg_quote"] is not False
+            or row["observed_at"] is not None
+            or row["valid_until"] is not None
+            or row["source_record_sha256"] is not None
+            or row["reason_code"] != reason_code
+        ):
+            raise ValueError("terminal CEX cost component is inconsistent")
+    canonical_rows = sorted(
+        inventory,
+        key=lambda row: (row["leg"], row["component_type"]),
+    )
+    return _canonical_json_sha256(canonical_rows)
+
+
+def build_terminal_route_opportunity(
+    *,
+    cohort_id: Any,
+    route: Mapping[str, Any],
+    requested_notional_usd: Any,
+    buy_leg: Mapping[str, Any],
+    sell_leg: Mapping[str, Any],
+    route_timing: Mapping[str, Any],
+    cost_components: Iterable[Mapping[str, Any]],
+    mode_evidence: Any,
+    now: Any,
+    core_manifest_sha256: Any,
+) -> Dict[str, Any]:
+    """Build one source-less opportunity only from retained terminal lineage."""
+    cohort = _required_text(cohort_id, "cohort_id")
+    if _COHORT_ID.fullmatch(cohort) is None:
+        raise ValueError("cohort_id must be canonical")
+    normalized_route = _validated_route(route)
+    _validate_route_topology(normalized_route)
+    if not all(
+        normalized_route[field].startswith("cex:")
+        for field in ("buy_market_id", "sell_market_id")
+    ):
+        raise ValueError("terminal route must use the exact CEX topology")
+    for direction, leg in (("buy", buy_leg), ("sell", sell_leg)):
+        if (
+            not isinstance(leg, Mapping)
+            or leg.get("market_id")
+            != normalized_route[direction + "_market_id"]
+        ):
+            raise ValueError("terminal route leg identity is invalid")
+    if (
+        not isinstance(route_timing, Mapping)
+        or set(route_timing)
+        != {"route_id", "skew_seconds", "timing_status", "reason_code"}
+    ):
+        raise ValueError("terminal route timing schema is invalid")
+    expected_timing = classify_route_timing(
+        normalized_route,
+        buy_leg,
+        sell_leg,
+    )
+    if dict(route_timing) != dict(expected_timing):
+        raise ValueError("terminal route timing does not recompute")
+    reason = route_timing.get("reason_code")
+    if (
+        route_timing.get("timing_status") == "within_sla"
+        or not isinstance(reason, str)
+        or reason not in ROUTE_OPPORTUNITY_REASON_CODES
+    ):
+        raise ValueError("terminal route timing must be outside the SLA")
+    requested_notional = _decimal(
+        requested_notional_usd,
+        "requested_notional_usd",
+        positive=True,
+    )
+    _timestamp(now, "now")
+    core_hash = _hash(core_manifest_sha256, "core_manifest_sha256")
+    opportunity_id = route_opportunity_id(
+        normalized_route["route_id"],
+        requested_notional,
+    )
+    cost_hash = _terminal_cost_component_hash(
+        cost_components,
+        cohort_id=cohort,
+        opportunity_id=opportunity_id,
+        route=normalized_route,
+        requested_notional=requested_notional,
+        reason_code=reason,
+    )
+    mode_hash = _validated_terminal_mode_evidence(
+        normalized_route,
+        mode_evidence,
+    )
+    row: Dict[str, Any] = {
+        "contract_version": ROUTE_OPPORTUNITY_CONTRACT_VERSION,
+        "cohort_id": cohort,
+        "route_id": normalized_route["route_id"],
+        "opportunity_id": opportunity_id,
+        "token_symbol": normalized_route["token_symbol"],
+        "buy_market_id": normalized_route["buy_market_id"],
+        "sell_market_id": normalized_route["sell_market_id"],
+        "route_mode": normalized_route["route_mode"],
+        "requested_notional_usd": _decimal_text(requested_notional),
+        "target_token_quantity": None,
+        "target_base_raw": None,
+        "target_base_unit_decimals": None,
+        "target_lattice_raw": None,
+        "buy_state_id": None,
+        "sell_state_id": None,
+        "buy_state_observed_at": None,
+        "sell_state_observed_at": None,
+        "skew_seconds": route_timing["skew_seconds"],
+        "route_age_seconds": None,
+        "gross_buy_cost_usd": None,
+        "gross_sell_proceeds_usd": None,
+        "gross_edge_usd": None,
+        "gross_edge_bps": None,
+        "gross_edge_bps_numerator": None,
+        "gross_edge_bps_denominator": None,
+        "strict_nonembedded_cost_usd": None,
+        "research_bounded_cost_usd": None,
+        "research_assumed_cost_usd": None,
+        "strict_net_edge_usd": None,
+        "strict_net_edge_bps": None,
+        "strict_net_edge_bps_numerator": None,
+        "strict_net_edge_bps_denominator": None,
+        "research_net_edge_usd": None,
+        "research_net_edge_bps": None,
+        "research_net_edge_bps_numerator": None,
+        "research_net_edge_bps_denominator": None,
+        "edge_bps_denominator_basis": None,
+        "cost_completeness": "unavailable",
+        "scenario_cost_completeness": "unavailable",
+        "reflected_or_embedded_component_keys": [],
+        "component_reasons": [],
+        "mode_evidence_eligible": False,
+        "inventory_profile_hash": None,
+        "maximum_proved_capacity_quantity": None,
+        "opportunity_class": "unavailable",
+        "primary_reason": reason,
+        "reason_codes": [reason],
+        "strict_eligible": False,
+        "strict_ready_for_publication": False,
+        "publication_attestation_sha256": None,
+        "buy_usd_projection_sha256": None,
+        "sell_usd_projection_sha256": None,
+        "cost_component_set_sha256": cost_hash,
+        "mode_evidence_sha256": mode_hash,
+        "buy_core_manifest_sha256": core_hash,
+        "sell_core_manifest_sha256": core_hash,
+    }
+    row["evidence_binding_sha256"] = _canonical_json_sha256(row)
+    return row
+
+
 def _empty_opportunity(
     *,
     cohort_id: str,
@@ -1730,7 +1957,11 @@ def validate_route_opportunity(
     )
     if binding != _canonical_json_sha256(provided):
         raise ValueError("route opportunity evidence binding mismatch")
-    expected = build_route_opportunity(**build_inputs)
+    expected = (
+        build_terminal_route_opportunity(**build_inputs)
+        if "route_timing" in build_inputs
+        else build_route_opportunity(**build_inputs)
+    )
     if dict(opportunity) != expected:
         raise ValueError("route opportunity evidence does not reproduce row")
     return opportunity

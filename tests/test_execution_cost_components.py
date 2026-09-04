@@ -304,6 +304,66 @@ class CostComponentRowTests(unittest.TestCase):
 
 
 class CostComponentValidationTests(unittest.TestCase):
+    def test_all_terminal_cex_topology_is_the_only_null_target_scenario(self):
+        shared = {
+            "cohort_id": "cohort-terminal",
+            "opportunity_id": "route-terminal:10000",
+            "requested_notional_usd": Decimal("10000"),
+            "target_token_quantity": None,
+            "value_status": "unavailable",
+            "amount_usd": None,
+            "rate_bps": None,
+            "basis": "retained route timing proves route unavailable",
+            "strict_eligible": False,
+            "observed_at": None,
+            "valid_until": None,
+            "source": "retained route timing",
+            "source_record_sha256": None,
+            "reason_code": "sell_leg_unavailable",
+        }
+        shapes = (
+            ("buy", "cex:alpha:CAKE/USDT", "buy_token", "venue_taker_fee"),
+            ("sell", "cex:beta:CAKE/USDT", "sell_token", "venue_taker_fee"),
+            ("route", "", "route", "rebalancing_or_transfer"),
+        )
+
+        try:
+            rows = [
+                cost_component_row(
+                    **shared,
+                    leg=leg,
+                    market_id=market_id,
+                    direction=direction,
+                    component_type=component_type,
+                )
+                for leg, market_id, direction, component_type in shapes
+            ]
+            validate_cost_components(rows)
+        except ValueError as error:
+            self.fail("all-terminal null targets were rejected: {}".format(error))
+
+        mutations = []
+        positive_status = dict(rows[0])
+        positive_status["value_status"] = "authenticated"
+        mutations.append(("positive status", [positive_status, *rows[1:]]))
+        numeric_values = dict(rows[0])
+        numeric_values.update({"amount_usd": "10", "rate_bps": "10"})
+        mutations.append(("numeric values", [numeric_values, *rows[1:]]))
+        strict = dict(rows[0])
+        strict["strict_eligible"] = True
+        mutations.append(("strict flag", [strict, *rows[1:]]))
+        mixed_target = dict(rows[0])
+        mixed_target["target_token_quantity"] = "100"
+        mutations.append(("mixed targets", [mixed_target, *rows[1:]]))
+        mixed_reason = dict(rows[0])
+        mixed_reason["reason_code"] = "buy_leg_unavailable"
+        mutations.append(("mixed terminal reasons", [mixed_reason, *rows[1:]]))
+
+        for label, mutated in mutations:
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    validate_cost_components(mutated)
+
     def test_duplicate_fixed_grain_key_is_rejected(self):
         row = component()
         with self.assertRaisesRegex(ValueError, "duplicate cost component"):

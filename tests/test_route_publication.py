@@ -39,6 +39,7 @@ from scripts.fetch_cex_depth import (
 )
 from scripts.route_opportunity import (
     build_route_opportunity,
+    build_terminal_route_opportunity,
     route_opportunity_id,
     usd_projection_evidence,
 )
@@ -931,6 +932,147 @@ def _task7_cex_inputs(core_root, raw_root, source_root, private_root):
     }
 
 
+def _terminal_publication_inputs(core_root, raw_root):
+    cohort = _cohort()
+    failed_market_id = cohort["legs"][1]["market_id"]
+    retained_raw = b"{}"
+    for leg in cohort["legs"]:
+        if leg["market_id"] == failed_market_id:
+            leg.update({
+                "status": "failed",
+                "available": False,
+                "reason_code": "source_unavailable",
+                "state_observed_at": None,
+                "snapshot_id": None,
+                "raw_response_sha256": None,
+            })
+        else:
+            leg["raw_response_sha256"] = hashlib.sha256(
+                retained_raw
+            ).hexdigest()
+    legs_by_market = {
+        leg["market_id"]: leg for leg in cohort["legs"]
+    }
+    route_rows = []
+    for route in cohort["routes"]:
+        candidate = {
+            **route,
+            "validated_at": cohort["collection_completed_at"],
+            "skew_sla_seconds": cohort["skew_sla_seconds"],
+        }
+        timing = route_publication.classify_route_timing(
+            candidate,
+            legs_by_market[route["buy_market_id"]],
+            legs_by_market[route["sell_market_id"]],
+        )
+        route_rows.append({
+            **route,
+            "validated_at": cohort["collection_completed_at"],
+            "skew_seconds": timing["skew_seconds"],
+            "timing_status": timing["timing_status"],
+            "reason_code": timing["reason_code"],
+        })
+    cohort["route_rows"] = route_rows
+    cohort = _rehash(cohort)
+    pointer = publish_route_cohort_bundle(cohort, core_root=core_root)
+    observed_market_id = next(
+        leg["market_id"] for leg in cohort["legs"]
+        if leg["status"] == "observed"
+    )
+    retained_member = (
+        raw_root / cohort["raw_evidence_run_id"] / "accepted"
+        / hashlib.sha256(observed_market_id.encode("utf-8")).hexdigest()
+    )
+    retained_member.mkdir(parents=True)
+    (retained_member / "response.json").write_bytes(retained_raw)
+
+    legs_by_market = {
+        leg["market_id"]: leg for leg in cohort["legs"]
+    }
+    timing_by_route = {
+        row["route_id"]: {
+            "route_id": row["route_id"],
+            "skew_seconds": row["skew_seconds"],
+            "timing_status": row["timing_status"],
+            "reason_code": row["reason_code"],
+        }
+        for row in cohort["route_rows"]
+    }
+    now = "2026-08-01T12:00:03Z"
+    opportunity_inputs = []
+    for route in cohort["routes"]:
+        timing = timing_by_route[route["route_id"]]
+        mode = classify_route_mode_evidence(route, now=now)
+        for notional in cohort["requested_notionals_usd"]:
+            opportunity_id = route_opportunity_id(route["route_id"], notional)
+            shared = {
+                "cohort_id": cohort["route_cohort_id"],
+                "opportunity_id": opportunity_id,
+                "requested_notional_usd": Decimal(notional),
+                "target_token_quantity": None,
+                "value_status": "unavailable",
+                "amount_usd": None,
+                "rate_bps": None,
+                "basis": "retained route timing proves route unavailable",
+                "strict_eligible": False,
+                "observed_at": None,
+                "valid_until": None,
+                "source": "retained route timing",
+                "source_record_sha256": None,
+                "reason_code": timing["reason_code"],
+            }
+            costs = [
+                cost_component_row(
+                    **shared,
+                    leg=leg,
+                    market_id=market_id,
+                    direction=direction,
+                    component_type=component_type,
+                )
+                for leg, market_id, direction, component_type in (
+                    (
+                        "buy", route["buy_market_id"],
+                        "buy_token", "venue_taker_fee",
+                    ),
+                    (
+                        "sell", route["sell_market_id"],
+                        "sell_token", "venue_taker_fee",
+                    ),
+                    (
+                        "route", "", "route",
+                        "rebalancing_or_transfer",
+                    ),
+                )
+            ]
+            terminal_inputs = {
+                "cohort_id": cohort["route_cohort_id"],
+                "route": route,
+                "requested_notional_usd": Decimal(notional),
+                "buy_leg": legs_by_market[route["buy_market_id"]],
+                "sell_leg": legs_by_market[route["sell_market_id"]],
+                "route_timing": timing,
+                "cost_components": costs,
+                "mode_evidence": mode,
+                "now": now,
+                "core_manifest_sha256": pointer["manifest_sha256"],
+            }
+            opportunity_inputs.append({
+                "classified_opportunity": (
+                    build_terminal_route_opportunity(**terminal_inputs)
+                ),
+                "build_inputs": {
+                    "input_kind": "terminal_route",
+                    **terminal_inputs,
+                },
+                "source_members": {},
+            })
+    return {
+        "cohort": cohort,
+        "pointer": pointer,
+        "opportunity_inputs": opportunity_inputs,
+    }
+
+
 _LIVE_COMPLETE_BUNDLE_GOLDEN_BY_RUNTIME = {
     (3, 8, 10): {
         "core_manifest_sha256": (
@@ -1161,6 +1303,163 @@ class TemporaryRouteRootTestCase(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name) / "data/local/routes/core"
+
+
+class TerminalOpportunityPublicationTests(TemporaryRouteRootTestCase):
+    def test_terminal_inputs_publish_and_cold_load_without_source_members(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _terminal_publication_inputs(self.root, raw_root)
+        routes_root = Path(self.temporary.name) / "data/local/routes"
+
+        try:
+            pointer = route_publication.publish_complete_route_bundle(
+                core_root=self.root,
+                raw_root=raw_root,
+                routes_root=routes_root,
+                opportunity_inputs=fixture["opportunity_inputs"],
+            )
+        except route_publication.RoutePublicationError as error:
+            self.fail("terminal publication was rejected: {}".format(error))
+        loaded = route_publication.load_latest_complete_route_bundle(
+            routes_root,
+            core_root=self.root,
+        )
+
+        self.assertEqual(loaded["pointer"], pointer)
+        self.assertEqual(len(loaded["bundle"]["opportunities"]), 10)
+        self.assertEqual(len(loaded["bundle"]["cost_components"]), 30)
+        self.assertTrue(all(
+            row["target_token_quantity"] is None
+            and row["opportunity_class"] == "unavailable"
+            and row["publication_attestation_sha256"] is None
+            for row in loaded["bundle"]["opportunities"]
+        ))
+
+    def test_persisted_terminal_cost_lineage_is_bound_to_opportunity(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _terminal_publication_inputs(self.root, raw_root)
+        complete = route_publication.build_complete_route_bundle(
+            core_root=self.root,
+            raw_root=raw_root,
+            opportunity_inputs=fixture["opportunity_inputs"],
+        )
+
+        def drift_market(component_rows):
+            component_rows[0]["market_id"] = "cex:other:CAKE/USDT"
+
+        def drift_cohort(component_rows):
+            for component in component_rows:
+                component["cohort_id"] = "cohort:" + "d" * 64
+
+        def drift_notional(component_rows):
+            for component in component_rows:
+                component["requested_notional_usd"] = "7777"
+
+        for label, mutate in (
+            ("market ID", drift_market),
+            ("cohort ID", drift_cohort),
+            ("requested notional", drift_notional),
+        ):
+            with self.subTest(label=label):
+                candidate = copy.deepcopy(complete)
+                opportunity = candidate["opportunities"][0]
+                component_rows = [
+                    component
+                    for component in candidate["cost_components"]
+                    if component["opportunity_id"]
+                    == opportunity["opportunity_id"]
+                ]
+                mutate(component_rows)
+                opportunity["cost_component_set_sha256"] = _canonical_sha256(
+                    sorted(
+                        component_rows,
+                        key=lambda component: (
+                            component["leg"], component["component_type"]
+                        ),
+                    )
+                )
+                replacement = _rehash_opportunity(opportunity)
+                opportunity.clear()
+                opportunity.update(replacement)
+
+                with self.assertRaises(route_publication.RoutePublicationError):
+                    route_publication._validate_complete_logical_bundle(
+                        candidate
+                    )
+
+    def test_standard_and_terminal_contract_mutations_are_rejected(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _terminal_publication_inputs(self.root, raw_root)
+        baseline = fixture["opportunity_inputs"]
+
+        mutations = {}
+        nonempty_sources = copy.deepcopy(baseline[0])
+        nonempty_sources["source_members"] = {"buy_market_rules": "fake.json"}
+        mutations["source members"] = nonempty_sources
+
+        within_sla = copy.deepcopy(baseline[0])
+        within_sla["build_inputs"]["route_timing"] = {
+            **within_sla["build_inputs"]["route_timing"],
+            "timing_status": "within_sla",
+            "reason_code": None,
+        }
+        mutations["within SLA"] = within_sla
+
+        nonterminal_cost = copy.deepcopy(baseline[0])
+        nonterminal_cost["build_inputs"]["cost_components"][0][
+            "value_status"
+        ] = "authenticated"
+        mutations["nonterminal cost"] = nonterminal_cost
+
+        different_core_leg = copy.deepcopy(baseline[0])
+        different_core_leg["build_inputs"]["buy_leg"][
+            "source_endpoint"
+        ] = "https://example.test/forged"
+        mutations["different core leg"] = different_core_leg
+
+        for label, field, value in (
+            ("numeric target", "target_token_quantity", "1"),
+            ("numeric economics", "gross_edge_usd", "1"),
+            ("state ID", "buy_state_id", "fabricated-state"),
+            ("attestation", "publication_attestation_sha256", "f" * 64),
+        ):
+            mutated = copy.deepcopy(baseline[0])
+            mutated["classified_opportunity"][field] = value
+            mutated["classified_opportunity"] = _rehash_opportunity(
+                mutated["classified_opportunity"]
+            )
+            mutations[label] = mutated
+
+        for label, mutated in mutations.items():
+            with self.subTest(label=label):
+                supplied = [copy.deepcopy(item) for item in baseline]
+                supplied[0] = mutated
+                with self.assertRaises(route_publication.RoutePublicationError):
+                    route_publication.build_complete_route_bundle(
+                        core_root=self.root,
+                        raw_root=raw_root,
+                        opportunity_inputs=supplied,
+                    )
+
+        standard_root = Path(self.temporary.name) / "standard/core"
+        standard_raw = Path(self.temporary.name) / "standard/raw"
+        standard = _task7_cex_inputs(
+            standard_root,
+            standard_raw,
+            Path(self.temporary.name) / "standard/sources",
+            Path(self.temporary.name) / "standard/private",
+        )
+        supplied = copy.deepcopy(standard["opportunity_inputs"])
+        supplied[0]["classified_opportunity"]["target_token_quantity"] = None
+        supplied[0]["classified_opportunity"] = _rehash_opportunity(
+            supplied[0]["classified_opportunity"]
+        )
+        with self.assertRaises(route_publication.RoutePublicationError):
+            route_publication.build_complete_route_bundle(
+                core_root=standard_root,
+                raw_root=standard_raw,
+                opportunity_inputs=supplied,
+            )
 
 
 class RoutePublicationInterfaceTests(unittest.TestCase):

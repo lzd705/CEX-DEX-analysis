@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from dashboard.opportunity_facts import (
     resolve_opportunity_bundle,
 )
 from scripts.route_publication import publish_complete_route_bundle
+from scripts.route_opportunity import build_terminal_route_opportunity
 from tests.test_route_cost_topology import (
     BUY_MARKET_ID,
     OPPORTUNITY_ID,
@@ -26,6 +28,7 @@ from tests.test_route_cost_topology import (
     historical_rows,
 )
 from tests.test_route_publication import _task7_cex_inputs
+from tests.test_route_opportunity import terminal_route_fixture
 
 
 NOW = datetime(2026, 8, 1, 12, 1, 30, tzinfo=timezone.utc)
@@ -181,8 +184,8 @@ def _route_costs(row):
     ]
 
 
-def _manifest(rows):
-    return {
+def _manifest(rows, *, core_manifest_sha256=None):
+    manifest = {
         "route_cohort_id": COHORT_ID,
         "requested_notionals_usd": [1000, 5000, 10000, 50000, 100000],
         "counts": {
@@ -201,6 +204,21 @@ def _manifest(rows):
             },
         },
     }
+    if core_manifest_sha256 is not None:
+        manifest["core_manifest_sha256"] = core_manifest_sha256
+    return manifest
+
+
+def _rehash_terminal_row(row):
+    normalized = dict(row)
+    normalized.pop("evidence_binding_sha256", None)
+    normalized["evidence_binding_sha256"] = hashlib.sha256(json.dumps(
+        normalized,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return normalized
 
 
 LEGS = [
@@ -445,6 +463,176 @@ class OpportunityBundleReaderTests(unittest.TestCase):
             health["reason"],
             "opportunity_bundle_validation_failed",
         )
+
+
+class TerminalOpportunityBundleTests(unittest.TestCase):
+    def _terminal(self):
+        build_inputs = terminal_route_fixture(cohort_id=COHORT_ID)
+        row = build_terminal_route_opportunity(**build_inputs)
+        route_candidate = {
+            **build_inputs["route"],
+            "route_volume_usd": None,
+            "route_volume_basis": "minimum_leg_source_horizon_usd",
+        }
+        return build_inputs, row, route_candidate
+
+    def test_terminal_shape_is_rendered_without_numeric_economics(self):
+        build_inputs, row, route_candidate = self._terminal()
+        try:
+            payload = build_opportunity_payload(
+                [row],
+                manifest=_manifest(
+                    [row],
+                    core_manifest_sha256=build_inputs[
+                        "core_manifest_sha256"
+                    ],
+                ),
+                legs=[build_inputs["buy_leg"], build_inputs["sell_leg"]],
+                cost_components=build_inputs["cost_components"],
+                route_candidates=[route_candidate],
+                now=NOW,
+            )
+        except OpportunityBundleInvalid as error:
+            self.fail("terminal dashboard bundle was rejected: {}".format(error))
+
+        projected = payload["routes"][0]
+        self.assertEqual(
+            projected["availability"],
+            {"status": "unavailable", "reason": "sell_leg_unavailable"},
+        )
+        self.assertIsNone(projected["target_token_quantity"])
+        self.assertIsNone(projected["gross_edge_usd"])
+        self.assertIsNone(projected["net_edge_usd"])
+        self.assertTrue(all(
+            item["amount_usd"] is None and item["rate_bps"] is None
+            for item in projected["cost_components"]
+        ))
+
+    def test_terminal_identity_and_core_lineage_are_trusted(self):
+        build_inputs, row, _route_candidate = self._terminal()
+        baseline_legs = [build_inputs["buy_leg"], build_inputs["sell_leg"]]
+        baseline_costs = build_inputs["cost_components"]
+        manifest = _manifest(
+            [row],
+            core_manifest_sha256=build_inputs["core_manifest_sha256"],
+        )
+        cases = []
+
+        wrong_route = {**row, "route_id": "route:forged"}
+        cases.append((
+            "route identity",
+            _rehash_terminal_row(wrong_route),
+            baseline_costs,
+        ))
+
+        wrong_opportunity_id = "route:forged:10000"
+        wrong_opportunity_costs = copy.deepcopy(baseline_costs)
+        for component in wrong_opportunity_costs:
+            component["opportunity_id"] = wrong_opportunity_id
+        canonical_costs = sorted(
+            wrong_opportunity_costs,
+            key=lambda component: (
+                component["leg"], component["component_type"]
+            ),
+        )
+        wrong_opportunity = {
+            **row,
+            "opportunity_id": wrong_opportunity_id,
+            "cost_component_set_sha256": hashlib.sha256(json.dumps(
+                canonical_costs,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
+        }
+        cases.append((
+            "opportunity identity",
+            _rehash_terminal_row(wrong_opportunity),
+            wrong_opportunity_costs,
+        ))
+
+        for label, field in (
+            ("buy core hash", "buy_core_manifest_sha256"),
+            ("sell core hash", "sell_core_manifest_sha256"),
+        ):
+            cases.append((
+                label,
+                _rehash_terminal_row({**row, field: "e" * 64}),
+                baseline_costs,
+            ))
+
+        for label, mutated_row, costs in cases:
+            with self.subTest(label=label):
+                with self.assertRaises(OpportunityBundleInvalid):
+                    build_opportunity_payload(
+                        [mutated_row],
+                        manifest=manifest,
+                        legs=baseline_legs,
+                        cost_components=costs,
+                        now=NOW,
+                    )
+
+    def test_standard_null_target_and_terminal_mutations_fail_closed(self):
+        build_inputs, row, route_candidate = self._terminal()
+        baseline_legs = [build_inputs["buy_leg"], build_inputs["sell_leg"]]
+        baseline_costs = build_inputs["cost_components"]
+        cases = {}
+
+        within_sla_legs = copy.deepcopy(baseline_legs)
+        within_sla_legs[1].update({
+            "status": "observed",
+            "available": True,
+            "reason_code": "observed",
+            "state_observed_at": "2026-08-01T12:00:30Z",
+        })
+        cases["within SLA timing"] = (row, within_sla_legs, baseline_costs)
+
+        nonterminal_costs = copy.deepcopy(baseline_costs)
+        nonterminal_costs[0]["value_status"] = "authenticated"
+        cases["nonterminal cost"] = (row, baseline_legs, nonterminal_costs)
+
+        different_legs = copy.deepcopy(baseline_legs)
+        different_legs[0]["market_id"] = "cex:other:CAKE/USDT"
+        cases["different core leg"] = (row, different_legs, baseline_costs)
+
+        for label, field, value in (
+            ("numeric target", "target_token_quantity", "1"),
+            ("numeric economics", "gross_edge_usd", "1"),
+            ("state ID", "buy_state_id", "fabricated-state"),
+            ("attestation", "publication_attestation_sha256", "f" * 64),
+        ):
+            cases[label] = ({**row, field: value}, baseline_legs, baseline_costs)
+
+        standard = _row("route:standard", "opportunity:standard")
+        standard["target_token_quantity"] = None
+        cases["standard null target"] = (
+            standard,
+            LEGS,
+            _route_costs({**standard, "target_token_quantity": "100"}),
+        )
+
+        for label, (mutated_row, legs, costs) in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaises(OpportunityBundleInvalid):
+                    build_opportunity_payload(
+                        [mutated_row],
+                        manifest=_manifest(
+                            [mutated_row],
+                            core_manifest_sha256=(
+                                None
+                                if label == "standard null target"
+                                else build_inputs["core_manifest_sha256"]
+                            ),
+                        ),
+                        legs=legs,
+                        cost_components=costs,
+                        route_candidates=(
+                            [route_candidate]
+                            if label != "standard null target"
+                            else None
+                        ),
+                        now=NOW,
+                    )
 
 
 class OpportunityPayloadTests(unittest.TestCase):

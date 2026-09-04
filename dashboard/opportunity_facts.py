@@ -32,14 +32,19 @@ from scripts.route_publication import (
     RoutePublicationError,
     load_latest_complete_route_bundle,
 )
+from scripts.execution_cost_components import validate_cost_components
 from scripts.route_opportunity import (
+    OPPORTUNITY_FIELDS,
+    ROUTE_OPPORTUNITY_CONTRACT_VERSION,
     ROUTE_OPPORTUNITY_MODES,
     ROUTE_OPPORTUNITY_REASON_CODES,
+    route_opportunity_id,
 )
 from scripts.route_cost_topology import (
     HISTORICAL_ATOMIC_COMPONENT_MATRIX,
     live_complete_cost_component_keys,
 )
+from scripts.route_cohort import classify_route_timing
 from scripts.timestamp_contract import parse_rfc3339_utc
 
 
@@ -132,6 +137,9 @@ _KNOWN_COST_STATUSES = _STRICT_COST_STATUSES | {
     "stale",
 }
 _SCENARIO_COST_STATUSES = frozenset({"bounded_estimate", "assumed"})
+_TERMINAL_COST_STATUSES = frozenset({
+    "unavailable", "unsupported", "failed", "stale"
+})
 _DYNAMIC_COST_STATUSES = (
     (_STRICT_COST_STATUSES - {"not_applicable"})
     | _SCENARIO_COST_STATUSES
@@ -548,10 +556,15 @@ def _validate_component_inventory(
         "route notional",
         positive=True,
     )
-    row_target = _bundle_fraction(
-        row.get("target_token_quantity"),
-        "target quantity",
-        positive=True,
+    raw_row_target = row.get("target_token_quantity")
+    row_target = (
+        None
+        if raw_row_target is None
+        else _bundle_fraction(
+            raw_row_target,
+            "target quantity",
+            positive=True,
+        )
     )
     for component in component_rows:
         leg = component.get("leg")
@@ -576,16 +589,156 @@ def _validate_component_inventory(
                 positive=True,
             )
             != row_notional
-            or _bundle_fraction(
-                component.get("target_token_quantity"),
-                "component target",
-                positive=True,
+            or (
+                component.get("target_token_quantity") is not None
+                if row_target is None
+                else _bundle_fraction(
+                    component.get("target_token_quantity"),
+                    "component target",
+                    positive=True,
+                ) != row_target
             )
-            != row_target
         ):
             raise OpportunityBundleInvalid()
     if observed != expected:
         raise OpportunityBundleInvalid()
+
+
+_TERMINAL_NULL_OPPORTUNITY_FIELDS = frozenset({
+    "target_token_quantity",
+    "target_base_raw",
+    "target_base_unit_decimals",
+    "target_lattice_raw",
+    "buy_state_id",
+    "sell_state_id",
+    "buy_state_observed_at",
+    "sell_state_observed_at",
+    "route_age_seconds",
+    "gross_buy_cost_usd",
+    "gross_sell_proceeds_usd",
+    "gross_edge_usd",
+    "gross_edge_bps",
+    "gross_edge_bps_numerator",
+    "gross_edge_bps_denominator",
+    "strict_nonembedded_cost_usd",
+    "research_bounded_cost_usd",
+    "research_assumed_cost_usd",
+    "strict_net_edge_usd",
+    "strict_net_edge_bps",
+    "strict_net_edge_bps_numerator",
+    "strict_net_edge_bps_denominator",
+    "research_net_edge_usd",
+    "research_net_edge_bps",
+    "research_net_edge_bps_numerator",
+    "research_net_edge_bps_denominator",
+    "edge_bps_denominator_basis",
+    "inventory_profile_hash",
+    "maximum_proved_capacity_quantity",
+    "publication_attestation_sha256",
+    "buy_usd_projection_sha256",
+    "sell_usd_projection_sha256",
+})
+
+
+def _validate_terminal_opportunity(
+    row: Mapping[str, Any],
+    component_rows: Sequence[Mapping[str, Any]],
+    legs_by_market: Mapping[str, Mapping[str, Any]],
+    core_manifest_sha256: Any,
+) -> None:
+    """Accept null targets only for the exact retained terminal route shape."""
+    reason = row.get("primary_reason")
+    provided = dict(row)
+    binding = provided.pop("evidence_binding_sha256", None)
+    try:
+        expected_binding = hashlib.sha256(json.dumps(
+            provided,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        validate_cost_components(component_rows)
+        canonical_costs = sorted(
+            (dict(component) for component in component_rows),
+            key=lambda component: (
+                component["leg"], component["component_type"]
+            ),
+        )
+        expected_cost_hash = hashlib.sha256(json.dumps(
+            canonical_costs,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        expected_opportunity_id = route_opportunity_id(
+            row.get("route_id"),
+            row.get("requested_notional_usd"),
+        )
+    except (KeyError, TypeError, ValueError):
+        raise OpportunityBundleInvalid() from None
+    if (
+        set(row) != OPPORTUNITY_FIELDS
+        or row.get("contract_version") != ROUTE_OPPORTUNITY_CONTRACT_VERSION
+        or binding != expected_binding
+        or row.get("cost_component_set_sha256") != expected_cost_hash
+        or row.get("opportunity_id") != expected_opportunity_id
+        or not isinstance(core_manifest_sha256, str)
+        or _HEX_SHA256.fullmatch(core_manifest_sha256) is None
+        or row.get("buy_core_manifest_sha256") != core_manifest_sha256
+        or row.get("sell_core_manifest_sha256") != core_manifest_sha256
+        or not isinstance(row.get("mode_evidence_sha256"), str)
+        or _HEX_SHA256.fullmatch(str(row["mode_evidence_sha256"])) is None
+        or not str(row.get("buy_market_id")).startswith("cex:")
+        or not str(row.get("sell_market_id")).startswith("cex:")
+        or row.get("opportunity_class") != "unavailable"
+        or row.get("strict_eligible") is not False
+        or row.get("strict_ready_for_publication") is not False
+        or row.get("mode_evidence_eligible") is not False
+        or row.get("cost_completeness") != "unavailable"
+        or row.get("scenario_cost_completeness") != "unavailable"
+        or not isinstance(reason, str)
+        or row.get("reason_codes") != [reason]
+        or row.get("reflected_or_embedded_component_keys") != []
+        or row.get("component_reasons") != []
+        or any(row.get(field) is not None for field in _TERMINAL_NULL_OPPORTUNITY_FIELDS)
+    ):
+        raise OpportunityBundleInvalid()
+    buy_leg = legs_by_market.get(str(row.get("buy_market_id")))
+    sell_leg = legs_by_market.get(str(row.get("sell_market_id")))
+    if buy_leg is None or sell_leg is None:
+        raise OpportunityBundleInvalid()
+    try:
+        timing = classify_route_timing(row, buy_leg, sell_leg)
+    except (TypeError, ValueError):
+        raise OpportunityBundleInvalid() from None
+    if (
+        timing.get("timing_status") == "within_sla"
+        or timing.get("route_id") != row.get("route_id")
+        or timing.get("reason_code") != reason
+        or timing.get("skew_seconds") != row.get("skew_seconds")
+    ):
+        raise OpportunityBundleInvalid()
+    if len(component_rows) != 3:
+        raise OpportunityBundleInvalid()
+    for component in component_rows:
+        leg = component.get("leg")
+        expected_direction = "route" if leg == "route" else str(leg) + "_token"
+        if (
+            component.get("direction") != expected_direction
+            or component.get("target_token_quantity") is not None
+            or component.get("value_status") not in _TERMINAL_COST_STATUSES
+            or component.get("amount_usd") is not None
+            or component.get("rate_bps") is not None
+            or component.get("strict_eligible") is not False
+            or component.get("embedded_in_leg_quote") is not False
+            or component.get("observed_at") is not None
+            or component.get("valid_until") is not None
+            or component.get("source_record_sha256") is not None
+            or component.get("reason_code") != reason
+        ):
+            raise OpportunityBundleInvalid()
 
 
 def _validate_ratio(
@@ -859,6 +1012,8 @@ def _validate_inventory(
     rows: Sequence[Mapping[str, Any]],
     manifest: Mapping[str, Any],
     costs: Sequence[Mapping[str, Any]],
+    *,
+    legs_by_market: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Dict[str, List[Mapping[str, Any]]]:
     cohort_id = manifest.get("route_cohort_id")
     if not isinstance(cohort_id, str):
@@ -885,6 +1040,12 @@ def _validate_inventory(
         route_mode = row.get("route_mode")
         primary_reason = row.get("primary_reason")
         reason_codes = row.get("reason_codes")
+        terminal_opportunity = row.get("target_token_quantity") is None
+        expected_completeness = (
+            {"unavailable"}
+            if terminal_opportunity
+            else {"complete", "incomplete"}
+        )
         if (
             not isinstance(opportunity_id, str)
             or not opportunity_id
@@ -901,9 +1062,9 @@ def _validate_inventory(
                 for reason in reason_codes
             )
             or len(reason_codes) != len(set(reason_codes))
-            or row.get("cost_completeness") not in {"complete", "incomplete"}
+            or row.get("cost_completeness") not in expected_completeness
             or row.get("scenario_cost_completeness")
-            not in {"complete", "incomplete"}
+            not in expected_completeness
         ):
             raise OpportunityBundleInvalid()
         if row_class == "executable_candidate":
@@ -1001,6 +1162,14 @@ def _validate_inventory(
     for opportunity_id, component_rows in costs_by_opportunity.items():
         opportunity = rows_by_id[opportunity_id]
         _validate_component_inventory(opportunity, component_rows)
+        if opportunity.get("target_token_quantity") is None:
+            _validate_terminal_opportunity(
+                opportunity,
+                component_rows,
+                legs_by_market or {},
+                manifest.get("core_manifest_sha256"),
+            )
+            continue
         if opportunity["opportunity_class"] == "research_estimate":
             _validate_research_economics(opportunity, component_rows)
             continue
@@ -1350,7 +1519,20 @@ def build_opportunity_payload(
     )
     row_inventory = list(rows)
     cost_inventory = list(cost_components or [])
-    component_rows = _validate_inventory(row_inventory, manifest, cost_inventory)
+    legs_by_market: Dict[str, Mapping[str, Any]] = {}
+    for leg in list(legs or []):
+        if not isinstance(leg, Mapping) or not isinstance(leg.get("market_id"), str):
+            raise OpportunityBundleInvalid()
+        market_id = str(leg["market_id"])
+        if market_id in legs_by_market:
+            raise OpportunityBundleInvalid()
+        legs_by_market[market_id] = leg
+    component_rows = _validate_inventory(
+        row_inventory,
+        manifest,
+        cost_inventory,
+        legs_by_market=legs_by_market,
+    )
     allowed_notionals = {
         _canonical_decimal_text(item, "manifest notional")
         for item in manifest.get("requested_notionals_usd", [])
@@ -1362,14 +1544,6 @@ def build_opportunity_payload(
         raise OpportunityQueryError(
             "notional must be one of the collected opportunity notionals"
         )
-    legs_by_market: Dict[str, Mapping[str, Any]] = {}
-    for leg in list(legs or []):
-        if not isinstance(leg, Mapping) or not isinstance(leg.get("market_id"), str):
-            raise OpportunityBundleInvalid()
-        market_id = str(leg["market_id"])
-        if market_id in legs_by_market:
-            raise OpportunityBundleInvalid()
-        legs_by_market[market_id] = leg
     route_ids = {str(row["route_id"]) for row in row_inventory}
     route_volumes: Dict[str, Dict[str, Any]] = {
         route_id: {
@@ -2118,10 +2292,20 @@ def opportunity_publication_health(
         rows = loaded["opportunities"]
         if not isinstance(rows, list) or not rows:
             raise OpportunityBundleInvalid()
+        legs_by_market: Dict[str, Mapping[str, Any]] = {}
+        for leg in loaded.get("legs", []):
+            if (
+                not isinstance(leg, Mapping)
+                or not isinstance(leg.get("market_id"), str)
+                or leg["market_id"] in legs_by_market
+            ):
+                raise OpportunityBundleInvalid()
+            legs_by_market[str(leg["market_id"])] = leg
         component_rows = _validate_inventory(
             rows,
             loaded["manifest"],
             loaded["cost_components"],
+            legs_by_market=legs_by_market,
         )
         current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         evaluations = []

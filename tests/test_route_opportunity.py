@@ -472,6 +472,100 @@ def cex_costs(
     return rows
 
 
+def terminal_route_fixture(
+    *,
+    cohort_id=COHORT_ID,
+    core_hash=CORE_HASH,
+    requested_notional="10000",
+    token_symbol="CAKE",
+):
+    identity = {
+        "token_symbol": token_symbol,
+        "buy_market_id": "cex:binance:{}/USDT".format(token_symbol),
+        "sell_market_id": "cex:bybit:{}/USDT".format(token_symbol),
+        "route_mode": "prepositioned_inventory",
+    }
+    route = {
+        **identity,
+        "route_id": canonical_route_id(identity),
+        "route_class": "candidate",
+        "settlement_reason": None,
+    }
+    buy_leg = {
+        "market_id": route["buy_market_id"],
+        "status": "observed",
+        "available": True,
+        "reason_code": "observed",
+        "state_observed_at": "2026-08-01T12:00:00Z",
+    }
+    sell_leg = {
+        "market_id": route["sell_market_id"],
+        "status": "failed",
+        "available": False,
+        "reason_code": "source_unavailable",
+        "state_observed_at": None,
+    }
+    route_timing = {
+        "route_id": route["route_id"],
+        "skew_seconds": None,
+        "timing_status": "unavailable",
+        "reason_code": "sell_leg_unavailable",
+    }
+    opportunity_id = route_opportunity_id(route["route_id"], requested_notional)
+    shared = {
+        "cohort_id": cohort_id,
+        "opportunity_id": opportunity_id,
+        "requested_notional_usd": Decimal(requested_notional),
+        "target_token_quantity": None,
+        "value_status": "unavailable",
+        "amount_usd": None,
+        "rate_bps": None,
+        "basis": "retained route timing proves route unavailable",
+        "strict_eligible": False,
+        "observed_at": None,
+        "valid_until": None,
+        "source": "retained route timing",
+        "source_record_sha256": None,
+        "reason_code": route_timing["reason_code"],
+    }
+    costs = [
+        cost_component_row(
+            **shared,
+            leg=leg,
+            market_id=market_id,
+            direction=direction,
+            component_type=component_type,
+        )
+        for leg, market_id, direction, component_type in (
+            ("buy", route["buy_market_id"], "buy_token", "venue_taker_fee"),
+            ("sell", route["sell_market_id"], "sell_token", "venue_taker_fee"),
+            ("route", "", "route", "rebalancing_or_transfer"),
+        )
+    ]
+    mode = {
+        "route_id": route["route_id"],
+        "route_mode": route["route_mode"],
+        "classification": "research_estimate",
+        "mode_evidence_eligible": False,
+        "reason_code": "mode_expected_request_unavailable",
+        "reason_codes": ["mode_expected_request_unavailable"],
+        "inventory_profile_hash": None,
+        "maximum_proved_capacity_quantity": None,
+    }
+    return {
+        "cohort_id": cohort_id,
+        "route": route,
+        "requested_notional_usd": Decimal(requested_notional),
+        "buy_leg": buy_leg,
+        "sell_leg": sell_leg,
+        "route_timing": route_timing,
+        "cost_components": costs,
+        "mode_evidence": mode,
+        "now": NOW,
+        "core_manifest_sha256": core_hash,
+    }
+
+
 def strict_fixture(
     *,
     now=NOW,
@@ -803,7 +897,7 @@ class CommonQuantityTests(unittest.TestCase):
         self.assertLessEqual(result.quantity * Decimal("200"), Decimal("10000"))
 
 
-class RouteOpportunityTests(unittest.TestCase):
+class _RouteOpportunityTopologyTests:
     def test_live_builder_rejects_collapsed_atomic_nine_row_topology(self):
         kwargs = atomic_v2_fixture()
         collapsed_costs = collapsed_atomic_gas_costs(kwargs)
@@ -874,6 +968,148 @@ class RouteOpportunityTests(unittest.TestCase):
         )
         self.assertEqual(result["opportunity_id"], collapsed_costs[0]["opportunity_id"])
 
+
+class _TerminalRouteOpportunityContractTests:
+    def test_terminal_builder_emits_exact_null_contract_and_rejects_mutations(self):
+        self.assertTrue(
+            hasattr(route_opportunity, "build_terminal_route_opportunity"),
+            "terminal route builder is not implemented",
+        )
+        kwargs = terminal_route_fixture()
+        result = route_opportunity.build_terminal_route_opportunity(**kwargs)
+
+        expected_id = (
+            "route:CAKE:cex:binance:CAKE/USDT->cex:bybit:CAKE/USDT:"
+            "prepositioned_inventory:10000"
+        )
+        self.assertEqual(result["opportunity_id"], expected_id)
+        self.assertEqual(result["primary_reason"], "sell_leg_unavailable")
+        self.assertEqual(result["reason_codes"], ["sell_leg_unavailable"])
+        self.assertEqual(result["opportunity_class"], "unavailable")
+        self.assertIs(result["strict_eligible"], False)
+        self.assertIs(result["strict_ready_for_publication"], False)
+        self.assertEqual(result["buy_core_manifest_sha256"], CORE_HASH)
+        self.assertEqual(result["sell_core_manifest_sha256"], CORE_HASH)
+        for field in (
+            "target_token_quantity",
+            "target_base_raw",
+            "target_base_unit_decimals",
+            "target_lattice_raw",
+            "buy_state_id",
+            "sell_state_id",
+            "buy_state_observed_at",
+            "sell_state_observed_at",
+            "route_age_seconds",
+            "gross_buy_cost_usd",
+            "gross_sell_proceeds_usd",
+            "gross_edge_usd",
+            "gross_edge_bps",
+            "gross_edge_bps_numerator",
+            "gross_edge_bps_denominator",
+            "strict_nonembedded_cost_usd",
+            "research_bounded_cost_usd",
+            "research_assumed_cost_usd",
+            "strict_net_edge_usd",
+            "strict_net_edge_bps",
+            "strict_net_edge_bps_numerator",
+            "strict_net_edge_bps_denominator",
+            "research_net_edge_usd",
+            "research_net_edge_bps",
+            "research_net_edge_bps_numerator",
+            "research_net_edge_bps_denominator",
+            "edge_bps_denominator_basis",
+            "inventory_profile_hash",
+            "maximum_proved_capacity_quantity",
+            "publication_attestation_sha256",
+            "buy_usd_projection_sha256",
+            "sell_usd_projection_sha256",
+        ):
+            with self.subTest(field=field):
+                self.assertIsNone(result[field])
+
+        canonical_costs = sorted(
+            (dict(row) for row in kwargs["cost_components"]),
+            key=lambda row: (row["leg"], row["component_type"]),
+        )
+        expected_cost_hash = hashlib.sha256(json.dumps(
+            canonical_costs,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        expected_mode_hash = hashlib.sha256(json.dumps(
+            kwargs["mode_evidence"],
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        self.assertEqual(result["cost_component_set_sha256"], expected_cost_hash)
+        self.assertEqual(result["mode_evidence_sha256"], expected_mode_hash)
+        self.assertEqual(
+            result["evidence_binding_sha256"],
+            hashlib.sha256(json.dumps(
+                {
+                    key: value for key, value in result.items()
+                    if key != "evidence_binding_sha256"
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(len(kwargs["cost_components"]), 3)
+        self.assertTrue(all(
+            row["target_token_quantity"] is None
+            and row["value_status"] == "unavailable"
+            and row["amount_usd"] is None
+            and row["rate_bps"] is None
+            and row["strict_eligible"] is False
+            and row["reason_code"] == "sell_leg_unavailable"
+            for row in kwargs["cost_components"]
+        ))
+
+        route_opportunity.validate_route_opportunity(result, **kwargs)
+
+        wrong_timing = {**kwargs, "route_timing": {
+            **kwargs["route_timing"],
+            "reason_code": "buy_leg_unavailable",
+        }}
+        wrong_route = {**kwargs, "route": {
+            **kwargs["route"],
+            "buy_market_id": "cex:bybit:CAKE/USDT",
+        }}
+        for label, mutated in (
+            ("timing reason", wrong_timing),
+            ("route identity", wrong_route),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(ValueError):
+                    route_opportunity.build_terminal_route_opportunity(**mutated)
+
+        for label, field, value in (
+            ("target", "target_token_quantity", "1"),
+            ("state", "sell_state_id", "fabricated-state"),
+            ("economics", "gross_edge_usd", "1"),
+            ("attestation", "publication_attestation_sha256", "f" * 64),
+        ):
+            with self.subTest(label=label):
+                mutated = {**result, field: value}
+                mutated["evidence_binding_sha256"] = hashlib.sha256(json.dumps(
+                    {
+                        key: item for key, item in mutated.items()
+                        if key != "evidence_binding_sha256"
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+                with self.assertRaises(ValueError):
+                    route_opportunity.validate_route_opportunity(
+                        mutated,
+                        **kwargs,
+                    )
+
+class RouteOpportunityTests(_RouteOpportunityTopologyTests, unittest.TestCase):
     def test_public_reason_registry_covers_every_mode_reason(self):
         expected_mode_reasons = frozenset().union(
             *route_opportunity._MODE_REASON_CODES_BY_MODE.values()
@@ -1730,6 +1966,13 @@ class RouteOpportunityTests(unittest.TestCase):
             result = build_route_opportunity(**kwargs)
 
         self.assertEqual(result, baseline)
+
+
+class TerminalRouteOpportunityTests(
+    _TerminalRouteOpportunityContractTests,
+    unittest.TestCase,
+):
+    pass
 
 
 if __name__ == "__main__":

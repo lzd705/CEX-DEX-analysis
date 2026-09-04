@@ -40,6 +40,7 @@ try:
     from scripts.execution_cost_components import (
         COST_COMPONENT_CONTRACT_VERSION,
         COST_COMPONENT_COLUMNS,
+        TERMINAL_VALUE_STATUSES,
         validate_cost_components,
     )
     from scripts.fetch_cex_depth import (
@@ -68,9 +69,11 @@ try:
     )
     from scripts.route_opportunity import (
         OPPORTUNITY_FIELDS,
+        ROUTE_OPPORTUNITY_CONTRACT_VERSION,
         _issue_publication_attestation,
         _publication_binding_sha256,
         build_route_opportunity,
+        build_terminal_route_opportunity,
         route_opportunity_id,
     )
     from scripts.route_cost_topology import (
@@ -110,6 +113,7 @@ except ModuleNotFoundError:
     from execution_cost_components import (  # type: ignore[no-redef]
         COST_COMPONENT_CONTRACT_VERSION,
         COST_COMPONENT_COLUMNS,
+        TERMINAL_VALUE_STATUSES,
         validate_cost_components,
     )
     from fetch_cex_depth import (  # type: ignore[no-redef]
@@ -138,9 +142,11 @@ except ModuleNotFoundError:
     )
     from route_opportunity import (  # type: ignore[no-redef]
         OPPORTUNITY_FIELDS,
+        ROUTE_OPPORTUNITY_CONTRACT_VERSION,
         _issue_publication_attestation,
         _publication_binding_sha256,
         build_route_opportunity,
+        build_terminal_route_opportunity,
         route_opportunity_id,
     )
     from route_cost_topology import (  # type: ignore[no-redef]
@@ -3752,6 +3758,25 @@ _OPPORTUNITY_BUILD_FIELDS = frozenset({
     "mode_evidence",
     "now",
 })
+_TERMINAL_OPPORTUNITY_BUILD_FIELDS = frozenset({
+    "input_kind",
+    "cohort_id",
+    "route",
+    "requested_notional_usd",
+    "buy_leg",
+    "sell_leg",
+    "route_timing",
+    "cost_components",
+    "mode_evidence",
+    "now",
+    "core_manifest_sha256",
+})
+_TERMINAL_ROUTE_TIMING_FIELDS = frozenset({
+    "route_id",
+    "skew_seconds",
+    "timing_status",
+    "reason_code",
+})
 _STRICT_CEX_SOURCE_MEMBERS = frozenset({
     "buy_market_rules",
     "sell_market_rules",
@@ -4363,7 +4388,19 @@ def _validated_prepublication_input(
         raise RoutePublicationError("complete opportunity input schema is invalid")
     build_inputs = raw.get("build_inputs")
     classified = raw.get("classified_opportunity")
-    if not isinstance(build_inputs, Mapping) or set(build_inputs) != _OPPORTUNITY_BUILD_FIELDS:
+    terminal_input = (
+        isinstance(build_inputs, Mapping)
+        and build_inputs.get("input_kind") == "terminal_route"
+    )
+    expected_build_fields = (
+        _TERMINAL_OPPORTUNITY_BUILD_FIELDS
+        if terminal_input
+        else _OPPORTUNITY_BUILD_FIELDS
+    )
+    if (
+        not isinstance(build_inputs, Mapping)
+        or set(build_inputs) != expected_build_fields
+    ):
         raise RoutePublicationError("opportunity build input schema is invalid")
     if not isinstance(classified, Mapping) or set(classified) != OPPORTUNITY_FIELDS:
         raise RoutePublicationError("classified opportunity schema is invalid")
@@ -4373,7 +4410,12 @@ def _validated_prepublication_input(
     ):
         raise RoutePublicationError("prepublication opportunity must not be attested")
     try:
-        rebuilt = build_route_opportunity(**dict(build_inputs))
+        replay_inputs = dict(build_inputs)
+        if terminal_input:
+            replay_inputs.pop("input_kind")
+            rebuilt = build_terminal_route_opportunity(**replay_inputs)
+        else:
+            rebuilt = build_route_opportunity(**replay_inputs)
     except (TypeError, ValueError) as error:
         raise RoutePublicationError("classified opportunity cannot be replayed") from error
     if dict(classified) != rebuilt:
@@ -4401,7 +4443,48 @@ def _validated_prepublication_input(
     ):
         raise RoutePublicationError("opportunity core manifest lineage mismatch")
 
-    for direction in ("buy", "sell"):
+    if terminal_input:
+        if dict(build_inputs["route"]) != dict(route):
+            raise RoutePublicationError("terminal route does not match core")
+        for direction in ("buy", "sell"):
+            core_leg = legs_by_market.get(
+                str(route[direction + "_market_id"])
+            )
+            if (
+                core_leg is None
+                or not isinstance(build_inputs.get(direction + "_leg"), Mapping)
+                or dict(build_inputs[direction + "_leg"]) != dict(core_leg)
+            ):
+                raise RoutePublicationError(
+                    "terminal route leg does not match core"
+                )
+        core_timing_row = next(
+            (
+                row for row in cohort["route_rows"]
+                if row.get("route_id") == route_id
+            ),
+            None,
+        )
+        expected_timing = (
+            {
+                field: core_timing_row[field]
+                for field in _TERMINAL_ROUTE_TIMING_FIELDS
+            }
+            if isinstance(core_timing_row, Mapping)
+            and _TERMINAL_ROUTE_TIMING_FIELDS.issubset(core_timing_row)
+            else None
+        )
+        if (
+            build_inputs.get("route_timing") != expected_timing
+            or build_inputs.get("core_manifest_sha256")
+            != core_manifest_sha256
+            or raw.get("source_members") != {}
+        ):
+            raise RoutePublicationError(
+                "terminal opportunity lineage does not match core"
+            )
+
+    for direction in (() if terminal_input else ("buy", "sell")):
         quote = build_inputs.get(direction + "_quote")
         leg = build_inputs.get(direction + "_leg")
         market_id = str(route[direction + "_market_id"])
@@ -4760,6 +4843,21 @@ def build_complete_route_bundle(
         if source_fd is not None:
             for raw in inputs:
                 members = raw.get("source_members") if isinstance(raw, Mapping) else None
+                build_inputs = (
+                    raw.get("build_inputs")
+                    if isinstance(raw, Mapping)
+                    else None
+                )
+                terminal_input = (
+                    isinstance(build_inputs, Mapping)
+                    and build_inputs.get("input_kind") == "terminal_route"
+                )
+                if terminal_input:
+                    if members != {}:
+                        raise RoutePublicationError(
+                            "terminal opportunity source members must be empty"
+                        )
+                    continue
                 if expected_typed_sources is not None:
                     classified = (
                         raw.get("classified_opportunity")
@@ -4830,7 +4928,12 @@ def build_complete_route_bundle(
                 raise RoutePublicationError("duplicate route notional scenario")
             scenario_keys.add(scenario_key)
             source_members = raw.get("source_members")
-            if (
+            terminal_input = (
+                build_inputs.get("input_kind") == "terminal_route"
+            )
+            if terminal_input:
+                final = dict(classified)
+            elif (
                 source_fd is None
                 or fee_profile_path is None
                 or fee_profile_id is None
@@ -4855,15 +4958,16 @@ def build_complete_route_bundle(
                 )
             final_rows.append(final)
             all_costs.extend(costs)
-            quote_inputs.extend([
-                (
-                    str(classified["route_id"]),
-                    Decimal(str(classified["requested_notional_usd"])),
-                    direction,
-                    build_inputs[direction + "_quote"],
-                )
-                for direction in ("buy", "sell")
-            ])
+            if not terminal_input:
+                quote_inputs.extend([
+                    (
+                        str(classified["route_id"]),
+                        Decimal(str(classified["requested_notional_usd"])),
+                        direction,
+                        build_inputs[direction + "_quote"],
+                    )
+                    for direction in ("buy", "sell")
+                ])
 
         expected_scenarios = {
             (str(route["route_id"]), str(notional))
@@ -5398,6 +5502,112 @@ def _complete_opportunity_sort_key(row: Any) -> Tuple[str, Decimal]:
     return str(row.get("route_id")), notional
 
 
+_TERMINAL_NULL_OPPORTUNITY_FIELDS = frozenset({
+    "target_token_quantity",
+    "target_base_raw",
+    "target_base_unit_decimals",
+    "target_lattice_raw",
+    "buy_state_id",
+    "sell_state_id",
+    "buy_state_observed_at",
+    "sell_state_observed_at",
+    "route_age_seconds",
+    "gross_buy_cost_usd",
+    "gross_sell_proceeds_usd",
+    "gross_edge_usd",
+    "gross_edge_bps",
+    "gross_edge_bps_numerator",
+    "gross_edge_bps_denominator",
+    "strict_nonembedded_cost_usd",
+    "research_bounded_cost_usd",
+    "research_assumed_cost_usd",
+    "strict_net_edge_usd",
+    "strict_net_edge_bps",
+    "strict_net_edge_bps_numerator",
+    "strict_net_edge_bps_denominator",
+    "research_net_edge_usd",
+    "research_net_edge_bps",
+    "research_net_edge_bps_numerator",
+    "research_net_edge_bps_denominator",
+    "edge_bps_denominator_basis",
+    "inventory_profile_hash",
+    "maximum_proved_capacity_quantity",
+    "publication_attestation_sha256",
+    "buy_usd_projection_sha256",
+    "sell_usd_projection_sha256",
+})
+
+
+def _validate_complete_terminal_opportunity(
+    row: Mapping[str, Any],
+    component_rows: Sequence[Mapping[str, Any]],
+    route: Mapping[str, Any],
+    legs_by_market: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Validate the sole source-less, null-target complete-bundle shape."""
+    reason = row.get("primary_reason")
+    if (
+        row.get("contract_version") != ROUTE_OPPORTUNITY_CONTRACT_VERSION
+        or not str(row.get("buy_market_id")).startswith("cex:")
+        or not str(row.get("sell_market_id")).startswith("cex:")
+        or not isinstance(row.get("mode_evidence_sha256"), str)
+        or _HEX_SHA256.fullmatch(str(row["mode_evidence_sha256"])) is None
+        or row.get("opportunity_class") != "unavailable"
+        or row.get("strict_eligible") is not False
+        or row.get("strict_ready_for_publication") is not False
+        or row.get("mode_evidence_eligible") is not False
+        or row.get("cost_completeness") != "unavailable"
+        or row.get("scenario_cost_completeness") != "unavailable"
+        or not isinstance(reason, str)
+        or row.get("reason_codes") != [reason]
+        or row.get("reflected_or_embedded_component_keys") != []
+        or row.get("component_reasons") != []
+        or any(row.get(field) is not None for field in _TERMINAL_NULL_OPPORTUNITY_FIELDS)
+    ):
+        raise RoutePublicationError("terminal route opportunity shape is invalid")
+    buy_leg = legs_by_market.get(str(route.get("buy_market_id")))
+    sell_leg = legs_by_market.get(str(route.get("sell_market_id")))
+    if buy_leg is None or sell_leg is None:
+        raise RoutePublicationError("terminal route opportunity leg is absent")
+    try:
+        timing = classify_route_timing(route, buy_leg, sell_leg)
+    except (TypeError, ValueError) as error:
+        raise RoutePublicationError(
+            "terminal route opportunity timing is invalid"
+        ) from error
+    if (
+        timing.get("timing_status") == "within_sla"
+        or timing.get("reason_code") != reason
+        or timing.get("skew_seconds") != row.get("skew_seconds")
+    ):
+        raise RoutePublicationError(
+            "terminal route opportunity timing does not recompute"
+        )
+    if len(component_rows) != 3 or any(
+        component.get("cohort_id") != row.get("cohort_id")
+        or component.get("opportunity_id") != row.get("opportunity_id")
+        or component.get("requested_notional_usd")
+        != row.get("requested_notional_usd")
+        or component.get("market_id") != (
+            ""
+            if component.get("leg") == "route"
+            else route.get(str(component.get("leg")) + "_market_id")
+        )
+        or component.get("target_token_quantity") is not None
+        or component.get("value_status") not in TERMINAL_VALUE_STATUSES
+        or component.get("amount_usd") is not None
+        or component.get("rate_bps") is not None
+        or component.get("strict_eligible") is not False
+        or component.get("embedded_in_leg_quote") is not False
+        or component.get("observed_at") is not None
+        or component.get("valid_until") is not None
+        or component.get("source_record_sha256") is not None
+        or component.get("reason_code") != reason
+        for component in component_rows
+    ):
+        raise RoutePublicationError("terminal route opportunity costs are invalid")
+
+
 def _validate_complete_logical_bundle_shared(
     bundle: Any, *, historical_atomic: bool = False,
 ) -> Dict[str, Any]:
@@ -5547,14 +5757,20 @@ def _validate_complete_logical_bundle_shared(
             or row.get("sell_core_manifest_sha256") != normalized["core_manifest_sha256"]
         ):
             raise RoutePublicationError("route opportunity core binding is invalid")
+        terminal_opportunity = row.get("target_token_quantity") is None
+        expected_completeness = (
+            {"unavailable"}
+            if terminal_opportunity
+            else {"complete", "incomplete"}
+        )
         if (
             type(row.get("strict_eligible")) is not bool
             or type(row.get("strict_ready_for_publication")) is not bool
             or row.get("opportunity_class") not in {
                 "executable_candidate", "research_estimate", "unavailable"
             }
-            or row.get("cost_completeness") not in {"complete", "incomplete"}
-            or row.get("scenario_cost_completeness") not in {"complete", "incomplete"}
+            or row.get("cost_completeness") not in expected_completeness
+            or row.get("scenario_cost_completeness") not in expected_completeness
         ):
             raise RoutePublicationError("route opportunity classification is invalid")
         notional = str(row.get("requested_notional_usd"))
@@ -5639,6 +5855,13 @@ def _validate_complete_logical_bundle_shared(
             != expected_cost_binding
         ):
             raise RoutePublicationError("route opportunity cost binding is invalid")
+        if terminal_opportunity:
+            _validate_complete_terminal_opportunity(
+                row,
+                component_rows,
+                route,
+                legs_by_market,
+            )
         if row.get("strict_eligible"):
             strict_cex_route = _strict_cex_route_identity(route)
             try:
