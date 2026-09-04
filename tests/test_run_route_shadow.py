@@ -565,6 +565,8 @@ class ShadowLockPriorityTests(unittest.TestCase):
                 "block_timestamp": fixed_block_timestamp,
                 "token0_address": token0,
                 "token1_address": token1,
+                "token0_decimals": "18",
+                "token1_decimals": "18",
                 "token0_price_usd": token0_price,
                 "token1_price_usd": token1_price,
             }

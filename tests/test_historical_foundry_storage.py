@@ -8674,6 +8674,15 @@ class HistoricalFoundryStorageTask4bFilesystemTests(
             fixture.close()
 
     def test_slice4_stop_has_raw_exchange_replay_but_no_later_surface(self):
+        retained_types = (
+            self.scan._ProductionHistoricalWindowCaptureReplayEvent,
+            self.storage.HistoricalRunStagingSnapshot,
+        )
+        retained_object_ids_at_start = {
+            id(value)
+            for value in gc.get_objects()
+            if type(value) in retained_types
+        }
         fixture, capability = self._new_capability()
         original_open = self.storage.os.open
         fd_names = {}
@@ -8682,7 +8691,8 @@ class HistoricalFoundryStorageTask4bFilesystemTests(
             "snapshot_allocations": 0,
             "event_issuer_calls": 0,
             "event_registry_sizes": [],
-            "snapshot_registry_sizes": [],
+            "snapshot_registry_growth_sizes": [],
+            "snapshot_registry_baselines": {},
             "quota_transition_calls": [],
             "final_surface_members": [],
             "member_open_order": [],
@@ -8775,8 +8785,12 @@ class HistoricalFoundryStorageTask4bFilesystemTests(
                         and "registry" in key
                         and type(value) is dict
                     ):
-                        observation["snapshot_registry_sizes"].append(
-                            len(value)
+                        registry_members = frozenset(value)
+                        baseline = observation[
+                            "snapshot_registry_baselines"
+                        ].setdefault(id(value), registry_members)
+                        observation["snapshot_registry_growth_sizes"].append(
+                            len(registry_members - baseline)
                         )
                 return tracer
             if filename == self.scan.__file__:
@@ -8824,7 +8838,7 @@ class HistoricalFoundryStorageTask4bFilesystemTests(
                 True,
                 tuple(
                     size != 0
-                    for size in observation["snapshot_registry_sizes"]
+                    for size in observation["snapshot_registry_growth_sizes"]
                 ),
             )
             quota_pairs = [
@@ -8865,8 +8879,8 @@ class HistoricalFoundryStorageTask4bFilesystemTests(
             capability = None
             gc.collect()
             self.assertFalse(any(
-                type(value) is self.scan._ProductionHistoricalWindowCaptureReplayEvent
-                or type(value) is self.storage.HistoricalRunStagingSnapshot
+                type(value) in retained_types
+                and id(value) not in retained_object_ids_at_start
                 for value in gc.get_objects()
             ))
         finally:
@@ -15286,7 +15300,7 @@ class HistoricalFoundryStorageTask4bMaximumIntegrationTests(
             "fees/00000001.json.gz", 268,
             "3d221de2ad977645a086c54ebd8b1f2e9363bc2c5b5ae571fe54030098bc8330",
         ),
-        "a7b49eae8078035d4b2df412cb79a568779ac7f615b2331a42bf144861bf3db3",
+        "e8428ddc68bdf5079f947b6bd38758f6bdc4e1094ebfb07425c20fba60deb434",
     )
 
     @staticmethod

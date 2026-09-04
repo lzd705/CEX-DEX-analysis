@@ -406,6 +406,7 @@ class BuildShadowAuditTests(unittest.TestCase):
     def test_partial_leg_without_literal_true_is_available(self):
         cohort = _cohort()
         cohort["legs"][0]["status"] = "partial"
+        cohort["legs"][0]["reason_code"] = "source_level_limit"
         cohort["legs"][0].pop("available")
         cohort = _rehash(cohort)
         audit = build_shadow_audit(

@@ -1750,6 +1750,8 @@ class AdminServiceTest(unittest.TestCase):
             (),
             "",
             (),
+            "",
+            (),
         )
         payload = {"metadata": {}, "cex_markets": [], "dex_pools": []}
 
@@ -1762,7 +1764,7 @@ class AdminServiceTest(unittest.TestCase):
                 with patch.object(
                     server,
                     "overlay_cex_depth_snapshot",
-                    side_effect=lambda value, _: value,
+                    side_effect=lambda value, _, __: value,
                 ):
                     with patch.object(
                         server,

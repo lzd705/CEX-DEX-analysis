@@ -548,11 +548,37 @@ class CostTopologyBoundaryTests(unittest.TestCase):
         )
 
     def test_low_level_historical_validator_stays_out_of_dashboard_and_release(self):
-        private_name = "_validate_historical_atomic_cost_component_matrix"
-        self.assertNotIn(private_name, opportunity_facts.__dict__)
-        self.assertNotIn(private_name, check_dashboard_release.__dict__)
-        self.assertFalse(hasattr(route_cost_topology, "HistoricalReplayBuildContext"))
-        self.assertNotIn("scripts.historical_route_publication", sys.modules)
+        historical_name = "scripts.historical_route_publication"
+        missing = object()
+        previous_module = sys.modules.get(historical_name, missing)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                (
+                    "import sys; "
+                    "from dashboard import opportunity_facts; "
+                    "from scripts import check_dashboard_release, "
+                    "route_cost_topology; "
+                    "private_name = "
+                    "'_validate_historical_atomic_cost_component_matrix'; "
+                    "violations = (private_name in "
+                    "opportunity_facts.__dict__, private_name in "
+                    "check_dashboard_release.__dict__, hasattr("
+                    "route_cost_topology, 'HistoricalReplayBuildContext'), "
+                    "'scripts.historical_route_publication' in "
+                    "sys.modules); "
+                    "raise SystemExit(any(violations))"
+                ),
+            ],
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        self.assertIs(sys.modules.get(historical_name, missing), previous_module)
 
     def test_package_and_direct_script_import_modes_work(self):
         completed = subprocess.run(

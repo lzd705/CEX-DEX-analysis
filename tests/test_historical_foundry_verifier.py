@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
-from importlib.machinery import SourceFileLoader
+from importlib.machinery import ModuleSpec, SourceFileLoader
 import inspect
 import json
 import multiprocessing
@@ -107,7 +107,7 @@ def _forged_same_name_test_module_worker(queue):
     genuine = sys.modules.get(module_name)
     fake = types.ModuleType(module_name)
     fake.__file__ = str(Path(__file__).resolve())
-    fake.__spec__ = type(genuine.__spec__)(
+    fake.__spec__ = ModuleSpec(
         module_name,
         SourceFileLoader(module_name, fake.__file__),
         origin=fake.__file__,
