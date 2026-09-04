@@ -392,6 +392,40 @@ MEV unavailable and research net null. The option accepts canonical decimal
 text from 0 through 10000 with at most six decimal places and is rejected for
 the CEX finalizer.
 
+### Sealed local Current Opportunity workflow demo
+
+For a repeatable presentation of the DEX research workflow without collecting
+current market data, run this command from the repository root:
+
+```bash
+python3 scripts/run_current_opportunity_demo.py --port 0
+```
+
+Open the URL printed by the runner and press `Ctrl-C` to stop it and remove the
+temporary fixture. The runner is fixed to loopback and replays a
+SHA-256-sealed synthetic AAA/WETH known-answer test (KAT) through the local Opportunity
+workflow. The fixture contains two synthetic Uniswap V2 pools, one route, and
+five requested USD notionals: `1000`, `5000`, `10000`, `50000`, and `100000`.
+The demo supplies 25 bps as an explicit research MEV assumption; that value is
+not observed or inferred from the signed evidence.
+
+The API projection uses the fixture's fixed clock so its research estimates do
+not disappear under the Current Opportunity freshness window during the
+presentation. This exception exists only inside the isolated demo runner. The
+normal Current Opportunity API continues to evaluate freshness against the
+wall clock.
+
+No live RPC or HTTP market collection and no transaction or order execution is
+performed. The displayed values are synthetic `research_estimate` results and
+may be negative; they are neither current-market nor profit claims and never
+become `executable_candidate`. Repository-pinned SHA-256 hashes seal the full
+fixture bytes. The SSH signature authenticates only the submission-policy
+snapshot; it does not sign every transcript or prove that fixture values came
+from a live chain, a real market, or an externally authoritative submission
+connector. In exact Current-demo mode, the page hides Historical Replay,
+cross-page navigation, and route-detail links because the runner intentionally
+serves only the read-only Current Opportunity API.
+
 If the pinned route-cost sidecar cannot establish either leg transcript, all
 required component rows remain terminal with null amounts and the page shows
 the route as `unavailable`; the MEV option does not override missing evidence.

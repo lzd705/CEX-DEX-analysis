@@ -91,6 +91,31 @@ The page labels all receipt-record, workflow-trace, gas-assumption, and result
 values as fixture evidence; they are not execution, verification, or profit
 claims.
 
+### Local sealed Current Opportunity demo
+
+From the repository root, start the sealed, loopback-only Current Opportunity
+workflow demo with:
+
+```bash
+python3 scripts/run_current_opportunity_demo.py --port 0
+```
+
+Open the URL printed by the command and press `Ctrl-C` when finished. The
+runner replays a synthetic AAA/WETH known-answer test (KAT) covering two
+synthetic Uniswap V2 pools and five USD notionals (`1000`, `5000`, `10000`,
+`50000`, and `100000`). It applies an explicit 25 bps research MEV assumption
+and uses the fixture's fixed clock so the same research workflow remains
+visible during a presentation.
+
+This demo performs no live RPC collection and no trade or order execution. Its
+rows are synthetic research estimates, not current market observations or
+profit claims. Repository-pinned SHA-256 hashes seal the full checked-in fixture.
+The SSH signature authenticates only the submission-policy snapshot inside the
+fixture; it does not sign every transcript or authenticate the synthetic values
+as real market data. The runner serves the read-only demo on `127.0.0.1`, hides
+links to surfaces that its one-API allowlist does not serve, and removes its
+temporary data on exit.
+
 The application code and SQLite schemas are versioned in GitHub. Reviewed
 market CSV inputs and the generated `market_facts.sqlite3` runtime database
 live in the ignored `data/local/` directory, or an external directory selected

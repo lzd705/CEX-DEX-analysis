@@ -255,6 +255,26 @@ const OPPORTUNITY_REASON_LABELS = Object.freeze({
   non_positive_net_edge: "The proved net edge is not positive.",
   publication_evidence_unverified: "Strict publication attestation is not verified.",
 });
+const CURRENT_OPPORTUNITY_DEMO_METADATA = Object.freeze({
+  contract_version: "opportunity_current_demo_summary/v1",
+  demo_fixture: true,
+  evidence_mode: "offline_sha256_sealed_fixture_with_signed_policy",
+  verification_status: "fixture_integrity_verified",
+  validation_boundary: "production_dex_research_finalizer",
+  temporal_scope: "fixed_fixture_clock",
+  clock_basis: "frozen_fixture_evaluation_time",
+  execution_claim: "synthetic_fixture_no_execution",
+  execution_status: "not_run",
+  simulation_basis: "sha256_sealed_repository_known_answer_fixture",
+  signed_scope: "submission_policy_snapshot_only",
+  live_rpc: false,
+  network_scope: "loopback_only",
+  token_pair: "AAA/WETH",
+  venue_model: "two synthetic Uniswap V2 pools",
+  research_mev_bps: "25",
+  fixture_evaluated_at: "2026-08-01T12:00:03Z",
+  fixture_asset_sha256: "7e0af472e466edbd73290e1a66dc60fe6e49b0accbd092ef5ae8cc5a6904a7fc",
+});
 
 const byId = (id) => document.getElementById(id);
 const compactCurrency = new Intl.NumberFormat("en-US", {
@@ -2205,6 +2225,10 @@ function opportunityComponentReason(component, route) {
 
 function opportunityComponentEvidence(component) {
   const status = String(component?.value_status || "status unavailable");
+  const rate = opportunityNumber(component?.rate_bps);
+  const rateText = rate === null
+    ? ""
+    : ` · ${String(component.rate_bps).trim()} bps`;
   const strictness = component?.strict_eligible === true
     ? "strict eligible"
     : "not strict eligible";
@@ -2214,7 +2238,7 @@ function opportunityComponentEvidence(component) {
   const reason = component?.reason_code
     ? ` · reason ${component.reason_code}`
     : "";
-  return `${status} · ${strictness} · ${reflection}${reason}`;
+  return `${status}${rateText} · ${strictness} · ${reflection}${reason}`;
 }
 
 function formatOpportunityTimestamp(value) {
@@ -2324,7 +2348,9 @@ function opportunityRowMarkup(route) {
       pairMode: "transient",
     })
     : "";
-  const routeIdentity = routePath
+  const routeIdentity = routePath && !isCurrentOpportunityDemoPayload(
+    app.opportunities,
+  )
     ? `<a class="opportunity-route-id route-action" href="${escapeHtml(routePath)}">${escapeHtml(routeId)}</a>`
     : `<span class="opportunity-route-id">${escapeHtml(routeId)}</span>`;
   const buyObserved = route?.leg_timestamps?.buy
@@ -2457,13 +2483,60 @@ function restoreMarketFreshness() {
   }
 }
 
-function isLoopbackHistoricalDemoLocation() {
+function isLoopbackOpportunityDemoLocation() {
   const location = globalThis.window?.location;
   const hostname = String(location?.hostname || "").toLowerCase();
   return (
     location?.hash === "#local-demo-fixture"
     && ["127.0.0.1", "localhost", "::1", "[::1]"].includes(hostname)
   );
+}
+
+function isLoopbackHistoricalDemoLocation() {
+  return isLoopbackOpportunityDemoLocation();
+}
+
+function currentOpportunityDemoMetadataMatches(metadata) {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return false;
+  }
+  return Object.entries(CURRENT_OPPORTUNITY_DEMO_METADATA).every(
+    ([field, expected]) => metadata[field] === expected,
+  );
+}
+
+function isCurrentOpportunityDemoPayload(payload) {
+  return (
+    isLoopbackOpportunityDemoLocation()
+    && payload?.availability?.status === "available"
+    && payload?.availability?.reason === null
+    && currentOpportunityDemoMetadataMatches(payload?.metadata)
+  );
+}
+
+function currentOpportunityResponseContractMatches(payload) {
+  const metadata = payload?.metadata;
+  const claimsDemoContract = (
+    metadata?.contract_version
+      === CURRENT_OPPORTUNITY_DEMO_METADATA.contract_version
+    || metadata?.demo_fixture === true
+  );
+  if (claimsDemoContract) return isCurrentOpportunityDemoPayload(payload);
+  return (
+    metadata?.contract_version === "opportunity_dashboard/v1"
+    && metadata?.demo_fixture !== true
+  );
+}
+
+function syncCurrentOpportunityDemoPresentation(payload = app.opportunities) {
+  const label = byId("current-opportunity-demo-label");
+  const active = isCurrentOpportunityDemoPayload(payload);
+  if (label) label.hidden = !active;
+  const primaryNavigation = byId("primary-navigation");
+  const scopeControl = byId("opportunity-scope-control");
+  if (primaryNavigation) primaryNavigation.hidden = active;
+  if (scopeControl) scopeControl.hidden = active;
+  return active;
 }
 
 function preserveHistoricalDemoFragment(path) {
@@ -2484,10 +2557,12 @@ function syncOpportunityScopePresentation(scope) {
   });
   const currentContext = byId("opportunity-current-context");
   const historicalContext = byId("opportunity-historical-context");
+  const currentDemoLabel = byId("current-opportunity-demo-label");
   const demoLabel = byId("historical-opportunity-demo-label");
   const dataActionsNav = byId("data-actions-nav");
   if (currentContext) currentContext.hidden = historical;
   if (historicalContext) historicalContext.hidden = !historical;
+  if (currentDemoLabel && historical) currentDemoLabel.hidden = true;
   if (demoLabel) {
     demoLabel.hidden = !(
       historical
@@ -2801,6 +2876,7 @@ function clearHistoricalOpportunityInventory() {
 
 function prepareOpportunityScopeLoad(scope) {
   syncOpportunityScopePresentation(scope);
+  syncCurrentOpportunityDemoPresentation();
   setGlobalFreshness(
     scope === "historical"
       ? "Loading historical replay"
@@ -2818,6 +2894,7 @@ function prepareOpportunityScopeLoad(scope) {
 function renderOpportunities(payload) {
   app.opportunities = payload;
   syncOpportunityScopePresentation("current");
+  syncCurrentOpportunityDemoPresentation(payload);
   clearHistoricalOpportunityInventory();
   const venueOptions = Array.isArray(payload?.metadata?.available_venues)
     ? payload.metadata.available_venues.filter((venue) => (
@@ -3004,6 +3081,7 @@ function opportunityFiltersFromControls() {
 function clearOpportunityFilterResult(errors) {
   invalidateOpportunityRequest();
   app.opportunities = null;
+  syncCurrentOpportunityDemoPresentation();
   byId("opportunities-view")?.setAttribute("aria-busy", "false");
   hideStatus(byId("opportunity-loading"));
   hideStatus(byId("opportunity-status"));
@@ -3197,6 +3275,9 @@ function opportunitySortComparison(left, right, filters) {
 }
 
 function opportunityResponseMatchesRequest(payload, requestedFilters) {
+  if (!currentOpportunityResponseContractMatches(payload)) {
+    return false;
+  }
   if (!opportunityResponseFiltersMatch(payload?.filters, requestedFilters)) {
     return false;
   }
@@ -3229,6 +3310,7 @@ function clearOpportunityResult(
   scope = opportunityScope(app.route?.filters || {}),
 ) {
   app.opportunities = null;
+  syncCurrentOpportunityDemoPresentation();
   byId("opportunities-view")?.setAttribute("aria-busy", "false");
   hideStatus(byId("opportunity-loading"));
   showError(byId("opportunity-error"), message);

@@ -16,7 +16,7 @@
           <p>Venue-level facts, aligned on daily UTC observations</p>
         </div>
       </div>
-      <nav class="primary-navigation" aria-label="Primary navigation">
+      <nav id="primary-navigation" class="primary-navigation" aria-label="Primary navigation">
         <a href="/screener" data-app-route="screener">Screener</a>
         <a href="/opportunities" data-app-route="opportunities">Opportunities</a>
         <a href="/tokens/AAVE/markets" data-app-route="markets">Markets</a>
@@ -904,11 +904,12 @@
             <span class="eyebrow">Synchronized route research</span>
             <h2 id="opportunities-title">Route Opportunities</h2>
             <p>Rank synchronized routes only after route timing, execution, cost, capacity, and evidence gates are applied.</p>
-            <div class="segmented-control opportunity-scope-control" role="group" aria-label="Opportunity time scope">
+            <div id="opportunity-scope-control" class="segmented-control opportunity-scope-control" role="group" aria-label="Opportunity time scope">
               <button type="button" data-opportunity-scope="current" class="active" aria-pressed="true">Current</button>
               <button type="button" data-opportunity-scope="historical" aria-pressed="false">Historical Replay</button>
             </div>
             <div id="opportunity-current-context" class="module-context" aria-label="Opportunity classification legend">
+              <span id="current-opportunity-demo-label" class="module-chip opportunity-demo-chip" hidden>LOCAL CURRENT DEMO FIXTURE · AAA/WETH synthetic pools · SHA-256-sealed KAT · SSH-signed policy snapshot only · 25 bps MEV assumption · fixed fixture clock · no live RPC or execution</span>
               <span class="module-chip opportunity-class-chip strict">Strict executable candidate</span>
               <span class="module-chip opportunity-class-chip estimate">Research estimate</span>
               <span class="module-chip opportunity-class-chip unavailable">Unavailable route</span>

@@ -62,6 +62,8 @@ const opportunityIds = [
   "estimate-opportunity-count", "unavailable-opportunity-count",
   "strict-opportunity-body", "estimate-opportunity-body",
   "unavailable-opportunity-body", "opportunities-view",
+  "current-opportunity-demo-label", "opportunity-scope-control",
+  "primary-navigation",
   "time-toolbar",
 ];
 const opportunityElements = Object.fromEntries(
@@ -280,6 +282,14 @@ console.log(JSON.stringify({
         self.assertIn("Unavailable routes", page)
         self.assertIn("Daily Price Gap", page)
         self.assertIn("not an executable route", page)
+        self.assertIn('id="current-opportunity-demo-label"', page)
+        self.assertIn("LOCAL CURRENT DEMO FIXTURE", page)
+        self.assertIn("AAA/WETH", page)
+        self.assertIn("25 bps MEV assumption", page)
+        self.assertIn("SHA-256-sealed KAT", page)
+        self.assertIn("SSH-signed policy snapshot only", page)
+        self.assertIn('id="opportunity-scope-control"', page)
+        self.assertIn('id="primary-navigation"', index)
 
     def test_opportunity_tables_and_mobile_disclosures_have_no_clipping_contract(self):
         index = INDEX_PATH.read_text(encoding="utf-8")
@@ -289,6 +299,8 @@ console.log(JSON.stringify({
         self.assertGreaterEqual(index.count('class="opportunity-table"'), 3)
         self.assertIn(".opportunity-table", styles)
         self.assertIn("font-variant-numeric: tabular-nums", styles)
+        self.assertIn(".opportunity-table td:nth-child(2) {", styles)
+        self.assertIn(".opportunity-table .opportunity-route-id { display: block; }", styles)
 
         mobile_match = re.search(
             r"@media \(max-width: 700px\) \{(?P<body>[\s\S]+)\}\s*$",
@@ -453,6 +465,209 @@ Promise.resolve(applyRouteFromLocation()).then(
 
 
 class OpportunityRendererTest(unittest.TestCase):
+    def test_current_demo_banner_requires_loopback_fragment_and_exact_metadata(self):
+        result = run_app_javascript(
+            DOM_FIXTURE
+            + PAYLOAD_FIXTURE
+            + r"""
+function demoPayload() {
+  const payload = JSON.parse(JSON.stringify(opportunityPayload));
+  Object.assign(payload.metadata, {
+    contract_version: "opportunity_current_demo_summary/v1",
+    demo_fixture: true,
+    evidence_mode: "offline_sha256_sealed_fixture_with_signed_policy",
+    verification_status: "fixture_integrity_verified",
+    validation_boundary: "production_dex_research_finalizer",
+    temporal_scope: "fixed_fixture_clock",
+    clock_basis: "frozen_fixture_evaluation_time",
+    execution_claim: "synthetic_fixture_no_execution",
+    execution_status: "not_run",
+    simulation_basis: "sha256_sealed_repository_known_answer_fixture",
+    signed_scope: "submission_policy_snapshot_only",
+    live_rpc: false,
+    network_scope: "loopback_only",
+    token_pair: "AAA/WETH",
+    venue_model: "two synthetic Uniswap V2 pools",
+    research_mev_bps: "25",
+    fixture_evaluated_at: "2026-08-01T12:00:03Z",
+    fixture_asset_sha256: "7e0af472e466edbd73290e1a66dc60fe6e49b0accbd092ef5ae8cc5a6904a7fc",
+  });
+  payload.availability = { status: "available", reason: null };
+  return payload;
+}
+const filters = normalizedOpportunityFilters({
+  notionalUsd: "10000", opportunityClass: "all", routeType: "all",
+  availability: "all", sort: "net_edge_usd", dir: "desc",
+});
+function evaluate(payload, hostname, hash) {
+  window.location = { hostname, hash };
+  const accepted = opportunityResponseMatchesRequest(payload, filters);
+  renderOpportunities(payload);
+  return {
+    accepted,
+    hidden: opportunityElements["current-opportunity-demo-label"].hidden,
+    navigationHidden: opportunityElements["primary-navigation"].hidden,
+    scopeHidden: opportunityElements["opportunity-scope-control"].hidden,
+    routeLinked: opportunityElements["estimate-opportunity-body"].innerHTML
+      .includes("route-action"),
+  };
+}
+const exact = evaluate(demoPayload(), "127.0.0.1", "#local-demo-fixture");
+const noFragment = evaluate(demoPayload(), "127.0.0.1", "");
+const nonLoopback = evaluate(demoPayload(), "demo.example", "#local-demo-fixture");
+const alteredPayload = demoPayload();
+alteredPayload.metadata.research_mev_bps = "0";
+const altered = evaluate(alteredPayload, "127.0.0.1", "#local-demo-fixture");
+const alteredMetadataFields = Object.keys(CURRENT_OPPORTUNITY_DEMO_METADATA).map(
+  (field) => {
+    const payload = demoPayload();
+    const value = payload.metadata[field];
+    payload.metadata[field] = typeof value === "boolean" ? !value : `${value}:altered`;
+    return {
+      field,
+      result: evaluate(payload, "127.0.0.1", "#local-demo-fixture"),
+    };
+  },
+);
+const production = evaluate(
+  JSON.parse(JSON.stringify(opportunityPayload)),
+  "127.0.0.1",
+  "#local-demo-fixture",
+);
+console.log(JSON.stringify({
+  exact, noFragment, nonLoopback, altered, alteredMetadataFields, production,
+}));
+""",
+            prelude=(
+                "globalThis.MarketMonitorNavigation = {"
+                "buildWorkspacePath() { return '/tokens/AAA/liquidity'; }"
+                "};"
+            ),
+        )
+
+        self.assertEqual(result["exact"], {
+            "accepted": True,
+            "hidden": False,
+            "navigationHidden": True,
+            "scopeHidden": True,
+            "routeLinked": False,
+        })
+        self.assertEqual(
+            result["noFragment"], {
+                "accepted": False,
+                "hidden": True,
+                "navigationHidden": False,
+                "scopeHidden": False,
+                "routeLinked": True,
+            }
+        )
+        self.assertEqual(
+            result["nonLoopback"], {
+                "accepted": False,
+                "hidden": True,
+                "navigationHidden": False,
+                "scopeHidden": False,
+                "routeLinked": True,
+            }
+        )
+        self.assertEqual(
+            result["altered"], {
+                "accepted": False,
+                "hidden": True,
+                "navigationHidden": False,
+                "scopeHidden": False,
+                "routeLinked": True,
+            }
+        )
+        self.assertTrue(result["alteredMetadataFields"])
+        self.assertTrue(all(
+            item["result"] == {
+                "accepted": False,
+                "hidden": True,
+                "navigationHidden": False,
+                "scopeHidden": False,
+                "routeLinked": True,
+            }
+            for item in result["alteredMetadataFields"]
+        ))
+        self.assertEqual(
+            result["production"], {
+                "accepted": True,
+                "hidden": True,
+                "navigationHidden": False,
+                "scopeHidden": False,
+                "routeLinked": True,
+            }
+        )
+
+    def test_cost_component_evidence_displays_exact_rate_bps_without_null_zero(self):
+        result = run_app_javascript(
+            r"""
+const assumed = opportunityComponentEvidence({
+  value_status: "assumed", strict_eligible: false,
+  reflected_or_embedded: false, rate_bps: "0.000001",
+});
+const absent = opportunityComponentEvidence({
+  value_status: "not_applicable", strict_eligible: true,
+  reflected_or_embedded: false, rate_bps: null,
+});
+console.log(JSON.stringify({ assumed, absent }));
+""",
+        )
+
+        self.assertIn("0.000001 bps", result["assumed"])
+        self.assertNotIn(" bps", result["absent"])
+        self.assertNotIn("0 bps", result["absent"])
+
+    def test_current_demo_negative_result_and_mev_rate_remain_visible(self):
+        result = run_app_javascript(
+            r"""
+const markup = opportunityRowMarkup({
+  route_id: "route:AAA:synthetic",
+  token_symbol: "AAA",
+  route_type: "dex_dex",
+  route_mode: "atomic_onchain",
+  opportunity_class: "research_estimate",
+  buy_market_id: "dex:eth:uniswap_v2:pool-a:AAA",
+  sell_market_id: "dex:eth:uniswap_v2:pool-b:AAA",
+  requested_notional_usd: "1000",
+  target_token_quantity: "0.166666666666666666",
+  availability: { status: "available", reason: null },
+  gross_edge_usd: "-255.259256375000112",
+  gross_edge_bps: "-2544.9343619",
+  net_edge_usd: "-257.759256400578112",
+  net_edge_bps: "-2569.859358",
+  cost_breakdown: {
+    strict_nonembedded_usd: "0.000000025578",
+    research_bounded_usd: "0",
+    research_assumed_usd: "2.5",
+  },
+  cost_components: [{
+    leg: "route", market_id: "", component_type: "mev_buffer",
+    value_status: "assumed", strict_eligible: false,
+    reflected_or_embedded: false, embedded_in_leg_quote: false,
+    amount_usd: "2.5", rate_bps: "25", reason_code: null,
+  }],
+  leg_timestamps: {
+    buy: "2026-08-01T12:00:00Z", sell: "2026-08-01T12:00:00Z",
+  },
+  skew_seconds: 0,
+  route_age_seconds: 3,
+  primary_reason: "non_positive_net_edge",
+  reason_codes: ["non_positive_net_edge"],
+  source_links: [],
+});
+console.log(JSON.stringify({ markup }));
+""",
+            prelude="globalThis.MarketMonitorNavigation = {};",
+        )
+
+        self.assertIn("$-257.759256401", result["markup"])
+        self.assertIn("25 bps", result["markup"])
+        self.assertIn(
+            'data-opportunity-class="research_estimate"', result["markup"]
+        )
+
     def test_withheld_source_url_keeps_market_identity_visible(self):
         result = run_app_javascript(
             r"""
@@ -980,7 +1195,10 @@ const filters = normalizedOpportunityFilters({
 function basePayload() {
   return {
     availability: { status: "available", reason: null },
-    metadata: { coverage: { returned_count: 2 } },
+    metadata: {
+      contract_version: "opportunity_dashboard/v1",
+      coverage: { returned_count: 2 },
+    },
     filters: {
       token: null, venue: null, notional_usd: "10000",
       opportunity_class: "all", route_type: "all", availability: "all",
