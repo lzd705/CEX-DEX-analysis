@@ -360,7 +360,31 @@ the finalizer process with the dashboard, disables administrator and public
 write surfaces, and skips ambient local-environment loading. The dashboard is
 started only after `routes/latest.json` and its complete bundle have passed a
 fresh full reload against the pinned core. This entry point does not collect
-market data, select a Shadow run, submit an order, or support DEX finalization.
+market data, select a Shadow run, or submit an order.
+
+An explicitly pinned, DEX-only core can use the same publication and serving
+boundary when every leg is an observed Ethereum Uniswap V2 pool, every route
+is same-chain `atomic_onchain`, and every leg has the complete v2 typed-source
+inventory (`dex_pool_state`, `dex_market_rules`, `dex_usd_conversion`, and
+`dex_usd_price_context`):
+
+```bash
+python3 scripts/route_opportunity_pipeline.py \
+  --finalizer eth-uniswap-v2-research \
+  --data-dir /absolute/local-data \
+  --shadow-run-id RUN_ID \
+  --expected-joint-pointer-sha256 64_HEX_SHA256 \
+  --serve \
+  --port 8765
+```
+
+This mode rereads and replays only the retained local bytes; it performs no RPC
+or HTTP collection. It never issues an executable attestation. If the pinned
+route-cost sidecar cannot establish gas, router, tax, transfer, pool-fee, or
+MEV costs, all required component rows remain terminal with null amounts and
+the page shows the route as `unavailable` rather than treating an unknown cost
+as zero. A DEX result is therefore either `research_estimate` or `unavailable`,
+never `executable_candidate`.
 
 Each sealed route candidate also carries its two ranking-volume inputs and a
 derived `route_volume_usd`. CEX legs bind the route-universe selected-window

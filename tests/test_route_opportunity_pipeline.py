@@ -1,9 +1,10 @@
-"""Tests for the explicit CEX-only route-opportunity finalizer."""
+"""Tests for pinned CEX and DEX route-opportunity finalizers."""
 
 from __future__ import annotations
 
 import copy
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import ExitStack, redirect_stdout
 from unittest.mock import patch
@@ -18,6 +20,7 @@ from unittest.mock import patch
 from scripts.route_cost_evidence import (
     build_unavailable_route_cost_evidence_manifest,
 )
+from scripts.fetch_dex_depth import ROUTE_V2_FEE_PROOF_SHA256
 from scripts.route_publication import (
     load_latest_complete_route_bundle,
     publish_route_cohort_bundle,
@@ -27,9 +30,11 @@ from scripts.route_shadow_audit import build_shadow_audit
 from scripts.route_shadow_inputs import (
     SourceFileIdentity,
     TYPED_SOURCE_ROLE_CONTRACTS,
+    TYPED_SOURCE_LINEAGE_SCHEMA_V2,
     _candidate_source_generation,
     write_run_universe,
 )
+from scripts.route_quantity import V2PoolState, V2_FEE_FORMULA
 from scripts.route_universe import route_universe_sha256
 import scripts.route_opportunity_pipeline as opportunity_pipeline
 from scripts.route_opportunity_pipeline import (
@@ -44,6 +49,58 @@ def _physical_json(value):
     return json.dumps(
         value, ensure_ascii=False, indent=2, sort_keys=True
     ).encode("utf-8") + b"\n"
+
+
+def _v2_pool_payload(
+    *,
+    pool_address,
+    raw_response_sha256,
+    reserve_quote_raw,
+):
+    state = V2PoolState(
+        chain="eth",
+        chain_id=1,
+        dex="uniswap_v2",
+        pool_address=pool_address,
+        token0_address="0x" + "1" * 40,
+        token1_address="0x" + "2" * 40,
+        token0_decimals=18,
+        token1_decimals=6,
+        reserve0_raw=1_000_000 * 10**18,
+        reserve1_raw=reserve_quote_raw,
+        reserve_timestamp_last_raw=1_754_046_400,
+        fee_bps=30,
+        fee_numerator=9_970,
+        fee_denominator=10_000,
+        fee_formula=V2_FEE_FORMULA,
+        fee_proof_sha256=ROUTE_V2_FEE_PROOF_SHA256,
+        block_number=123,
+        block_hash="0x" + "a" * 64,
+        block_header_sha256="b" * 64,
+        observed_at="2026-08-01T12:00:00Z",
+        raw_response_sha256=raw_response_sha256,
+    )
+    integer_fields = {
+        "chain_id", "token0_decimals", "token1_decimals", "reserve0_raw",
+        "reserve1_raw", "reserve_timestamp_last_raw", "fee_bps",
+        "fee_numerator", "fee_denominator", "block_number",
+    }
+    return {
+        "schema": "route_v2_pool_state/v1",
+        **{
+            field: str(getattr(state, field)) if field in integer_fields
+            else getattr(state, field)
+            for field in (
+                "chain", "chain_id", "dex", "pool_address",
+                "token0_address", "token1_address", "token0_decimals",
+                "token1_decimals", "reserve0_raw", "reserve1_raw",
+                "reserve_timestamp_last_raw", "fee_bps", "fee_numerator",
+                "fee_denominator", "fee_formula", "fee_proof_sha256",
+                "block_number", "block_hash", "block_header_sha256",
+                "observed_at", "raw_response_sha256", "state_id",
+            )
+        },
+    }
 
 
 class RouteOpportunityPipelineTests(unittest.TestCase):
@@ -214,6 +271,39 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output.getvalue()), loaded["pointer"])
         dashboard_exec.assert_not_called()
+
+    def test_cli_dex_v2_publishes_then_execs_read_only_dashboard(self):
+        data_dir, _cohort, joint = self._install_real_dex_run()
+        output = io.StringIO()
+
+        with ExitStack() as stack:
+            dashboard_exec = stack.enter_context(patch.object(
+                opportunity_pipeline.os,
+                "execve",
+                side_effect=RuntimeError("dashboard exec sentinel"),
+            ))
+            stack.enter_context(redirect_stdout(output))
+            stack.enter_context(self.assertRaisesRegex(
+                RuntimeError, "dashboard exec sentinel"
+            ))
+            opportunity_pipeline.main([
+                "--finalizer", "eth-uniswap-v2-research",
+                "--data-dir", str(data_dir),
+                "--shadow-run-id", joint["pointer"]["run_id"],
+                "--expected-joint-pointer-sha256", joint["pointer_sha256"],
+                "--serve",
+                "--port", "43211",
+            ])
+
+        loaded = load_latest_complete_route_bundle(
+            data_dir / "routes", core_root=data_dir / "routes/core"
+        )
+        self.assertEqual(
+            json.loads(output.getvalue().splitlines()[0]), loaded["pointer"]
+        )
+        self.assertEqual(
+            dashboard_exec.call_args.args[1][-2:], ["--port", "43211"]
+        )
 
     def _install_real_cex_run(self, *, sell_quantity="10000"):
         data_dir = Path(self.temporary.name) / "real-data"
@@ -423,6 +513,295 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
             shadow_root, core_pointer=core_pointer, audit=audit
         )
         return data_dir, fixture, joint
+
+    def _install_real_dex_run(self, *, typed_context_price=None):
+        data_dir = Path(self.temporary.name) / "real-dex-data"
+        core_root = data_dir / "routes/core"
+        shadow_root = data_dir / "routes/shadow"
+        raw_root = data_dir / "raw/route-cohort"
+        cohort = copy.deepcopy(route_publication_test._dex_cohort())
+        run_id = cohort["raw_evidence_run_id"]
+
+        logical_paths = (
+            "market_facts.sqlite3",
+            "cex_instrument_lifecycle.json",
+            "admin/token_registry.json",
+            "cex_exchange_volume_daily.csv",
+            "cex_depth_latest.csv",
+            "dex_depth_latest.csv",
+            "cex_execution_cost_latest.csv",
+            "dex_execution_cost_latest.csv",
+            "dex_pool_tvl_latest.csv",
+            "config/tokens.csv",
+            "config/token_chains.csv",
+        )
+        identities = [
+            SourceFileIdentity(
+                path,
+                index + 1,
+                hashlib.sha256(path.encode("utf-8")).hexdigest(),
+            )
+            for index, path in enumerate(logical_paths)
+        ]
+        generation = _candidate_source_generation(identities)
+        cohort["candidate_source_generation"] = generation
+        cohort["source_state"]["candidate_source_generation"] = generation
+        cohort["selection_window"] = {
+            "start": "2026-07-03",
+            "end": "2026-08-01",
+        }
+        for rows in (cohort["routes"], cohort["route_rows"]):
+            for row in rows:
+                row["candidate_source_generation"] = generation
+
+        typed_root = raw_root / run_id / "typed"
+        typed_root.mkdir(parents=True)
+        manifest_members = []
+        target_address = "0x" + "1" * 40
+        quote_address = "0x" + "2" * 40
+        price_source_hash = "e" * 64
+        for index, leg in enumerate(cohort["legs"], start=1):
+            market_id = leg["market_id"]
+            pool_address = market_id.split(":", 4)[3]
+            raw_bytes = _shadow_json_bytes({
+                "fixture": "pinned-dex-pool-rpc/v1",
+                "market_id": market_id,
+            })
+            raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+            accepted = (
+                raw_root / run_id / "accepted"
+                / hashlib.sha256(market_id.encode("utf-8")).hexdigest()
+            )
+            accepted.mkdir(parents=True)
+            (accepted / "response.json").write_bytes(raw_bytes)
+
+            context = {
+                "schema": "route_collector_context/v1",
+                "snapshot_id": "tvl-snapshot-001",
+                "request_started_at": "2026-08-01T11:59:58+00:00",
+                "observed_at": "2026-08-01T12:00:01+00:00",
+                "response_received_at": "2026-08-01T12:00:02+00:00",
+                "status": "observed",
+                "reason_code": "observed",
+                "pool_name": "UNI / USDC",
+                "base_token_id": "eth_" + target_address,
+                "quote_token_id": "eth_" + quote_address,
+                "base_token_price_usd": "95",
+                "quote_token_price_usd": "1",
+                "tvl_method": "geckoterminal_reserve_in_usd",
+                "source": "retained local fixture",
+                "source_endpoint": "https://api.example.test/pools",
+                "raw_response_sha256": price_source_hash,
+            }
+            leg.update({
+                "status": "observed",
+                "available": True,
+                "reason_code": None,
+                "snapshot_id": run_id,
+                "source_endpoint": "https://rpc.example.test/eth",
+                "state_observed_at": "2026-08-01T12:00:00Z",
+                "fixed_block_number": "123",
+                "fixed_block_timestamp": "2026-08-01T12:00:00Z",
+                "raw_response_sha256": raw_sha256,
+                "chain": "eth",
+                "dex": "uniswap_v2",
+                "pool_address": pool_address,
+                "block_timestamp": "2026-08-01T12:00:00Z",
+                "target_token_position": "token0",
+                "target_token_address": target_address,
+                "target_token_side": "base",
+                "token0_address": target_address,
+                "token0_symbol": "UNI",
+                "token0_decimals": "18",
+                "token0_price_usd": "95",
+                "token1_address": quote_address,
+                "token1_symbol": "USDC",
+                "token1_decimals": "6",
+                "token1_price_usd": "1",
+                "usd_price_source_snapshot_id": context["snapshot_id"],
+                "usd_price_observed_at": context["observed_at"],
+                "usd_price_source": context["source"],
+                "usd_price_source_endpoint": context["source_endpoint"],
+                "usd_price_raw_response_sha256": price_source_hash,
+                "collector_context": context,
+            })
+            pool = _v2_pool_payload(
+                pool_address=pool_address,
+                raw_response_sha256=raw_sha256,
+                reserve_quote_raw=(
+                    90_000_000 * 10**6
+                    if index == 1 else 100_000_000 * 10**6
+                ),
+            )
+            rules = {
+                "schema": "route_dex_market_rules_source/v1",
+                "market_id": market_id,
+                "base_asset": "UNI",
+                "quote_asset": "USDC",
+                "base_token_address": target_address,
+                "quote_token_address": quote_address,
+                "base_unit_decimals": 18,
+                "quote_unit_decimals": 6,
+                "base_increment": "0.000000000000000001",
+                "quote_increment": "0.000001",
+                "min_base_quantity": "0",
+                "min_quote_notional": "0",
+                "increment_source": "fixed_block_token_decimals",
+                "minimum_source": "dex_protocol_no_additional_order_minimum",
+                "observed_at": "2026-08-01T12:00:00Z",
+                "valid_until": "2026-08-01T12:02:00Z",
+                "raw_response_sha256": raw_sha256,
+            }
+            conversion = {
+                "schema": "route_dex_usd_conversion_source/v1",
+                "market_id": market_id,
+                "target_asset": "UNI",
+                "target_token_address": target_address,
+                "quote_asset": "USDC",
+                "quote_token_address": quote_address,
+                "usd_per_quote": "1",
+                "value_status": "measured",
+                "observed_at": "2026-08-01T12:00:01Z",
+                "valid_until": "2026-08-01T14:00:01Z",
+                "state_observed_at": "2026-08-01T12:00:00Z",
+                "source": context["source"],
+                "source_snapshot_id": context["snapshot_id"],
+                "source_raw_response_sha256": price_source_hash,
+                "state_raw_response_sha256": raw_sha256,
+            }
+            typed_context = copy.deepcopy(context)
+            if typed_context_price is not None:
+                typed_context["base_token_price_usd"] = typed_context_price
+            payloads = {
+                "dex_market_rules": _shadow_json_bytes(rules),
+                "dex_pool_state": _shadow_json_bytes(pool),
+                "dex_usd_conversion": _shadow_json_bytes(conversion),
+                "dex_usd_price_context": _shadow_json_bytes(typed_context),
+            }
+            members = []
+            for role, payload in sorted(payloads.items()):
+                contract = TYPED_SOURCE_ROLE_CONTRACTS[role]
+                filename = "dex-leg{}-{}.json".format(index, role)
+                (typed_root / filename).write_bytes(payload)
+                digest = hashlib.sha256(payload).hexdigest()
+                logical_generation = (
+                    pool["state_id"].split(":", 1)[1]
+                    if role == "dex_pool_state" else digest
+                )
+                member = {
+                    "role": role,
+                    "status": "observed",
+                    "reason_code": None,
+                    "filename": filename,
+                    "sha256": digest,
+                    "size": len(payload),
+                    "logical_generation": logical_generation,
+                    "adapter_id": contract["adapter_id"],
+                    "content_schema": contract["content_schema"],
+                }
+                members.append(member)
+                manifest_members.append({
+                    "market_id": market_id,
+                    **{
+                        key: member[key]
+                        for key in (
+                            "role", "filename", "sha256", "size",
+                            "logical_generation", "adapter_id",
+                            "content_schema",
+                        )
+                    },
+                })
+            leg["typed_source_lineage"] = {
+                "schema": TYPED_SOURCE_LINEAGE_SCHEMA_V2,
+                "members": members,
+            }
+
+        for row in cohort["route_rows"]:
+            row["skew_seconds"] = "0"
+
+        manifest_members.sort(key=lambda row: (row["market_id"], row["role"]))
+        (raw_root / run_id / "typed-manifest.json").write_bytes(
+            _shadow_json_bytes({
+                "schema": "route_typed_source_manifest/v1",
+                "raw_evidence_run_id": run_id,
+                "member_count": len(manifest_members),
+                "members": manifest_members,
+            })
+        )
+        cohort = _rehash(cohort)
+        core_pointer = publish_route_cohort_bundle(
+            cohort, core_root=core_root
+        )
+
+        harness = object.__new__(
+            route_publication_test.JointShadowPublicationTests
+        )
+        harness.generation = generation
+        universe = route_publication_test.JointShadowPublicationTests._universe(
+            harness, cohort
+        )
+        universe_sha = route_universe_sha256(universe)
+        baseline = {
+            "schema": "route_shadow_baseline_manifest/v1",
+            "calculation_version": "route_shadow_inputs/v1",
+            "candidate_source_generation": generation,
+            "selection_window": copy.deepcopy(cohort["selection_window"]),
+            "filters": {
+                "window_days": 30,
+                "calendar": "complete_utc_days",
+                "cex_volume_aggregation": "sum_quote_volume_usd",
+                "maximum_legs_per_token_market_type": 3,
+            },
+            "observation_bounds": {
+                "start_inclusive": "2026-07-03T00:00:00Z",
+                "end_exclusive": "2026-08-02T00:00:00Z",
+            },
+            "inputs": [
+                {"path": row.path, "size": row.size, "sha256": row.sha256}
+                for row in identities
+            ],
+            "route_universe_sha256": universe_sha,
+        }
+        write_run_universe(shadow_root, run_id, universe, baseline)
+        evaluated_at = "2026-08-01T12:00:03Z"
+        cost = build_unavailable_route_cost_evidence_manifest(
+            universe=universe,
+            run_id=run_id,
+            route_cohort_id=cohort["route_cohort_id"],
+            phase="canary",
+            candidate_source_generation=generation,
+            route_universe_sha256=universe_sha,
+            evaluated_at=evaluated_at,
+        )
+        cost_bytes = _shadow_json_bytes(cost)
+        (shadow_root / "runs" / run_id / "route-cost-evidence.json").write_bytes(
+            cost_bytes
+        )
+        audit = build_shadow_audit(
+            cohort,
+            core_pointer=core_pointer,
+            run={
+                "run_id": run_id,
+                "phase_state_sha256": hashlib.sha256(
+                    b"route-shadow-phase/implicit-canary/v1\n"
+                ).hexdigest(),
+                "phase_transition_id": None,
+                "route_universe_sha256": universe_sha,
+                "baseline_manifest_sha256": hashlib.sha256(
+                    _shadow_json_bytes(baseline)
+                ).hexdigest(),
+                "candidate_source_generation": generation,
+                "route_cost_evidence_sha256": hashlib.sha256(
+                    cost_bytes
+                ).hexdigest(),
+            },
+            phase="canary",
+            audit_finished_at="2026-08-01T12:00:04Z",
+        )
+        joint = publish_shadow_result(
+            shadow_root, core_pointer=core_pointer, audit=audit
+        )
+        return data_dir, cohort, joint
 
     def _pinned_views(self, *, dex=False):
         cohort_id = "cohort:" + "b" * 64
@@ -666,6 +1045,463 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
         self.assertEqual(
             payload["routes"][0]["opportunity_class"], "research_estimate"
         )
+
+    def test_pinned_dex_v2_terminal_cost_grid_is_published_and_visible(self):
+        from dashboard import server
+
+        data_dir, cohort, joint = self._install_real_dex_run()
+        result = (
+            opportunity_pipeline.finalize_eth_uniswap_v2_research_opportunities(
+                data_dir=data_dir,
+                shadow_run_id=joint["pointer"]["run_id"],
+                expected_joint_pointer_sha256=joint["pointer_sha256"],
+            )
+        )
+
+        loaded = load_latest_complete_route_bundle(
+            data_dir / "routes", core_root=data_dir / "routes/core"
+        )["bundle"]
+        self.assertEqual(result["schema"], "route_opportunity_pointer/v1")
+        self.assertEqual(
+            len(loaded["opportunities"]),
+            len(cohort["routes"]) * 5,
+        )
+        self.assertEqual(
+            {
+                row["requested_notional_usd"]
+                for row in loaded["opportunities"]
+            },
+            {"1000", "5000", "10000", "50000", "100000"},
+        )
+        self.assertEqual(
+            {row["opportunity_class"] for row in loaded["opportunities"]},
+            {"unavailable"},
+        )
+        self.assertEqual(
+            loaded["input_generations"]["adapter_versions"],
+            {
+                "dex_market_rules": "route_dex_market_rules_source/v1",
+                "dex_pool_state": "route_quantity_quote_for_v2_pool/v1",
+                "dex_usd_conversion": (
+                    "route_dex_usd_conversion_source/v1"
+                ),
+                "dex_usd_price_context": (
+                    "route_dex_usd_price_context/v1"
+                ),
+            },
+        )
+        self.assertTrue(all(
+            row["strict_eligible"] is False
+            and row["strict_ready_for_publication"] is False
+            and row["publication_attestation_sha256"] is None
+            and row["primary_reason"] == "cost_components_incomplete"
+            and row["reason_codes"] == ["cost_components_incomplete"]
+            and row["component_reasons"] == [
+                "mev_scenario_unavailable:route:mev_buffer:"
+                "strict_cost_adapter_unsupported"
+            ]
+            for row in loaded["opportunities"]
+        ))
+        for opportunity in loaded["opportunities"]:
+            self.assertRegex(
+                opportunity["buy_state_id"],
+                r"^dex-v2-quantity:[0-9a-f]{64}$",
+            )
+            self.assertRegex(
+                opportunity["sell_state_id"],
+                r"^dex-v2-quantity:[0-9a-f]{64}$",
+            )
+            self.assertRegex(
+                opportunity["buy_usd_projection_sha256"],
+                r"^[0-9a-f]{64}$",
+            )
+            self.assertRegex(
+                opportunity["sell_usd_projection_sha256"],
+                r"^[0-9a-f]{64}$",
+            )
+            costs = [
+                row for row in loaded["cost_components"]
+                if row["opportunity_id"] == opportunity["opportunity_id"]
+            ]
+            self.assertEqual(len(costs), 10)
+            self.assertEqual(
+                {(row["leg"], row["component_type"]) for row in costs},
+                {
+                    ("buy", "network_gas"),
+                    ("buy", "pool_swap_fee"),
+                    ("buy", "router_or_integrator_fee"),
+                    ("buy", "token_transfer_tax"),
+                    ("route", "mev_buffer"),
+                    ("route", "rebalancing_or_transfer"),
+                    ("sell", "network_gas"),
+                    ("sell", "pool_swap_fee"),
+                    ("sell", "router_or_integrator_fee"),
+                    ("sell", "token_transfer_tax"),
+                },
+            )
+            self.assertTrue(all(
+                row["opportunity_id"] == opportunity["opportunity_id"]
+                and row["requested_notional_usd"]
+                == opportunity["requested_notional_usd"]
+                and row["target_token_quantity"]
+                == opportunity["target_token_quantity"]
+                and row["source_record_sha256"]
+                == joint["pointer"]["route_cost_evidence_sha256"]
+                for row in costs
+            ))
+        self.assertTrue(all(
+            component["value_status"] == "unavailable"
+            and component["amount_usd"] is None
+            and component["rate_bps"] is None
+            and component["reason_code"]
+            == "strict_cost_adapter_unsupported"
+            for component in loaded["cost_components"]
+        ))
+
+        server.clear_runtime_caches()
+        try:
+            with patch.dict(
+                server.os.environ,
+                {"MARKET_ROUTE_DATA_DIR": str(data_dir / "routes")},
+                clear=True,
+            ):
+                payload = server.build_route_opportunities(notional="1000")
+        finally:
+            server.clear_runtime_caches()
+        self.assertEqual(
+            payload["availability"], {"status": "available", "reason": None}
+        )
+        self.assertEqual(len(payload["routes"]), len(cohort["routes"]))
+        self.assertEqual(
+            {row["route_type"] for row in payload["routes"]}, {"dex_dex"}
+        )
+        self.assertEqual(
+            {row["opportunity_class"] for row in payload["routes"]},
+            {"unavailable"},
+        )
+
+    def test_dex_supported_cost_pool_filter_is_exact_and_fail_closed(self):
+        retained = {
+            "dex:eth:uniswap_v2:pool-a:UNI": {"payload": b"a"},
+            "dex:eth:uniswap_v2:pool-b:UNI": {"payload": b"b"},
+        }
+        cost_evidence = {
+            "selected_markets": [
+                {
+                    "market_id": "dex:eth:uniswap_v2:pool-a:UNI",
+                    "structural_support_status": "supported",
+                },
+                {
+                    "market_id": "dex:eth:uniswap_v2:pool-b:UNI",
+                    "structural_support_status": "unsupported",
+                },
+            ],
+        }
+
+        self.assertEqual(
+            opportunity_pipeline._cost_supported_pool_members(
+                cost_evidence, retained
+            ),
+            {"dex:eth:uniswap_v2:pool-a:UNI": retained[
+                "dex:eth:uniswap_v2:pool-a:UNI"
+            ]},
+        )
+        with self.assertRaisesRegex(
+            RouteOpportunityPipelineError,
+            "pool-state evidence is missing",
+        ):
+            opportunity_pipeline._cost_supported_pool_members(
+                cost_evidence,
+                {"dex:eth:uniswap_v2:pool-b:UNI": retained[
+                    "dex:eth:uniswap_v2:pool-b:UNI"
+                ]},
+            )
+
+    def test_published_dex_bundle_serves_page_and_api_over_loopback(self):
+        from dashboard import server
+
+        data_dir, cohort, joint = self._install_real_dex_run()
+        opportunity_pipeline.finalize_eth_uniswap_v2_research_opportunities(
+            data_dir=data_dir,
+            shadow_run_id=joint["pointer"]["run_id"],
+            expected_joint_pointer_sha256=joint["pointer_sha256"],
+        )
+
+        server.clear_runtime_caches()
+        http_server = None
+        worker = None
+        try:
+            with patch.dict(
+                server.os.environ,
+                {"MARKET_ROUTE_DATA_DIR": str(data_dir / "routes")},
+                clear=True,
+            ), patch.object(
+                server.MarketMonitorHandler,
+                "log_message",
+                return_value=None,
+            ):
+                http_server = server.ThreadingHTTPServer(
+                    ("127.0.0.1", 0),
+                    server.MarketMonitorHandler,
+                )
+                http_server.daemon_threads = True
+                worker = threading.Thread(
+                    target=http_server.serve_forever,
+                    daemon=True,
+                )
+                worker.start()
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    http_server.server_address[1],
+                    timeout=5,
+                )
+                try:
+                    connection.request("GET", "/opportunities")
+                    page = connection.getresponse()
+                    page_body = page.read().decode("utf-8")
+                    self.assertEqual(page.status, 200)
+                    self.assertIn("text/html", page.getheader("Content-Type"))
+                    self.assertIn('id="opportunities-view"', page_body)
+
+                    connection.request(
+                        "GET",
+                        "/api/markets/opportunities?notional=1000&"
+                        "route_type=dex_dex&availability=unavailable",
+                    )
+                    response = connection.getresponse()
+                    payload = json.loads(response.read().decode("utf-8"))
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.getheader("Cache-Control"), "no-store")
+                finally:
+                    connection.close()
+        finally:
+            if http_server is not None:
+                if worker is not None and worker.is_alive():
+                    http_server.shutdown()
+                http_server.server_close()
+            if worker is not None:
+                worker.join(timeout=5)
+            server.clear_runtime_caches()
+
+        self.assertEqual(
+            payload["availability"], {"status": "available", "reason": None}
+        )
+        self.assertEqual(len(payload["routes"]), len(cohort["routes"]))
+        self.assertTrue(all(
+            row["route_type"] == "dex_dex"
+            and row["opportunity_class"] == "unavailable"
+            and row["primary_reason"] == "cost_components_incomplete"
+            and len(row["cost_components"]) == 10
+            for row in payload["routes"]
+        ))
+
+    def test_dex_price_context_must_equal_core_collector_context(self):
+        data_dir, _cohort, joint = self._install_real_dex_run(
+            typed_context_price="96"
+        )
+        latest_path = data_dir / "routes/latest.json"
+        latest_path.write_bytes(self.old_pointer_bytes)
+
+        with self.assertRaisesRegex(
+            RouteOpportunityPipelineError,
+            "price context differs",
+        ):
+            opportunity_pipeline.finalize_eth_uniswap_v2_research_opportunities(
+                data_dir=data_dir,
+                shadow_run_id=joint["pointer"]["run_id"],
+                expected_joint_pointer_sha256=joint["pointer_sha256"],
+            )
+
+        self.assertEqual(latest_path.read_bytes(), self.old_pointer_bytes)
+
+    def test_dex_leg_snapshot_must_equal_raw_evidence_run(self):
+        data_dir, cohort, joint = self._install_real_dex_run()
+        changed = copy.deepcopy(cohort)
+        changed["legs"][0]["snapshot_id"] = "different-run"
+
+        with self.assertRaisesRegex(
+            RouteOpportunityPipelineError,
+            "pool state differs",
+        ):
+            opportunity_pipeline._load_dex_sources(
+                root=data_dir,
+                cohort=changed,
+                source_root=(
+                    data_dir / "raw/route-cohort"
+                    / joint["pointer"]["run_id"] / "typed"
+                ),
+                now="2026-08-01T12:00:03Z",
+            )
+
+    def test_dex_scope_rejects_non_eth_non_v2_and_non_atomic_routes(self):
+        cases = (
+            ("wrong-chain", "arb", "uniswap_v2", "atomic_onchain"),
+            ("wrong-dex", "eth", "uniswap_v3", "atomic_onchain"),
+            ("wrong-mode", "eth", "uniswap_v2", "research_only"),
+        )
+        for label, chain, dex, route_mode in cases:
+            with self.subTest(label=label):
+                shadow, latest_core = self._pinned_views(dex=True)
+                first = "dex:{}:{}:0x{}:AAVE".format(
+                    chain, dex, "1" * 40
+                )
+                second = "dex:{}:{}:0x{}:AAVE".format(
+                    chain, dex, "2" * 40
+                )
+                cohort = shadow["cohort"]
+                cohort["legs"] = [
+                    {
+                        "market_id": market_id,
+                        "market_type": "dex",
+                        "status": "observed",
+                        "available": True,
+                    }
+                    for market_id in (first, second)
+                ]
+                cohort["routes"] = [{
+                    "route_id": "route-1",
+                    "buy_market_id": first,
+                    "sell_market_id": second,
+                    "route_mode": route_mode,
+                    "route_class": "candidate",
+                    "settlement_reason": None,
+                }]
+                latest_core["cohort"] = copy.deepcopy(cohort)
+                with ExitStack() as stack:
+                    stack.enter_context(patch(
+                        "scripts.route_opportunity_pipeline.load_shadow_result",
+                        return_value=shadow,
+                    ))
+                    stack.enter_context(patch(
+                        "scripts.route_opportunity_pipeline."
+                        "load_latest_route_cohort",
+                        return_value=latest_core,
+                    ))
+                    publisher = stack.enter_context(patch(
+                        "scripts.route_opportunity_pipeline."
+                        "publish_complete_route_bundle"
+                    ))
+                    with self.assertRaisesRegex(
+                        RouteOpportunityPipelineError,
+                        "requires observed|requires same-chain",
+                    ):
+                        opportunity_pipeline.finalize_eth_uniswap_v2_research_opportunities(
+                            data_dir=self.data_dir,
+                            shadow_run_id=self.run_id,
+                            expected_joint_pointer_sha256=(
+                                self.expected_joint_sha256
+                            ),
+                        )
+
+                publisher.assert_not_called()
+                self.assertEqual(
+                    self.public_pointer.read_bytes(), self.old_pointer_bytes
+                )
+
+    def test_dex_sidecar_drift_before_commit_preserves_pointer(self):
+        data_dir, _cohort, joint = self._install_real_dex_run()
+        latest_path = data_dir / "routes/latest.json"
+        latest_path.write_bytes(self.old_pointer_bytes)
+        actual_publisher = opportunity_pipeline.publish_complete_route_bundle
+
+        def mutate_then_publish(**kwargs):
+            sidecar = (
+                data_dir / "routes/shadow/runs"
+                / joint["pointer"]["run_id"]
+                / "route-cost-evidence.json"
+            )
+            sidecar.write_bytes(sidecar.read_bytes() + b"\n")
+            return actual_publisher(**kwargs)
+
+        with patch(
+            "scripts.route_opportunity_pipeline."
+            "publish_complete_route_bundle",
+            side_effect=mutate_then_publish,
+        ):
+            with self.assertRaises(RouteOpportunityPipelineError):
+                opportunity_pipeline.finalize_eth_uniswap_v2_research_opportunities(
+                    data_dir=data_dir,
+                    shadow_run_id=joint["pointer"]["run_id"],
+                    expected_joint_pointer_sha256=joint["pointer_sha256"],
+                )
+
+        self.assertEqual(latest_path.read_bytes(), self.old_pointer_bytes)
+
+    def test_dex_transient_typed_mutation_cannot_publish(self):
+        data_dir, cohort, joint = self._install_real_dex_run()
+        latest_path = data_dir / "routes/latest.json"
+        latest_path.write_bytes(self.old_pointer_bytes)
+        actual_publisher = opportunity_pipeline.publish_complete_route_bundle
+        context_member = next(
+            member
+            for member in cohort["legs"][0]["typed_source_lineage"]["members"]
+            if member["role"] == "dex_usd_price_context"
+        )
+        context_path = (
+            data_dir / "raw/route-cohort" / joint["pointer"]["run_id"]
+            / "typed" / context_member["filename"]
+        )
+        original_bytes = context_path.read_bytes()
+        mutated = json.loads(original_bytes)
+        mutated["base_token_price_usd"] = "96"
+        mutated_bytes = _shadow_json_bytes(mutated)
+        self.assertNotEqual(mutated_bytes, original_bytes)
+
+        def mutate_then_restore_at_precommit(**kwargs):
+            original_validator = kwargs["precommit_validator"]
+            context_path.write_bytes(mutated_bytes)
+
+            def restore_then_validate():
+                context_path.write_bytes(original_bytes)
+                original_validator()
+
+            kwargs["precommit_validator"] = restore_then_validate
+            try:
+                return actual_publisher(**kwargs)
+            finally:
+                context_path.write_bytes(original_bytes)
+
+        with patch(
+            "scripts.route_opportunity_pipeline."
+            "publish_complete_route_bundle",
+            side_effect=mutate_then_restore_at_precommit,
+        ):
+            with self.assertRaises(RouteOpportunityPipelineError):
+                opportunity_pipeline.finalize_eth_uniswap_v2_research_opportunities(
+                    data_dir=data_dir,
+                    shadow_run_id=joint["pointer"]["run_id"],
+                    expected_joint_pointer_sha256=joint["pointer_sha256"],
+                )
+
+        self.assertEqual(context_path.read_bytes(), original_bytes)
+        self.assertEqual(latest_path.read_bytes(), self.old_pointer_bytes)
+
+    def test_dex_typed_member_inventory_must_be_exact(self):
+        data_dir, _cohort, joint = self._install_real_dex_run()
+        latest_path = data_dir / "routes/latest.json"
+        actual_publisher = opportunity_pipeline.publish_complete_route_bundle
+
+        def without_members(**kwargs):
+            changed = copy.deepcopy(kwargs["opportunity_inputs"])
+            for item in changed:
+                item["source_members"] = {}
+            kwargs["opportunity_inputs"] = changed
+            return actual_publisher(**kwargs)
+
+        latest_path.write_bytes(self.old_pointer_bytes)
+        with patch(
+            "scripts.route_opportunity_pipeline."
+            "publish_complete_route_bundle",
+            side_effect=without_members,
+        ):
+            with self.assertRaises(RouteOpportunityPipelineError):
+                opportunity_pipeline.finalize_eth_uniswap_v2_research_opportunities(
+                    data_dir=data_dir,
+                    shadow_run_id=joint["pointer"]["run_id"],
+                    expected_joint_pointer_sha256=joint["pointer_sha256"],
+                )
+
+        self.assertEqual(latest_path.read_bytes(), self.old_pointer_bytes)
 
     def test_incomplete_high_notional_is_published_as_unavailable(self):
         data_dir, fixture, joint = self._install_real_cex_run(

@@ -3781,6 +3781,31 @@ _COMPLETE_ADAPTER_VERSIONS = {
     "inventory": "route_inventory/private_profile/v1",
     "usd_conversion": "route_usd_conversion_source/v1",
 }
+_COMPLETE_DEX_ADAPTER_VERSIONS = {
+    role: str(TYPED_SOURCE_ROLE_CONTRACTS[role]["adapter_id"])
+    for role in (
+        "dex_market_rules",
+        "dex_pool_state",
+        "dex_usd_conversion",
+        "dex_usd_price_context",
+    )
+}
+
+
+def _complete_adapter_versions_for_legs(
+    legs: Iterable[Mapping[str, Any]],
+) -> Dict[str, str]:
+    market_types = {row.get("market_type") for row in legs}
+    if not market_types or not market_types.issubset({"cex", "dex"}):
+        raise RoutePublicationError(
+            "complete route adapter market types are invalid"
+        )
+    result: Dict[str, str] = {}
+    if "cex" in market_types:
+        result.update(_COMPLETE_ADAPTER_VERSIONS)
+    if "dex" in market_types:
+        result.update(_COMPLETE_DEX_ADAPTER_VERSIONS)
+    return result
 
 
 def _json_safe_value(value: Any) -> Any:
@@ -3824,6 +3849,110 @@ def _read_member_from_root(
         label=label,
     )
     return _decode_json_object_bytes(value, label=label), value, physical_sha256
+
+
+def _typed_source_descriptors_by_filename(
+    cohort: Mapping[str, Any],
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Return pinned typed files, or ``None`` for a legacy untyped core."""
+    result: Dict[str, Dict[str, Any]] = {}
+    legs = cohort.get("legs")
+    if not isinstance(legs, list):
+        raise RoutePublicationError("typed-source core inventory is invalid")
+    lineage_presence = [
+        "typed_source_lineage" in leg
+        for leg in legs
+        if isinstance(leg, Mapping)
+    ]
+    if len(lineage_presence) != len(legs):
+        raise RoutePublicationError("typed-source core leg is invalid")
+    if not any(lineage_presence):
+        return None
+    if not all(lineage_presence):
+        raise RoutePublicationError(
+            "typed-source core inventory is incomplete"
+        )
+    for leg in legs:
+        if not isinstance(leg, Mapping):
+            raise RoutePublicationError("typed-source core leg is invalid")
+        market_id = leg.get("market_id")
+        market_type = leg.get("market_type")
+        if not isinstance(market_id, str) or market_type not in {"cex", "dex"}:
+            raise RoutePublicationError("typed-source core leg identity is invalid")
+        try:
+            members = typed_source_lineage_observed_members(
+                leg.get("typed_source_lineage"),
+                market_type=market_type,
+            )
+        except (TypeError, ValueError) as error:
+            raise RoutePublicationError(
+                "typed-source core lineage is invalid"
+            ) from error
+        for member in members:
+            filename = _require_relative_basename(
+                member["filename"], "typed source member"
+            )
+            if filename in result:
+                raise RoutePublicationError(
+                    "typed-source core filename inventory is ambiguous"
+                )
+            result[filename] = {
+                "market_id": market_id,
+                **member,
+            }
+    return result
+
+
+def _expected_complete_source_members(
+    route: Mapping[str, Any],
+    *,
+    legs_by_market: Mapping[str, Mapping[str, Any]],
+    descriptors_by_filename: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, str]:
+    """Bind one scenario's source aliases to its two core legs."""
+    by_market_role = {
+        (descriptor["market_id"], descriptor["role"]): descriptor
+        for descriptor in descriptors_by_filename.values()
+    }
+    if len(by_market_role) != len(descriptors_by_filename):
+        raise RoutePublicationError(
+            "typed-source core role inventory is ambiguous"
+        )
+    result: Dict[str, str] = {}
+    for direction in ("buy", "sell"):
+        market_id = route.get(direction + "_market_id")
+        leg = legs_by_market.get(market_id)
+        if leg is None:
+            raise RoutePublicationError(
+                "typed source route leg is not in the core"
+            )
+        market_type = leg.get("market_type")
+        if market_type == "cex":
+            aliases = (
+                ("market_rules", "cex_market_rules"),
+                ("usd_conversion", "quote_usd_conversion"),
+            )
+        elif market_type == "dex":
+            aliases = tuple(
+                (role, role)
+                for role in sorted(
+                    descriptor["role"]
+                    for descriptor in descriptors_by_filename.values()
+                    if descriptor["market_id"] == market_id
+                )
+            )
+        else:
+            raise RoutePublicationError(
+                "typed source route leg market type is invalid"
+            )
+        for alias, descriptor_role in aliases:
+            descriptor = by_market_role.get((market_id, descriptor_role))
+            if descriptor is None:
+                raise RoutePublicationError(
+                    "typed source route inventory is incomplete"
+                )
+            result["{}_{}".format(direction, alias)] = descriptor["filename"]
+    return result
 
 
 def _read_core_raw_members(
@@ -4380,11 +4509,37 @@ def build_complete_route_bundle(
             except (TypeError, ValueError) as error:
                 raise RoutePublicationError("private fee profile is invalid") from error
 
+        expected_typed_sources = (
+            _typed_source_descriptors_by_filename(cohort)
+            if source_fd is not None else None
+        )
         typed_source_records: Dict[Tuple[str, str], Dict[str, str]] = {}
         if source_fd is not None:
             for raw in inputs:
                 members = raw.get("source_members") if isinstance(raw, Mapping) else None
-                if not isinstance(members, Mapping):
+                if expected_typed_sources is not None:
+                    classified = (
+                        raw.get("classified_opportunity")
+                        if isinstance(raw, Mapping) else None
+                    )
+                    route_id = (
+                        classified.get("route_id")
+                        if isinstance(classified, Mapping) else None
+                    )
+                    route = routes_by_id.get(route_id)
+                    if (
+                        route is None
+                        or not isinstance(members, Mapping)
+                        or dict(members) != _expected_complete_source_members(
+                            route,
+                            legs_by_market=legs_by_market,
+                            descriptors_by_filename=expected_typed_sources,
+                        )
+                    ):
+                        raise RoutePublicationError(
+                            "typed source member inventory differs from core lineage"
+                        )
+                elif not isinstance(members, Mapping):
                     continue
                 for role, filename in members.items():
                     source_name = _require_relative_basename(
@@ -4396,6 +4551,16 @@ def build_complete_route_bundle(
                         source_name,
                         label="typed source member",
                     )
+                    if expected_typed_sources is not None:
+                        expected = expected_typed_sources.get(source_name)
+                        if (
+                            expected is None
+                            or len(_source_bytes) != expected["size"]
+                            or source_sha256 != expected["sha256"]
+                        ):
+                            raise RoutePublicationError(
+                                "typed source member differs from core lineage"
+                            )
                     typed_source_records[(str(role), source_name)] = {
                         "role": str(role),
                         "filename": source_name,
@@ -4558,7 +4723,9 @@ def build_complete_route_bundle(
             "typed_source_generation": _canonical_input_sha256([
                 typed_source_records[key] for key in sorted(typed_source_records)
             ]),
-            "adapter_versions": dict(_COMPLETE_ADAPTER_VERSIONS),
+            "adapter_versions": _complete_adapter_versions_for_legs(
+                cohort["legs"]
+            ),
         }
         return {
             "schema": "route_opportunity/v1",
@@ -5030,7 +5197,7 @@ def _validate_complete_logical_bundle_shared(
         if not isinstance(value, str) or _HEX_SHA256.fullmatch(value) is None:
             raise RoutePublicationError("complete route generation hash is invalid")
     adapters = generations.get("adapter_versions")
-    if adapters != _COMPLETE_ADAPTER_VERSIONS:
+    if not isinstance(adapters, dict):
         raise RoutePublicationError("complete route adapter generation is invalid")
 
     routes = normalized.get("routes")
@@ -5069,6 +5236,15 @@ def _validate_complete_logical_bundle_shared(
         collection_completed_at=context["collection_completed_at"],
         collection_deadline_at=context["collection_deadline_at"],
     )
+    expected_adapters = (
+        _COMPLETE_ADAPTER_VERSIONS
+        if historical_atomic
+        else _complete_adapter_versions_for_legs(legs)
+    )
+    if adapters != expected_adapters:
+        raise RoutePublicationError(
+            "complete route adapter generation is invalid"
+        )
     for route in routes:
         if (
             route["buy_market_id"] not in legs_by_market
@@ -5799,19 +5975,13 @@ def _verify_complete_core_lineage(
             fcntl.flock(core_fd, fcntl.LOCK_SH)
         except Exception as error:
             raise RoutePublicationError("route core lock acquisition failed") from error
-        snapshot = _optional_pointer_snapshot_at(core_fd)
-        if snapshot is None:
-            raise RoutePublicationError("route core pointer is missing")
-        loaded = load_latest_route_cohort(core)
-        if (
-            loaded["manifest_sha256"] != expected_manifest_sha256
-            or _sha256_bytes(snapshot[0]) != expected_pointer_sha256
-            or not _pointer_snapshot_is_owned(
-                _optional_pointer_snapshot_at(core_fd), snapshot
-            )
-        ):
-            raise RoutePublicationError("route core changed before public pointer commit")
-        _verify_open_path_identity(core, core_details, "route core root")
+        _verify_complete_core_lineage_at_locked(
+            core,
+            core_fd,
+            core_details,
+            expected_manifest_sha256=expected_manifest_sha256,
+            expected_pointer_sha256=expected_pointer_sha256,
+        )
     finally:
         try:
             fcntl.flock(core_fd, fcntl.LOCK_UN)
@@ -5819,6 +5989,55 @@ def _verify_complete_core_lineage(
             os.close(core_fd)
             raise RoutePublicationError("route core lock release failed") from error
         os.close(core_fd)
+
+
+def _verify_complete_core_lineage_at_locked(
+    core: Path,
+    core_fd: int,
+    core_details: os.stat_result,
+    *,
+    expected_manifest_sha256: str,
+    expected_pointer_sha256: str,
+) -> None:
+    """Verify the live core while the caller retains its shared lock."""
+    snapshot = _optional_pointer_snapshot_at(core_fd)
+    if snapshot is None:
+        raise RoutePublicationError("route core pointer is missing")
+    try:
+        pointer = _decode_json_object_bytes(
+            snapshot[0], label="route core pointer"
+        )
+        if (
+            set(pointer) != {
+                "schema", "bundle_stage", "route_cohort_id", "manifest_sha256"
+            }
+            or pointer.get("schema") != ROUTE_CORE_POINTER_SCHEMA
+            or pointer.get("bundle_stage") != ROUTE_CORE_BUNDLE_STAGE
+            or pointer.get("manifest_sha256") != expected_manifest_sha256
+            or _sha256_bytes(snapshot[0]) != expected_pointer_sha256
+        ):
+            raise RoutePublicationError(
+                "route core changed before public pointer commit"
+            )
+        _load_core_bundle_at_root(
+            core,
+            core_fd,
+            route_cohort_id=pointer["route_cohort_id"],
+            core_manifest_sha256=expected_manifest_sha256,
+        )
+    except RoutePublicationError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise RoutePublicationError(
+            "route core changed before public pointer commit"
+        ) from error
+    if not _pointer_snapshot_is_owned(
+        _optional_pointer_snapshot_at(core_fd), snapshot
+    ):
+        raise RoutePublicationError(
+            "route core changed before public pointer commit"
+        )
+    _verify_open_path_identity(core, core_details, "route core root")
 
 
 def publish_complete_route_bundle(
@@ -5852,18 +6071,57 @@ def publish_complete_route_bundle(
     artifacts, _manifest = _complete_artifact_bytes(bundle)
     expected_manifest_sha256 = _sha256_bytes(artifacts[MANIFEST_FILENAME])
 
-    routes = _ensure_real_directory(Path(routes_root))
-    routes, routes_fd, routes_details = _open_verified_directory(
-        routes, "complete routes root"
+    # A cheap preflight rejects stale builds before taking both publication
+    # locks.  The same lineage is checked again while the core shared lock is
+    # retained through the public pointer commit below.
+    _verify_complete_core_lineage(
+        Path(core_root),
+        expected_manifest_sha256=bundle["core_manifest_sha256"],
+        expected_pointer_sha256=bundle["core_pointer_sha256"],
     )
+
+    routes = _ensure_real_directory(Path(routes_root))
+    core, core_fd, core_details = _open_verified_directory(
+        Path(core_root), "route core root"
+    )
+    try:
+        routes, routes_fd, routes_details = _open_verified_directory(
+            routes, "complete routes root"
+        )
+    except BaseException:
+        os.close(core_fd)
+        raise
+    if _same_inode(core_details, routes_details):
+        try:
+            os.close(routes_fd)
+        finally:
+            os.close(core_fd)
+        raise RoutePublicationError(
+            "route core and complete routes roots must be distinct"
+        )
     bundles_fd: Optional[int] = None
     stage_fd: Optional[int] = None
     stage_name: Optional[str] = None
     stage_details: Optional[os.stat_result] = None
     renamed = False
+    core_locked = False
     routes_locked = False
     old_pointer: Optional[Tuple[bytes, os.stat_result]] = None
     try:
+        try:
+            fcntl.flock(core_fd, fcntl.LOCK_SH)
+            core_locked = True
+        except Exception as error:
+            raise RoutePublicationError(
+                "route core lock acquisition failed"
+            ) from error
+        _verify_complete_core_lineage_at_locked(
+            core,
+            core_fd,
+            core_details,
+            expected_manifest_sha256=bundle["core_manifest_sha256"],
+            expected_pointer_sha256=bundle["core_pointer_sha256"],
+        )
         try:
             fcntl.flock(routes_fd, fcntl.LOCK_EX)
             routes_locked = True
@@ -5916,9 +6174,14 @@ def publish_complete_route_bundle(
                 parent_fd=bundles_fd,
             )
 
-        # The public pointer may only bind the exact core pointer observed by build.
-        _verify_complete_core_lineage(
-            Path(core_root),
+        # The public pointer may only bind the exact core pointer observed by
+        # build.  This check and the callback run while the same shared core
+        # lock is retained, so a cooperating core publisher cannot advance
+        # latest between validation and commit.
+        _verify_complete_core_lineage_at_locked(
+            core,
+            core_fd,
+            core_details,
             expected_manifest_sha256=bundle["core_manifest_sha256"],
             expected_pointer_sha256=bundle["core_pointer_sha256"],
         )
@@ -5938,7 +6201,21 @@ def publish_complete_route_bundle(
         try:
             if precommit_validator is not None:
                 precommit_validator()
+            _verify_complete_core_lineage_at_locked(
+                core,
+                core_fd,
+                core_details,
+                expected_manifest_sha256=bundle["core_manifest_sha256"],
+                expected_pointer_sha256=bundle["core_pointer_sha256"],
+            )
             _commit_complete_pointer_at_locked(routes_fd, routes, pointer_bytes)
+            _verify_complete_core_lineage_at_locked(
+                core,
+                core_fd,
+                core_details,
+                expected_manifest_sha256=bundle["core_manifest_sha256"],
+                expected_pointer_sha256=bundle["core_pointer_sha256"],
+            )
         except BaseException:
             _restore_pointer_after_failure(
                 routes_fd, routes, old_pointer, pointer_bytes
@@ -5946,24 +6223,43 @@ def publish_complete_route_bundle(
             raise
         return pointer
     finally:
+        primary_error_active = sys.exc_info()[0] is not None
+        cleanup_errors: List[BaseException] = []
         if stage_fd is not None:
-            os.close(stage_fd)
+            try:
+                os.close(stage_fd)
+            except BaseException as error:
+                cleanup_errors.append(error)
         if (
             not renamed and bundles_fd is not None and stage_name is not None
             and stage_details is not None
         ):
-            _remove_stage_directory_at(bundles_fd, stage_name, stage_details)
-        if bundles_fd is not None:
-            os.close(bundles_fd)
-        if routes_locked:
             try:
-                fcntl.flock(routes_fd, fcntl.LOCK_UN)
-            except Exception as error:
-                os.close(routes_fd)
-                raise RoutePublicationError(
-                    "complete routes lock release failed"
-                ) from error
-        os.close(routes_fd)
+                _remove_stage_directory_at(
+                    bundles_fd, stage_name, stage_details
+                )
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if bundles_fd is not None:
+            try:
+                os.close(bundles_fd)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        routes_cleanup_error = _release_route_lock_and_close(
+            routes_fd,
+            locked=routes_locked,
+            label="complete routes",
+        )
+        core_cleanup_error = _release_route_lock_and_close(
+            core_fd,
+            locked=core_locked,
+            label="route core",
+        )
+        for cleanup_error in (routes_cleanup_error, core_cleanup_error):
+            if cleanup_error is not None:
+                cleanup_errors.append(cleanup_error)
+        if cleanup_errors and not primary_error_active:
+            raise cleanup_errors[0]
 
 
 def load_latest_complete_route_bundle(
@@ -7359,6 +7655,21 @@ def _validate_joint_lineage(
     retained_pool_states = _load_retained_typed_source_members(
         Path(shadow_root), core
     )
+    raw_selected_markets = evidence["cost_evidence"].get("selected_markets")
+    cost_supported_market_ids = {
+        row.get("market_id")
+        for row in raw_selected_markets
+        if isinstance(row, Mapping)
+        and row.get("structural_support_status") == "supported"
+    } if isinstance(raw_selected_markets, list) else set()
+    if not cost_supported_market_ids.issubset(retained_pool_states):
+        raise RoutePublicationError(
+            "supported route-cost pool-state evidence is missing"
+        )
+    cost_pool_states = {
+        market_id: retained_pool_states[market_id]
+        for market_id in sorted(cost_supported_market_ids)
+    }
     _validate_cost_evidence_outer_lineage(
         evidence["cost_evidence"],
         run_id=audit["run_id"],
@@ -7367,7 +7678,7 @@ def _validate_joint_lineage(
         candidate_source_generation=audit["candidate_source_generation"],
         route_universe_sha256_value=evidence["route_universe_sha256"],
         universe=universe,
-        retained_typed_pool_state_members=retained_pool_states,
+        retained_typed_pool_state_members=cost_pool_states,
     )
     _validate_dex_collector_contexts(universe, core["legs"])
     try:

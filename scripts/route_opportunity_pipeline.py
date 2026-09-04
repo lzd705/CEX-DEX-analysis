@@ -1,4 +1,4 @@
-"""Explicit CEX-only finalization of one pinned route Shadow run."""
+"""Finalize one pinned route Shadow run into Current Opportunities."""
 
 from __future__ import annotations
 
@@ -18,15 +18,19 @@ from scripts.cex_fee_facts import (
     collect_cex_fee_snapshot,
     load_validated_fee_profile,
 )
+from scripts.collect_route_cohort import _validated_typed_payload_inventory
 from scripts.execution_cost_components import cost_component_row
 from scripts.fetch_cex_depth import (
     cex_quantity_state_id,
     route_quantity_quote_for_book,
 )
+from scripts.fetch_dex_depth import freeze_v2_pool_state
 from scripts.route_cost_evidence import (
     RouteCostEvidenceError,
     replay_route_cost_coverage_outcomes,
+    validate_retained_v2_pool_state_member,
 )
+from scripts.route_cost_topology import live_complete_cost_component_keys
 from scripts.route_inventory import (
     classify_route_mode_evidence,
     inventory_capacity_for_route,
@@ -47,14 +51,22 @@ from scripts.route_publication import (
     _read_core_raw_members,
     _read_member_from_root,
     _read_shadow_run_evidence,
+    _validate_route_collector_context,
     _verify_open_path_identity,
     load_latest_route_cohort,
     load_latest_complete_route_bundle,
     load_shadow_result,
     publish_complete_route_bundle,
 )
-from scripts.route_quantity import FeeSemantics
-from scripts.route_shadow_inputs import typed_source_lineage_observed_members
+from scripts.route_quantity import (
+    FeeSemantics,
+    MarketRules,
+    quote_v2_pool_quantity,
+)
+from scripts.route_shadow_inputs import (
+    TYPED_SOURCE_LINEAGE_SCHEMA_V2,
+    typed_source_lineage_observed_members,
+)
 from scripts.timestamp_contract import exact_rfc3339_epoch_seconds
 
 
@@ -64,6 +76,103 @@ class RouteOpportunityPipelineError(ValueError):
 
 _FEE_PROFILE_ENV = "MARKET_CEX_PRIVATE_FEE_PROFILE"
 _INVENTORY_PROFILE_ENV = "MARKET_ROUTE_PRIVATE_INVENTORY_PROFILE"
+_DEX_TYPED_ROLES = frozenset({
+    "dex_market_rules",
+    "dex_pool_state",
+    "dex_usd_conversion",
+    "dex_usd_price_context",
+})
+_DEX_POOL_INTEGER_FIELDS = frozenset({
+    "chain_id", "token0_decimals", "token1_decimals", "reserve0_raw",
+    "reserve1_raw", "reserve_timestamp_last_raw", "fee_bps",
+    "fee_numerator", "fee_denominator", "block_number",
+})
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _dex_source_members_by_market(
+    cohort: Mapping[str, Any],
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    result: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for leg in cohort["legs"]:
+        lineage = (
+            leg.get("typed_source_lineage")
+            if isinstance(leg, Mapping) else None
+        )
+        if (
+            not isinstance(leg, Mapping)
+            or not isinstance(lineage, Mapping)
+            or lineage.get("schema")
+            != TYPED_SOURCE_LINEAGE_SCHEMA_V2
+        ):
+            raise RouteOpportunityPipelineError(
+                "DEX typed-source lineage is not complete v2 evidence"
+            )
+        try:
+            observed = typed_source_lineage_observed_members(
+                lineage, market_type="dex"
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise RouteOpportunityPipelineError(
+                "DEX typed-source lineage is not complete v2 evidence"
+            ) from error
+        members = {row["role"]: row for row in observed}
+        market_id = leg.get("market_id")
+        if (
+            not isinstance(market_id, str)
+            or set(members) != _DEX_TYPED_ROLES
+            or market_id in result
+        ):
+            raise RouteOpportunityPipelineError(
+                "DEX typed-source lineage is not complete v2 evidence"
+            )
+        result[market_id] = members
+    return result
+
+
+def _cost_supported_pool_members(
+    cost_evidence: Mapping[str, Any],
+    retained: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Mapping[str, Any]]:
+    selected = cost_evidence.get("selected_markets")
+    if not isinstance(selected, list):
+        raise RouteOpportunityPipelineError(
+            "pinned route-cost selected-market inventory is invalid"
+        )
+    supported = {
+        row.get("market_id")
+        for row in selected
+        if isinstance(row, Mapping)
+        and row.get("structural_support_status") == "supported"
+    }
+    if (
+        any(not isinstance(market_id, str) for market_id in supported)
+        or not supported.issubset(retained)
+    ):
+        raise RouteOpportunityPipelineError(
+            "supported DEX cost pool-state evidence is missing"
+        )
+    return {
+        market_id: retained[market_id]
+        for market_id in sorted(supported)
+    }
+
+
+def _frozen_v2_state(payload: Mapping[str, Any]) -> Any:
+    source = {
+        key: int(value) if key in _DEX_POOL_INTEGER_FIELDS else value
+        for key, value in payload.items()
+        if key not in {"schema", "state_id"}
+    }
+    return freeze_v2_pool_state(source)
 
 
 def _loopback_port(value: str) -> int:
@@ -165,6 +274,202 @@ def _source_members_by_market(
             )
         result[leg["market_id"]] = members
     return result
+
+
+def _load_dex_sources(
+    *,
+    root: Path,
+    cohort: Mapping[str, Any],
+    source_root: Path,
+    now: str,
+) -> tuple[
+    Dict[str, Dict[str, Any]],
+    Dict[str, Dict[str, Any]],
+]:
+    members_by_market = _dex_source_members_by_market(cohort)
+    try:
+        raw_members = _read_core_raw_members(
+            root / "raw/route-cohort", cohort
+        )
+        source_path, source_fd, source_details = _open_verified_directory(
+            source_root, "DEX typed-source root"
+        )
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        raise RouteOpportunityPipelineError(
+            "retained DEX source evidence is invalid"
+        ) from error
+
+    sources: Dict[str, Dict[str, Any]] = {}
+    retained_pool_members: Dict[str, Dict[str, Any]] = {}
+    try:
+        for leg in cohort["legs"]:
+            market_id = leg["market_id"]
+            descriptors = members_by_market[market_id]
+            payloads: Dict[str, Dict[str, Any]] = {}
+            payload_bytes: Dict[str, bytes] = {}
+            full_descriptors: Dict[str, Dict[str, Any]] = {}
+            for role in sorted(_DEX_TYPED_ROLES):
+                descriptor = descriptors[role]
+                payload, raw_bytes, digest = _read_member_from_root(
+                    source_fd,
+                    descriptor["filename"],
+                    label="DEX " + role + " source",
+                )
+                if (
+                    len(raw_bytes) != descriptor["size"]
+                    or digest != descriptor["sha256"]
+                ):
+                    raise RouteOpportunityPipelineError(
+                        "DEX typed-source bytes differ from lineage"
+                    )
+                payloads[role] = payload
+                payload_bytes[role] = raw_bytes
+                full_descriptors[role] = {
+                    "market_id": market_id,
+                    **descriptor,
+                }
+
+            accepted_raw_sha256 = raw_members[market_id][2]
+            replayed = _validated_typed_payload_inventory(
+                trusted_leg=leg,
+                collector_row=leg,
+                accepted_raw_sha256=accepted_raw_sha256,
+                values=[
+                    {"role": role, "payload": payload_bytes[role]}
+                    for role in sorted(_DEX_TYPED_ROLES)
+                ],
+            )
+            replayed_by_role = {row["role"]: row for row in replayed}
+            if set(replayed_by_role) != _DEX_TYPED_ROLES:
+                raise RouteOpportunityPipelineError(
+                    "DEX typed-source replay inventory differs"
+                )
+            for role in sorted(_DEX_TYPED_ROLES):
+                actual = replayed_by_role[role]
+                descriptor = descriptors[role]
+                if (
+                    actual["market_id"] != market_id
+                    or actual["payload"] != payload_bytes[role]
+                    or actual["logical_generation"]
+                    != descriptor["logical_generation"]
+                    or actual["adapter_id"] != descriptor["adapter_id"]
+                    or actual["content_schema"]
+                    != descriptor["content_schema"]
+                ):
+                    raise RouteOpportunityPipelineError(
+                        "DEX typed-source replay differs from lineage"
+                    )
+
+            context_payload = payloads["dex_usd_price_context"]
+            context_view = _validate_route_collector_context(
+                context_payload, market_id=market_id
+            )
+            if (
+                context_payload != leg.get("collector_context")
+                or payload_bytes["dex_usd_price_context"]
+                != _canonical_json_bytes(context_payload)
+            ):
+                raise RouteOpportunityPipelineError(
+                    "DEX price context differs from the core leg"
+                )
+
+            pool_payload = validate_retained_v2_pool_state_member(
+                payload_bytes["dex_pool_state"],
+                descriptor=full_descriptors["dex_pool_state"],
+            )
+            state = _frozen_v2_state(pool_payload)
+            if (
+                state.state_id != pool_payload["state_id"]
+                or str(state.block_number) != leg.get("fixed_block_number")
+                or state.observed_at != leg.get("state_observed_at")
+                or exact_rfc3339_epoch_seconds(state.observed_at)
+                != exact_rfc3339_epoch_seconds(
+                    leg.get("fixed_block_timestamp")
+                )
+                or leg.get("snapshot_id")
+                != cohort.get("raw_evidence_run_id")
+            ):
+                raise RouteOpportunityPipelineError(
+                    "DEX pool state differs from the pinned core leg"
+                )
+
+            rules_payload = payloads["dex_market_rules"]
+            rules_bytes = payload_bytes["dex_market_rules"]
+            rules = MarketRules(
+                market_id=rules_payload["market_id"],
+                base_asset=rules_payload["base_asset"],
+                quote_asset=rules_payload["quote_asset"],
+                base_unit_decimals=rules_payload["base_unit_decimals"],
+                quote_unit_decimals=rules_payload["quote_unit_decimals"],
+                base_increment=Decimal(rules_payload["base_increment"]),
+                quote_increment=Decimal(rules_payload["quote_increment"]),
+                min_base_quantity=Decimal(
+                    rules_payload["min_base_quantity"]
+                ),
+                min_quote_notional=Decimal(
+                    rules_payload["min_quote_notional"]
+                ),
+                observed_at=rules_payload["observed_at"],
+                valid_until=rules_payload["valid_until"],
+                source_record_sha256=hashlib.sha256(rules_bytes).hexdigest(),
+            )
+            conversion = payloads["dex_usd_conversion"]
+            evaluated = exact_rfc3339_epoch_seconds(now)
+            if not (
+                exact_rfc3339_epoch_seconds(rules.observed_at)
+                <= evaluated
+                < exact_rfc3339_epoch_seconds(rules.valid_until)
+                and exact_rfc3339_epoch_seconds(conversion["observed_at"])
+                <= evaluated
+                < exact_rfc3339_epoch_seconds(conversion["valid_until"])
+            ):
+                raise RouteOpportunityPipelineError(
+                    "DEX rules or USD conversion do not cover evaluation time"
+                )
+            reference_price = context_view["address_prices"].get(
+                leg.get("target_token_address")
+            )
+            if reference_price is None:
+                raise RouteOpportunityPipelineError(
+                    "DEX target USD reference is unavailable"
+                )
+            retained_pool_members[market_id] = {
+                "descriptor": full_descriptors["dex_pool_state"],
+                "payload": payload_bytes["dex_pool_state"],
+            }
+            sources[market_id] = {
+                "state": state,
+                "rules": rules,
+                "conversion": conversion,
+                "usd_rate": Decimal(conversion["usd_per_quote"]),
+                "usd_sha": hashlib.sha256(
+                    payload_bytes["dex_usd_conversion"]
+                ).hexdigest(),
+                "reference_price_usd": Decimal(reference_price),
+                "filenames": {
+                    role: descriptors[role]["filename"]
+                    for role in sorted(_DEX_TYPED_ROLES)
+                },
+            }
+        _verify_open_path_identity(
+            source_path, source_details, "DEX typed-source root"
+        )
+    except (
+        KeyError,
+        InvalidOperation,
+        OSError,
+        RouteCostEvidenceError,
+        TypeError,
+        ValueError,
+    ) as error:
+        if isinstance(error, RouteOpportunityPipelineError):
+            raise
+        raise RouteOpportunityPipelineError(
+            "retained DEX source evidence is invalid"
+        ) from error
+    finally:
+        os.close(source_fd)
+    return sources, retained_pool_members
 
 
 def _validated_usd_source(
@@ -570,6 +875,240 @@ def _build_inputs(
     return opportunities, profile_id
 
 
+def _terminal_dex_cost_components(
+    *,
+    cohort_id: str,
+    route: Mapping[str, Any],
+    requested_notional_usd: Decimal,
+    target_token_quantity: Decimal,
+    coverage: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    status = coverage.get("status")
+    reason = coverage.get("reason_code")
+    if (
+        status not in {"unavailable", "failed"}
+        or not isinstance(reason, str)
+        or not reason
+        or coverage.get("coverage_kind")
+        not in {"terminal_scope_replay", "binding"}
+    ):
+        raise RouteOpportunityPipelineError(
+            "DEX route-cost coverage is not a terminal replay"
+        )
+    value_status = "failed" if status == "failed" else "unavailable"
+    opportunity_id = route_opportunity_id(
+        route["route_id"], requested_notional_usd
+    )
+    rows: List[Dict[str, Any]] = []
+    for leg, component_type in sorted(
+        live_complete_cost_component_keys(route)
+    ):
+        market_id = "" if leg == "route" else route[leg + "_market_id"]
+        rows.append(cost_component_row(
+            cohort_id=cohort_id,
+            opportunity_id=opportunity_id,
+            leg=leg,
+            market_id=market_id,
+            direction=("route" if leg == "route" else leg + "_token"),
+            requested_notional_usd=requested_notional_usd,
+            target_token_quantity=target_token_quantity,
+            component_type=component_type,
+            value_status=value_status,
+            amount_usd=None,
+            rate_bps=None,
+            basis="pinned route-cost coverage did not establish this component",
+            strict_eligible=False,
+            observed_at=None,
+            valid_until=None,
+            source="pinned route-cost evidence",
+            source_record_sha256=coverage[
+                "route_cost_evidence_sha256"
+            ],
+            reason_code=reason,
+        ))
+    return rows
+
+
+def _build_dex_inputs(
+    *,
+    cohort: Mapping[str, Any],
+    core_manifest_sha256: str,
+    sources: Mapping[str, Mapping[str, Any]],
+    outcomes: List[Mapping[str, Any]],
+    now: str,
+) -> List[Dict[str, Any]]:
+    legs_by_market = {
+        row["market_id"]: row for row in cohort["legs"]
+    }
+    outcome_by_key = {
+        (row.get("route_id"), str(row.get("requested_notional_usd"))): row
+        for row in outcomes
+        if isinstance(row, Mapping)
+    }
+    expected_keys = {
+        (route["route_id"], str(notional))
+        for route in cohort["routes"]
+        for notional in cohort["requested_notionals_usd"]
+    }
+    if (
+        len(outcome_by_key) != len(outcomes)
+        or set(outcome_by_key) != expected_keys
+    ):
+        raise RouteOpportunityPipelineError(
+            "DEX route-cost coverage scenario inventory differs"
+        )
+
+    opportunities: List[Dict[str, Any]] = []
+    cohort_now = cohort["collection_completed_at"]
+    for route in cohort["routes"]:
+        buy_source = sources[route["buy_market_id"]]
+        sell_source = sources[route["sell_market_id"]]
+        for raw_notional in cohort["requested_notionals_usd"]:
+            notional = Decimal(str(raw_notional))
+            try:
+                target = common_target_quantity(
+                    requested_notional_usd=notional,
+                    buy_reference_price_usd=buy_source[
+                        "reference_price_usd"
+                    ],
+                    sell_reference_price_usd=sell_source[
+                        "reference_price_usd"
+                    ],
+                    buy_market_rules=buy_source["rules"],
+                    sell_market_rules=sell_source["rules"],
+                )
+                quotes: Dict[str, Any] = {}
+                quote_evidence: Dict[str, Dict[str, Any]] = {}
+                projections: Dict[str, Optional[Dict[str, Any]]] = {}
+                build_legs: Dict[str, Dict[str, Any]] = {}
+                source_members: Dict[str, str] = {}
+                for direction in ("buy", "sell"):
+                    market_id = route[direction + "_market_id"]
+                    source = sources[market_id]
+                    leg = legs_by_market[market_id]
+                    rules = source["rules"]
+                    state = source["state"]
+                    quote = quote_v2_pool_quantity(
+                        state,
+                        target,
+                        rules,
+                        direction=direction,
+                        target_token_address=source["conversion"][
+                            "target_token_address"
+                        ],
+                        quote_token_address=source["conversion"][
+                            "quote_token_address"
+                        ],
+                        cohort_now=cohort_now,
+                        snapshot_id=leg["snapshot_id"],
+                    )
+                    quotes[direction] = quote
+                    build_legs[direction] = {
+                        **dict(leg),
+                        "state_id": quote.state_id,
+                    }
+                    quote_evidence[direction] = {
+                        "kind": "dex_v2",
+                        "pool_state": state,
+                        "market_rules": rules,
+                        "target_token_address": source["conversion"][
+                            "target_token_address"
+                        ],
+                        "quote_token_address": source["conversion"][
+                            "quote_token_address"
+                        ],
+                        "cohort_now": cohort_now,
+                        "snapshot_id": leg["snapshot_id"],
+                        "assurance_status": "route_bundle_validated",
+                        "core_manifest_sha256": core_manifest_sha256,
+                    }
+                    cash = (
+                        quote.quote_debit_quantity
+                        if direction == "buy"
+                        else quote.quote_received_quantity
+                    )
+                    conversion = source["conversion"]
+                    projections[direction] = (
+                        None
+                        if cash is None
+                        else usd_projection_evidence(
+                            market_id=market_id,
+                            state_id=quote.state_id,
+                            direction=direction,
+                            quote_asset=conversion["quote_asset"],
+                            quote_cash_quantity=cash,
+                            usd_per_quote=source["usd_rate"],
+                            value_status="measured",
+                            observed_at=conversion["observed_at"],
+                            valid_until=conversion["valid_until"],
+                            source=conversion["source"],
+                            source_record_sha256=source["usd_sha"],
+                            core_manifest_sha256=core_manifest_sha256,
+                        )
+                    )
+                    source_members.update({
+                        "{}_{}".format(direction, role): filename
+                        for role, filename in source["filenames"].items()
+                    })
+
+                costs = _terminal_dex_cost_components(
+                    cohort_id=cohort["route_cohort_id"],
+                    route=route,
+                    requested_notional_usd=notional,
+                    target_token_quantity=target.quantity,
+                    coverage=outcome_by_key[(
+                        route["route_id"], str(raw_notional)
+                    )],
+                )
+                mode = classify_route_mode_evidence(route, now=now)
+                build_inputs = {
+                    "cohort_id": cohort["route_cohort_id"],
+                    "route": route,
+                    "requested_notional_usd": notional,
+                    "common_target": target,
+                    "buy_leg": build_legs["buy"],
+                    "sell_leg": build_legs["sell"],
+                    "buy_quote": quotes["buy"],
+                    "sell_quote": quotes["sell"],
+                    "buy_quote_evidence": quote_evidence["buy"],
+                    "sell_quote_evidence": quote_evidence["sell"],
+                    "buy_usd_projection": projections["buy"],
+                    "sell_usd_projection": projections["sell"],
+                    "cost_components": costs,
+                    "mode_evidence": mode,
+                    "now": now,
+                }
+                classified = build_route_opportunity(**build_inputs)
+                if (
+                    classified.get("opportunity_class")
+                    not in {"research_estimate", "unavailable"}
+                    or classified.get("strict_eligible") is not False
+                    or classified.get("strict_ready_for_publication") is not False
+                    or classified.get("publication_attestation_sha256")
+                    is not None
+                ):
+                    raise RouteOpportunityPipelineError(
+                        "DEX research finalizer attempted a strict upgrade"
+                    )
+                opportunities.append({
+                    "classified_opportunity": classified,
+                    "build_inputs": build_inputs,
+                    "source_members": source_members,
+                })
+            except (
+                KeyError,
+                InvalidOperation,
+                TypeError,
+                ValueError,
+            ) as error:
+                if isinstance(error, RouteOpportunityPipelineError):
+                    raise
+                raise RouteOpportunityPipelineError(
+                    "DEX opportunity inputs cannot be reconstructed"
+                ) from error
+    return opportunities
+
+
 def finalize_cex_route_opportunities(
     *,
     data_dir: Path,
@@ -744,9 +1283,208 @@ def finalize_cex_route_opportunities(
         ) from error
 
 
+def finalize_eth_uniswap_v2_research_opportunities(
+    *,
+    data_dir: Path,
+    shadow_run_id: str,
+    expected_joint_pointer_sha256: str,
+) -> Dict[str, Any]:
+    """Replay one pinned DEX-only Shadow run without strict upgrading."""
+    root = Path(data_dir)
+    try:
+        shadow = load_shadow_result(
+            root / "routes/shadow",
+            run_id=shadow_run_id,
+            expected_pointer_sha256=expected_joint_pointer_sha256,
+        )
+        latest_core = load_latest_route_cohort(root / "routes/core")
+    except (TypeError, ValueError) as error:
+        raise RouteOpportunityPipelineError(
+            "pinned DEX route Shadow evidence is invalid"
+        ) from error
+
+    pointer = shadow.get("pointer")
+    cohort = shadow.get("cohort")
+    latest_cohort = latest_core.get("cohort")
+    latest_pointer = latest_core.get("pointer")
+    if (
+        not isinstance(pointer, dict)
+        or not isinstance(cohort, dict)
+        or shadow.get("pointer_sha256") != expected_joint_pointer_sha256
+        or pointer.get("run_id") != shadow_run_id
+        or not isinstance(latest_pointer, dict)
+        or latest_core.get("manifest_sha256")
+        != pointer.get("core_manifest_sha256")
+        or pointer.get("core_pointer_sha256")
+        != hashlib.sha256(
+            _pointer_payload_bytes(latest_pointer)
+        ).hexdigest()
+        or latest_cohort != cohort
+        or cohort.get("raw_evidence_run_id") != shadow_run_id
+        or cohort.get("candidate_source_generation")
+        != pointer.get("candidate_source_generation")
+    ):
+        raise RouteOpportunityPipelineError(
+            "pinned DEX Shadow run and latest core lineage differ"
+        )
+
+    legs = cohort.get("legs")
+    routes = cohort.get("routes")
+    if (
+        not isinstance(legs, list)
+        or not legs
+        or not isinstance(routes, list)
+        or not routes
+    ):
+        raise RouteOpportunityPipelineError(
+            "Ethereum Uniswap V2 core inventory is invalid"
+        )
+    legs_by_market = {
+        leg.get("market_id"): leg
+        for leg in legs
+        if isinstance(leg, Mapping)
+    }
+    if len(legs_by_market) != len(legs):
+        raise RouteOpportunityPipelineError(
+            "Ethereum Uniswap V2 core inventory is invalid"
+        )
+    for market_id, leg in legs_by_market.items():
+        parts = market_id.split(":") if isinstance(market_id, str) else []
+        if (
+            len(parts) != 5
+            or parts[:3] != ["dex", "eth", "uniswap_v2"]
+            or leg.get("market_type") != "dex"
+            or leg.get("status") != "observed"
+            or leg.get("available") is not True
+        ):
+            raise RouteOpportunityPipelineError(
+                "finalizer requires observed Ethereum Uniswap V2 legs"
+            )
+    if any(
+        not isinstance(route, Mapping)
+        or route.get("route_mode") != "atomic_onchain"
+        or route.get("route_class") != "candidate"
+        or route.get("settlement_reason") is not None
+        or route.get("buy_market_id") not in legs_by_market
+        or route.get("sell_market_id") not in legs_by_market
+        for route in routes
+    ):
+        raise RouteOpportunityPipelineError(
+            "finalizer requires same-chain atomic Uniswap V2 routes"
+        )
+
+    try:
+        evidence = _read_shadow_run_evidence(
+            root / "routes/shadow", shadow_run_id
+        )
+    except (TypeError, ValueError) as error:
+        raise RouteOpportunityPipelineError(
+            "pinned DEX route-cost evidence is invalid"
+        ) from error
+    cost_bytes = evidence.get("cost_evidence_bytes")
+    cost_evidence = evidence.get("cost_evidence")
+    if (
+        not isinstance(cost_bytes, bytes)
+        or not isinstance(cost_evidence, dict)
+        or hashlib.sha256(cost_bytes).hexdigest()
+        != pointer.get("route_cost_evidence_sha256")
+    ):
+        raise RouteOpportunityPipelineError(
+            "pinned DEX route-cost sidecar hash differs"
+        )
+    now = cost_evidence.get("evaluated_at")
+    if not isinstance(now, str):
+        raise RouteOpportunityPipelineError(
+            "DEX route-cost evaluation time is missing"
+        )
+    source_root = root / "raw/route-cohort" / shadow_run_id / "typed"
+    sources, retained_pool_members = _load_dex_sources(
+        root=root,
+        cohort=cohort,
+        source_root=source_root,
+        now=now,
+    )
+    try:
+        outcomes = replay_route_cost_coverage_outcomes(
+            cost_evidence,
+            universe=evidence["universe"],
+            expected_run_id=shadow_run_id,
+            expected_route_cohort_id=cohort["route_cohort_id"],
+            expected_phase=pointer["phase"],
+            expected_candidate_source_generation=cohort[
+                "candidate_source_generation"
+            ],
+            expected_route_universe_sha256=pointer[
+                "route_universe_sha256"
+            ],
+            retained_typed_pool_state_members=(
+                _cost_supported_pool_members(
+                    cost_evidence, retained_pool_members
+                )
+            ),
+        )
+    except (
+        KeyError,
+        RouteCostEvidenceError,
+        TypeError,
+        ValueError,
+    ) as error:
+        if isinstance(error, RouteOpportunityPipelineError):
+            raise
+        raise RouteOpportunityPipelineError(
+            "pinned DEX route-cost evidence replay failed"
+        ) from error
+    inputs = _build_dex_inputs(
+        cohort=cohort,
+        core_manifest_sha256=pointer["core_manifest_sha256"],
+        sources=sources,
+        outcomes=outcomes,
+        now=now,
+    )
+
+    def validate_pinned_shadow() -> None:
+        try:
+            confirmed_shadow = load_shadow_result(
+                root / "routes/shadow",
+                run_id=shadow_run_id,
+                expected_pointer_sha256=expected_joint_pointer_sha256,
+            )
+        except (TypeError, ValueError) as error:
+            raise RouteOpportunityPipelineError(
+                "pinned DEX Shadow evidence changed during reconstruction"
+            ) from error
+        if confirmed_shadow != shadow:
+            raise RouteOpportunityPipelineError(
+                "pinned DEX Shadow evidence changed during reconstruction"
+            )
+
+    validate_pinned_shadow()
+    try:
+        return publish_complete_route_bundle(
+            core_root=root / "routes/core",
+            routes_root=root / "routes",
+            raw_root=root / "raw/route-cohort",
+            opportunity_inputs=inputs,
+            source_root=source_root,
+            precommit_validator=validate_pinned_shadow,
+        )
+    except (TypeError, ValueError) as error:
+        raise RouteOpportunityPipelineError(
+            "DEX research opportunity publication failed"
+        ) from error
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Finalize one explicitly pinned CEX-only route Shadow run."
+        description="Finalize one explicitly pinned route Shadow run."
+    )
+    parser.add_argument(
+        "--finalizer",
+        choices=("cex", "eth-uniswap-v2-research"),
+        default="cex",
+        help=(
+            "pinned evidence workflow to publish (default: cex)"
+        ),
     )
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--shadow-run-id", required=True)
@@ -766,7 +1504,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="loopback dashboard port used with --serve (default: 8765)",
     )
     arguments = parser.parse_args(argv)
-    pointer = finalize_cex_route_opportunities(
+    finalizer = (
+        finalize_cex_route_opportunities
+        if arguments.finalizer == "cex"
+        else finalize_eth_uniswap_v2_research_opportunities
+    )
+    pointer = finalizer(
         data_dir=arguments.data_dir,
         shadow_run_id=arguments.shadow_run_id,
         expected_joint_pointer_sha256=(

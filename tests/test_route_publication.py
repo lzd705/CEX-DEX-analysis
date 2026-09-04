@@ -6,6 +6,7 @@ import copy
 import csv
 from dataclasses import replace
 from decimal import Decimal, localcontext
+import fcntl
 import hashlib
 import json
 import os
@@ -172,6 +173,11 @@ def _atomic_complete_bundle(complete):
             (route["sell_market_id"], "2" * 64, "2026-08-01T12:01:00Z"),
         )
     ], key=lambda row: row["market_id"])
+    bundle["input_generations"]["adapter_versions"] = (
+        route_publication._complete_adapter_versions_for_legs(
+            bundle["legs"]
+        )
+    )
 
     opportunities = []
     costs = []
@@ -1769,6 +1775,137 @@ class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
             current_core["cohort"]["route_cohort_id"],
             next_core["route_cohort_id"],
         )
+
+    def test_core_pointer_mutation_in_precommit_preserves_complete_pointer(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _task7_cex_inputs(
+            self.root,
+            raw_root,
+            Path(self.temporary.name) / "typed-sources",
+            Path(self.temporary.name) / "private-profiles",
+        )
+        routes_root = Path(self.temporary.name) / "routes"
+        kwargs = {
+            "core_root": self.root,
+            "routes_root": routes_root,
+            "raw_root": raw_root,
+            "source_root": fixture["source_root"],
+            "fee_profile_path": fixture["fee_profile_path"],
+            "fee_profile_id": fixture["fee_profile_id"],
+            "inventory_profile_path": fixture["inventory_profile_path"],
+            "opportunity_inputs": fixture["opportunity_inputs"],
+        }
+        route_publication.publish_complete_route_bundle(**kwargs)
+        complete_pointer = routes_root / "latest.json"
+        old_complete_pointer = complete_pointer.read_bytes()
+        core_pointer = self.root / "latest.json"
+        old_core_pointer = core_pointer.read_bytes()
+
+        def corrupt_live_core_pointer():
+            core_pointer.write_bytes(b'{"corrupted":true}\n')
+
+        try:
+            with self.assertRaisesRegex(ValueError, "core changed"):
+                route_publication.publish_complete_route_bundle(
+                    **kwargs,
+                    precommit_validator=corrupt_live_core_pointer,
+                )
+        finally:
+            core_pointer.write_bytes(old_core_pointer)
+
+        self.assertEqual(complete_pointer.read_bytes(), old_complete_pointer)
+        self.assertEqual(core_pointer.read_bytes(), old_core_pointer)
+
+    def test_complete_publisher_rejects_same_core_and_routes_root(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _task7_cex_inputs(
+            self.root,
+            raw_root,
+            Path(self.temporary.name) / "typed-sources",
+            Path(self.temporary.name) / "private-profiles",
+        )
+        old_core_pointer = (self.root / "latest.json").read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "must be distinct"):
+            route_publication.publish_complete_route_bundle(
+                core_root=self.root,
+                routes_root=self.root,
+                raw_root=raw_root,
+                source_root=fixture["source_root"],
+                fee_profile_path=fixture["fee_profile_path"],
+                fee_profile_id=fixture["fee_profile_id"],
+                inventory_profile_path=fixture["inventory_profile_path"],
+                opportunity_inputs=fixture["opportunity_inputs"],
+            )
+
+        self.assertEqual(
+            (self.root / "latest.json").read_bytes(), old_core_pointer
+        )
+
+    def test_stage_close_failure_still_releases_publication_locks(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _task7_cex_inputs(
+            self.root,
+            raw_root,
+            Path(self.temporary.name) / "typed-sources",
+            Path(self.temporary.name) / "private-profiles",
+        )
+        routes_root = Path(self.temporary.name) / "routes"
+        original_make_stage = route_publication._make_unique_directory_at
+        original_close = route_publication.os.close
+        state = {"stage_fd": None, "injected": False}
+
+        def track_stage(*args, **kwargs):
+            result = original_make_stage(*args, **kwargs)
+            state["stage_fd"] = result[2]
+            return result
+
+        def fail_stage_close_once(descriptor):
+            if descriptor == state["stage_fd"] and not state["injected"]:
+                state["injected"] = True
+                raise OSError("injected stage close failure")
+            return original_close(descriptor)
+
+        try:
+            with patch(
+                "scripts.route_publication._make_unique_directory_at",
+                side_effect=track_stage,
+            ), patch(
+                "scripts.route_publication.os.close",
+                side_effect=fail_stage_close_once,
+            ):
+                with self.assertRaisesRegex(OSError, "stage close"):
+                    route_publication.publish_complete_route_bundle(
+                        core_root=self.root,
+                        routes_root=routes_root,
+                        raw_root=raw_root,
+                        source_root=fixture["source_root"],
+                        fee_profile_path=fixture["fee_profile_path"],
+                        fee_profile_id=fixture["fee_profile_id"],
+                        inventory_profile_path=fixture[
+                            "inventory_profile_path"
+                        ],
+                        opportunity_inputs=fixture["opportunity_inputs"],
+                    )
+        finally:
+            if state["stage_fd"] is not None and state["injected"]:
+                original_close(state["stage_fd"])
+
+        self.assertTrue(state["injected"])
+        locked_fds = [
+            os.open(str(path), os.O_RDONLY)
+            for path in (self.root, routes_root)
+        ]
+        try:
+            for descriptor in locked_fds:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            for descriptor in locked_fds:
+                os.close(descriptor)
 
     def test_caller_pre_attested_input_is_rejected_before_public_write(self):
         raw_root = Path(self.temporary.name) / "raw/route-cohort"

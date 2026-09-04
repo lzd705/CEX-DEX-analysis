@@ -1021,6 +1021,12 @@ def _analyze_cost_components(
             if _fraction(row["rate_bps"], "component rate") != rate_bps:
                 raise ValueError("pool fee rate does not match quantity quote")
             is_reflected = True
+        if status in TERMINAL_VALUE_STATUSES:
+            strict_missing.append(key_text)
+            scenario_missing.append(key_text)
+            if status == "stale":
+                component_reasons.append("cost_component_stale:" + key_text)
+            continue
         current = _component_current(row, now_epoch)
         if not current:
             strict_missing.append(key_text)

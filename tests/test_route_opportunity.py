@@ -1437,6 +1437,67 @@ class RouteOpportunityTests(unittest.TestCase):
             result["component_reasons"],
         )
 
+    def test_terminal_unavailable_cost_is_not_mislabeled_stale(self):
+        kwargs = strict_fixture()
+        row = kwargs["cost_components"][0]
+        kwargs["cost_components"][0] = cost_component_row(
+            cohort_id=row["cohort_id"],
+            opportunity_id=row["opportunity_id"],
+            leg=row["leg"],
+            market_id=row["market_id"],
+            direction=row["direction"],
+            requested_notional_usd=row["requested_notional_usd"],
+            target_token_quantity=row["target_token_quantity"],
+            component_type=row["component_type"],
+            value_status="unavailable",
+            amount_usd=None,
+            rate_bps=None,
+            basis="pinned evidence did not establish this component",
+            strict_eligible=False,
+            observed_at=None,
+            valid_until=None,
+            source="pinned route-cost evidence",
+            source_record_sha256=None,
+            reason_code="strict_cost_adapter_unsupported",
+        )
+
+        result = build_route_opportunity(**kwargs)
+
+        self.assertEqual(result["opportunity_class"], "unavailable")
+        self.assertEqual(result["reason_codes"], ["cost_components_incomplete"])
+        self.assertEqual(result["component_reasons"], [])
+
+    def test_explicit_terminal_stale_cost_keeps_stale_reason(self):
+        kwargs = strict_fixture()
+        row = kwargs["cost_components"][0]
+        kwargs["cost_components"][0] = cost_component_row(
+            cohort_id=row["cohort_id"],
+            opportunity_id=row["opportunity_id"],
+            leg=row["leg"],
+            market_id=row["market_id"],
+            direction=row["direction"],
+            requested_notional_usd=row["requested_notional_usd"],
+            target_token_quantity=row["target_token_quantity"],
+            component_type=row["component_type"],
+            value_status="stale",
+            amount_usd=None,
+            rate_bps=None,
+            basis="pinned evidence is stale",
+            strict_eligible=False,
+            observed_at=None,
+            valid_until=None,
+            source="pinned route-cost evidence",
+            source_record_sha256=None,
+            reason_code="source_expired",
+        )
+
+        result = build_route_opportunity(**kwargs)
+
+        self.assertEqual(
+            result["component_reasons"],
+            ["cost_component_stale:buy:venue_taker_fee"],
+        )
+
     def test_expired_not_applicable_proof_does_not_bypass_currentness(self):
         kwargs = strict_fixture()
         route_row = kwargs["cost_components"][-1]
