@@ -3267,7 +3267,10 @@ def _public_cex_depth_row(
     response_received_at="2026-08-01T12:00:00+00:00",
     exchange="binance",
     snapshot_id="live-cex-test",
+    leg=None,
 ):
+    token_symbol = leg["token_symbol"] if leg is not None else "UNI"
+    cex_symbol = leg["cex_symbol"] if leg is not None else "UNI/USDT"
     endpoint = {
         "binance": "https://data-api.binance.vision/api/v3/depth",
         "bybit": "https://api.bybit.com/v5/market/orderbook",
@@ -3275,14 +3278,14 @@ def _public_cex_depth_row(
     raw = '{{"exchange":"{}"}}'.format(exchange).encode("ascii")
     return observed_row(
         {
-            "token_symbol": "UNI",
+            "token_symbol": token_symbol,
             "exchange": exchange,
-            "cex_symbol": "UNI/USDT",
+            "cex_symbol": cex_symbol,
         },
         {
             "bids": [(Decimal("99.99"), Decimal("1000"))],
             "asks": [(Decimal("100.01"), Decimal("1000"))],
-            "source_instrument": "UNIUSDT",
+            "source_instrument": cex_symbol.replace("/", ""),
             "source_sequence": "123",
             "source_observed_at": observed_at,
             "source_endpoint": endpoint,
@@ -3489,6 +3492,7 @@ class CexRouteStateTimestampProjectionTests(unittest.TestCase):
                 response_received_at="2026-08-01T12:00:00+00:00",
                 exchange=exchange,
                 snapshot_id=snapshot_id,
+                leg=leg,
             )
             raw_path.write_bytes(
                 '{{"exchange":"{}"}}'.format(exchange).encode("ascii")
@@ -3531,27 +3535,30 @@ class CexRouteStateTimestampProjectionTests(unittest.TestCase):
                 ["101.2", "1000000"], ["102", "1000000"],
             ],
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        bybit_book = json.dumps({
-            "retCode": 0,
-            "result": {
-                "s": "UNIUSDT",
-                "u": 2002,
-                "cts": 1788518846632,
-                "b": [
-                    ["100.2", "1000000"], ["100.1", "1000000"],
-                    ["99.2", "1000000"], ["98", "1000000"],
-                ],
-                "a": [
-                    ["100.3", "1000000"], ["100.4", "1000000"],
-                    ["101.4", "1000000"], ["102", "1000000"],
-                ],
-            },
-        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        bybit_books = {
+            instrument: json.dumps({
+                "retCode": 0,
+                "result": {
+                    "s": instrument,
+                    "u": 2002,
+                    "cts": 1788518846632,
+                    "b": [
+                        ["100.2", "1000000"], ["100.1", "1000000"],
+                        ["99.2", "1000000"], ["98", "1000000"],
+                    ],
+                    "a": [
+                        ["100.3", "1000000"], ["100.4", "1000000"],
+                        ["101.4", "1000000"], ["102", "1000000"],
+                    ],
+                },
+            }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            for instrument in ("UNIUSDT", "CAKEUSDT")
+        }
         binance_rules = json.dumps({
             "symbols": [{
-                "symbol": "UNIUSDT",
+                "symbol": token_symbol + "USDT",
                 "status": "TRADING",
-                "baseAsset": "UNI",
+                "baseAsset": token_symbol,
                 "quoteAsset": "USDT",
                 "baseAssetPrecision": 8,
                 "quoteAssetPrecision": 8,
@@ -3564,16 +3571,16 @@ class CexRouteStateTimestampProjectionTests(unittest.TestCase):
                     },
                     {"filterType": "MIN_NOTIONAL", "minNotional": "1"},
                 ],
-            }],
+            } for token_symbol in ("UNI", "CAKE")],
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")
         bybit_rules = json.dumps({
             "retCode": 0,
             "result": {
                 "category": "spot",
                 "list": [{
-                    "symbol": "UNIUSDT",
+                    "symbol": token_symbol + "USDT",
                     "status": "Trading",
-                    "baseCoin": "UNI",
+                    "baseCoin": token_symbol,
                     "quoteCoin": "USDT",
                     "lotSizeFilter": {
                         "basePrecision": "0.0001",
@@ -3582,7 +3589,7 @@ class CexRouteStateTimestampProjectionTests(unittest.TestCase):
                         "minOrderAmt": "1",
                     },
                     "priceFilter": {"tickSize": "0.0001"},
-                }],
+                } for token_symbol in ("UNI", "CAKE")],
             },
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -3592,7 +3599,10 @@ class CexRouteStateTimestampProjectionTests(unittest.TestCase):
             elif "api.binance.com" in url:
                 raw = binance_rules
             elif "/v5/market/orderbook" in url:
-                raw = bybit_book
+                instrument = (
+                    "CAKEUSDT" if "symbol=CAKEUSDT" in url else "UNIUSDT"
+                )
+                raw = bybit_books[instrument]
             elif "/v5/market/instruments-info" in url:
                 raw = bybit_rules
             else:
@@ -3631,6 +3641,15 @@ class CexRouteStateTimestampProjectionTests(unittest.TestCase):
             cohort, _typed = attach_typed_source_lineage(
                 cohort, raw_root=raw_root
             )
+            self.assertEqual(
+                {leg["market_id"] for leg in cohort["legs"]},
+                {
+                    "cex:binance:UNI/USDT",
+                    "cex:bybit:UNI/USDT",
+                    "cex:binance:CAKE/USDT",
+                    "cex:bybit:CAKE/USDT",
+                },
+            )
             self.assertTrue(all(
                 {
                     member["role"]
@@ -3652,6 +3671,8 @@ class CexRouteStateTimestampProjectionTests(unittest.TestCase):
             self.assertEqual(set(legacy_sources), {
                 "cex:binance:UNI/USDT",
                 "cex:bybit:UNI/USDT",
+                "cex:binance:CAKE/USDT",
+                "cex:bybit:CAKE/USDT",
             })
             core_pointer = publish_route_cohort_bundle(
                 cohort, core_root=root / "routes/core"
@@ -3674,14 +3695,28 @@ class CexRouteStateTimestampProjectionTests(unittest.TestCase):
             )
 
         self.assertEqual(loaded["pointer"], pointer)
-        self.assertEqual(len(loaded["bundle"]["opportunities"]), 10)
+        self.assertEqual(len(loaded["bundle"]["opportunities"]), 20)
+        self.assertEqual(
+            {
+                token: sum(
+                    row["token_symbol"] == token
+                    for row in loaded["bundle"]["opportunities"]
+                )
+                for token in ("UNI", "CAKE")
+            },
+            {"UNI": 10, "CAKE": 10},
+        )
         covered = [
             row for row in loaded["bundle"]["opportunities"]
             if row["requested_notional_usd"] == "1000"
         ]
-        self.assertEqual(len(covered), 2)
+        self.assertEqual(len(covered), 4)
         for row in covered:
-            self.assertEqual(row["opportunity_class"], "research_estimate")
+            self.assertEqual(
+                row["opportunity_class"],
+                "research_estimate"
+                if row["token_symbol"] == "UNI" else "unavailable",
+            )
             for field in (
                 "gross_buy_cost_usd",
                 "gross_sell_proceeds_usd",
@@ -3689,7 +3724,10 @@ class CexRouteStateTimestampProjectionTests(unittest.TestCase):
                 "research_net_edge_usd",
                 "research_net_edge_bps",
             ):
-                self.assertIsNotNone(row[field])
+                if row["token_symbol"] == "UNI":
+                    self.assertIsNotNone(row[field])
+                else:
+                    self.assertIsNone(row[field])
         self.assertTrue(all(
             row["strict_eligible"] is False
             for row in loaded["bundle"]["opportunities"]
