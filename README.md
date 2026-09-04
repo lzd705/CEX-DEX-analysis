@@ -75,9 +75,10 @@ npm --prefix dashboard install
 
 ### Live read-only Current Opportunity research
 
-From the repository root, collect current public `UNI/USDT` order books and
-instrument rules from Binance and Bybit, then publish both venue directions at
-the five fixed USD notionals:
+From the repository root, collect current public `UNI/USDT` and `CAKE/USDT`
+order books and instrument rules from Binance and Bybit. The fixed inventory is
+four markets and four same-token directions; the five USD notionals therefore
+produce twenty scenarios:
 
 ```bash
 python3 scripts/run_live_cex_opportunity.py \
@@ -102,6 +103,15 @@ command to create a fresh cohort rather than treating an old row as current.
 Neither command places orders, signs transactions, transfers assets, or reads
 wallets, balances, or account inventory.
 
+A successful refresh prints a `live_cex_opportunity_refresh/v2` receipt with
+both token pairs, both venues, `market_count=4`, `route_count=4`, and
+`opportunity_count=20`. A failed or deadline-exceeded leg remains in the closed
+cohort. Only its dependent token routes become terminal, null-economics rows;
+independent routes can still publish. Missing or duplicate legs/routes,
+inconsistent route timing, corrupt lineage, a collector-wide exception, or a
+cold-reload failure aborts the refresh and preserves the previous complete
+pointer.
+
 The tracked public fee schedule is a non-strict research scenario, not an
 authenticated account-fee source. It was checked at `2026-09-04T10:00:00Z` and
 expires at `2026-09-11T10:00:00Z`. The
@@ -111,9 +121,13 @@ is recorded as 10 bps. The
 publishes 10 bps for standard crypto-to-crypto and 20 bps for Adventure
 Zone/xStocks; the workflow projects 20 bps as the maximum reviewed public
 reference rate for this scenario. That Bybit source does not establish the
-user's region, account tier, or the category of `UNI/USDT`. Both components are
-therefore `bounded_estimate` with `strict_eligible=false`. If an exact current
-reference is absent, the fee is `unavailable` and no numeric fee is inferred.
+user's region, account tier, or the category of `UNI/USDT`. Both UNI components
+are therefore `bounded_estimate` with `strict_eligible=false`. The tracked
+schedule has no reviewed exact `CAKE/USDT` rows. Usable CAKE books therefore
+remain visible but their economics are unavailable with
+`cex_fee_public_bound_unavailable`; no UNI rate, wildcard, guessed rate, or zero
+substitutes for the missing CAKE evidence. If any exact current reference is
+absent, the fee is `unavailable` and no numeric fee is inferred.
 Before running after the schedule expires, manually re-review the official
 pages and update or remove the expired rows; the command does not fetch fee
 pages or guess a replacement rate. Custom public schedules also fail closed

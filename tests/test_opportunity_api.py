@@ -49,6 +49,7 @@ def _row(
     research_net_edge_bps="180",
     primary_reason="positive_strict_net_edge",
     reason_codes=None,
+    token_symbol="AAVE",
     buy_market_id="cex:binance:AAVE/USDT",
     sell_market_id="cex:bybit:AAVE/USDT",
 ):
@@ -56,7 +57,7 @@ def _row(
         "cohort_id": COHORT_ID,
         "route_id": route_id,
         "opportunity_id": opportunity_id,
-        "token_symbol": "AAVE",
+        "token_symbol": token_symbol,
         "buy_market_id": buy_market_id,
         "sell_market_id": sell_market_id,
         "route_mode": "prepositioned_inventory",
@@ -1062,6 +1063,92 @@ class OpportunityPayloadTests(unittest.TestCase):
                     now=NOW,
                 )
                 self.assertEqual(payload["routes"][-1]["route_id"], "route:c")
+
+    def test_mixed_uni_cake_payload_filters_exactly_and_sorts_null_last(self):
+        uni = _row(
+            "route:uni",
+            "opportunity:uni",
+            opportunity_class="research_estimate",
+            strict_eligible=False,
+            strict_ready=False,
+            strict_net_edge_usd="180",
+            strict_net_edge_bps="180",
+            research_net_edge_usd="175",
+            research_net_edge_bps="175",
+            primary_reason="cost_component_estimated",
+            reason_codes=["cost_component_estimated"],
+            token_symbol="UNI",
+            buy_market_id="cex:binance:UNI/USDT",
+            sell_market_id="cex:bybit:UNI/USDT",
+        )
+        terminal_inputs = terminal_route_fixture(
+            cohort_id=COHORT_ID,
+            token_symbol="CAKE",
+        )
+        cake = build_terminal_route_opportunity(**terminal_inputs)
+        rows = [cake, uni]
+        costs = _route_costs(uni) + terminal_inputs["cost_components"]
+        manifest = _manifest(
+            rows,
+            core_manifest_sha256=terminal_inputs["core_manifest_sha256"],
+        )
+        legs = [terminal_inputs["buy_leg"], terminal_inputs["sell_leg"]]
+
+        unfiltered_by_direction = {
+            direction: build_opportunity_payload(
+                rows,
+                manifest=manifest,
+                legs=legs,
+                cost_components=costs,
+                opportunity_class="all",
+                sort="net_edge_usd",
+                direction=direction,
+                now=NOW,
+            )
+            for direction in ("asc", "desc")
+        }
+        uni_only = build_opportunity_payload(
+            rows,
+            manifest=manifest,
+            legs=legs,
+            cost_components=costs,
+            token="UNI",
+            opportunity_class="all",
+            sort="net_edge_usd",
+            direction="asc",
+            now=NOW,
+        )
+        cake_only = build_opportunity_payload(
+            rows,
+            manifest=manifest,
+            legs=legs,
+            cost_components=costs,
+            token="CAKE",
+            opportunity_class="all",
+            sort="net_edge_usd",
+            direction="desc",
+            now=NOW,
+        )
+
+        self.assertEqual(
+            {
+                direction: [
+                    row["token_symbol"] for row in payload["routes"]
+                ]
+                for direction, payload in unfiltered_by_direction.items()
+            },
+            {"asc": ["UNI", "CAKE"], "desc": ["UNI", "CAKE"]},
+        )
+        self.assertEqual(
+            [row["token_symbol"] for row in uni_only["routes"]], ["UNI"]
+        )
+        self.assertEqual(
+            [row["token_symbol"] for row in cake_only["routes"]], ["CAKE"]
+        )
+        terminal = cake_only["routes"][0]
+        self.assertIsNone(terminal["target_token_quantity"])
+        self.assertIsNone(terminal["net_edge_usd"])
+        self.assertEqual(terminal["availability"]["status"], "unavailable")
 
     def test_canonical_route_id_breaks_numeric_sort_ties(self):
         first = _row("route:z", "opportunity:z", strict_net_edge_usd="180")

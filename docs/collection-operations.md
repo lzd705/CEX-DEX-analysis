@@ -425,19 +425,32 @@ the CEX finalizer.
 
 ### Live public CEX Opportunity research refresh
 
-Run the fixed, read-only `UNI/USDT` workflow from the repository root:
+Run the fixed, read-only `UNI/USDT` plus `CAKE/USDT` workflow from the
+repository root:
 
 ```bash
 python3 scripts/run_live_cex_opportunity.py \
   --data-dir /absolute/local/path
 ```
 
-The command collects current public Binance and Bybit books and instrument
-rules, publishes both venue directions at USD 1,000, 5,000, 10,000, 50,000,
-and 100,000, then cold-reloads the complete pointer. It uses the repository
+The command collects four current public Binance/Bybit markets, publishes four
+same-token routes at USD 1,000, 5,000, 10,000, 50,000, and 100,000, then
+cold-reloads the twenty-scenario complete pointer. It uses the repository
 `config/cex_public_fee_schedules.csv` by default. A successful rerun creates a
 new immutable cohort; it does not mutate the prior cohort or reuse demo data.
-A negative net edge is a valid research result.
+A negative net edge is a valid research result. Its compact
+`live_cex_opportunity_refresh/v2` receipt reports both token pairs, both venues,
+four markets, four routes, twenty opportunities, zero strict-eligible rows, and
+whether loopback serving was requested.
+
+Leg failures are isolated by token. A terminal CAKE leg retains the exact
+four-leg/four-route cohort and publishes ten terminal CAKE rows with null
+quantity and economics while the ten evidence-backed UNI rows continue. The
+terminal costs are the exact three CEX topology components and use the route
+timing reason. Missing or extra identities, duplicate IDs, unknown status or
+reason values, timing that does not recompute from the retained routes/legs,
+corrupt raw or typed lineage, collector-wide exceptions, and reload failures
+abort atomically and preserve the prior complete pointer.
 
 To serve the verified result through the normal Current Opportunity page:
 
@@ -467,6 +480,13 @@ immediate transfer cost. The page labels fee components as one of:
 The live public workflow can publish only `research_estimate` or `unavailable`.
 It never upgrades a public reference or an assumed transfer cost into
 `executable_candidate`.
+
+The tracked schedule currently has reviewed exact rows for `UNI/USDT` only.
+It has no exact `CAKE/USDT` fee rows. Even when both CAKE books and rules are
+usable, CAKE fee components remain `cex_fee_public_bound_unavailable` with null
+amount and rate, so CAKE economics remain unavailable. Operators must not copy
+UNI rates, add a wildcard, or enter zero as a substitute; exact CAKE rows require
+a separate evidence review.
 
 ### Sealed local Current Opportunity workflow demo
 

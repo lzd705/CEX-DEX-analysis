@@ -31,7 +31,7 @@ from scripts.cex_fee_facts import (
 )
 from scripts.collect_route_cohort import _attachment_authority_bytes
 from scripts.live_cex_research import build_live_cex_research_universe
-from scripts.route_cohort import canonical_route_id
+from scripts.route_cohort import canonical_route_id, classify_route_timing
 from scripts.fetch_dex_depth import ROUTE_V2_FEE_PROOF_SHA256
 from scripts.route_publication import (
     load_latest_complete_route_bundle,
@@ -2231,7 +2231,7 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
         latest.write_bytes(self.old_pointer_bytes)
         return data_dir, fixture, latest
 
-    def _install_public_core(self):
+    def _install_public_core(self, *, failed_market_id=None):
         data_dir, fixture, latest = self._install_aave_core()
         core_root = data_dir / "routes/core"
         raw_root = data_dir / "raw/route-cohort"
@@ -2244,6 +2244,9 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
         old_legs = {
             leg["market_id"].split(":", 2)[1]: leg
             for leg in cohort["legs"]
+        }
+        old_market_ids = {
+            leg["market_id"] for leg in old_legs.values()
         }
         fixed_legs = []
         manifest_members = []
@@ -2266,8 +2269,9 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
                 raw_root / run_id / "accepted"
                 / hashlib.sha256(market_id.encode("utf-8")).hexdigest()
             )
-            accepted.mkdir(parents=True)
-            (accepted / "response.json").write_bytes(response)
+            if market_id != failed_market_id:
+                accepted.mkdir(parents=True)
+                (accepted / "response.json").write_bytes(response)
 
             leg = copy.deepcopy(old_leg)
             leg.update({
@@ -2286,6 +2290,21 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
                 }[venue],
                 "raw_response_sha256": hashlib.sha256(response).hexdigest(),
             })
+            if market_id == failed_market_id:
+                leg = {
+                    "leg_id": market_id,
+                    "market_id": market_id,
+                    "market_type": "cex",
+                    "status": "failed",
+                    "available": False,
+                    "reason_code": "source_unavailable",
+                    "execution_adapter_status": selected[
+                        "execution_adapter_status"
+                    ],
+                    "execution_adapter_supported": selected[
+                        "execution_adapter_supported"
+                    ],
+                }
             members = []
             for old_member in old_leg["typed_source_lineage"]["members"]:
                 member = copy.deepcopy(old_member)
@@ -2293,6 +2312,17 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
                 member["filename"] = "{}-{}".format(
                     token_symbol.lower(), filename
                 )
+                if market_id == failed_market_id:
+                    member.update({
+                        "status": "unavailable",
+                        "reason_code": "typed_source_missing",
+                        "filename": None,
+                        "sha256": None,
+                        "size": None,
+                        "logical_generation": None,
+                    })
+                    members.append(member)
+                    continue
                 expected_typed_filenames.add(member["filename"])
                 payload = json.loads(
                     (typed_root / filename).read_text(encoding="utf-8")
@@ -2330,6 +2360,15 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
             }
             fixed_legs.append(leg)
 
+        for old_market_id in old_market_ids:
+            old_accepted = (
+                raw_root / run_id / "accepted"
+                / hashlib.sha256(old_market_id.encode("utf-8")).hexdigest()
+            )
+            for member_path in old_accepted.iterdir():
+                member_path.unlink()
+            old_accepted.rmdir()
+
         for member_path in typed_root.iterdir():
             if member_path.name not in expected_typed_filenames:
                 member_path.unlink()
@@ -2365,14 +2404,26 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
         )
         cohort["routes"] = copy.deepcopy(universe["routes"])
         cohort["route_rows"] = []
+        legs_by_market = {
+            leg["market_id"]: leg for leg in fixed_legs
+        }
         for route in cohort["routes"]:
             timing = old_rows[route["buy_market_id"].split(":", 2)[1]]
+            recomputed = classify_route_timing(
+                {
+                    **route,
+                    "validated_at": timing["validated_at"],
+                    "skew_sla_seconds": cohort["skew_sla_seconds"],
+                },
+                legs_by_market[route["buy_market_id"]],
+                legs_by_market[route["sell_market_id"]],
+            )
             cohort["route_rows"].append({
                 **copy.deepcopy(route),
                 "validated_at": timing["validated_at"],
-                "skew_seconds": timing["skew_seconds"],
-                "timing_status": timing["timing_status"],
-                "reason_code": timing["reason_code"],
+                "skew_seconds": recomputed["skew_seconds"],
+                "timing_status": recomputed["timing_status"],
+                "reason_code": recomputed["reason_code"],
             })
         cohort["legs"] = fixed_legs
         selected_by_market = {
@@ -2380,6 +2431,8 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
         }
         for leg in fixed_legs:
             market_id = leg["market_id"]
+            if market_id == failed_market_id:
+                continue
             accepted = (
                 raw_root / run_id / "accepted"
                 / hashlib.sha256(market_id.encode("utf-8")).hexdigest()
@@ -2417,6 +2470,11 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
         publish_route_cohort_bundle(cohort, core_root=core_root)
         latest.write_bytes(self.old_pointer_bytes)
         return data_dir, fixture, latest
+
+    def _install_terminal_cake_core(self):
+        return self._install_public_core(
+            failed_market_id="cex:bybit:CAKE/USDT"
+        )
 
     def _write_schedule(self, rows=None):
         schedule = Path(self.temporary.name) / "public-fees.csv"
@@ -2635,6 +2693,249 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
                 rebalancing["reason_code"],
                 "inventory_not_observed_for_public_research",
             )
+
+    def test_failed_cake_leg_publishes_ten_uni_and_ten_terminal_cake_rows(self):
+        data_dir, _fixture, latest = self._install_terminal_cake_core()
+        schedule = self._write_schedule()
+        captured = {}
+        actual_publish = opportunity_pipeline.publish_complete_route_bundle
+
+        def capture_and_publish(**kwargs):
+            captured["inputs"] = kwargs["opportunity_inputs"]
+            return actual_publish(**kwargs)
+
+        with patch(
+            "scripts.route_opportunity_pipeline.publish_complete_route_bundle",
+            side_effect=capture_and_publish,
+        ):
+            pointer = self._finalize_public(data_dir, schedule)
+
+        self.assertNotEqual(latest.read_bytes(), self.old_pointer_bytes)
+        loaded = load_latest_complete_route_bundle(
+            data_dir / "routes",
+            core_root=data_dir / "routes/core",
+        )
+        self.assertEqual(pointer, loaded["pointer"])
+        rows = loaded["bundle"]["opportunities"]
+        uni = [row for row in rows if row["token_symbol"] == "UNI"]
+        cake = [row for row in rows if row["token_symbol"] == "CAKE"]
+        self.assertEqual((len(uni), len(cake)), (10, 10))
+        self.assertTrue(all(
+            row["opportunity_class"] == "research_estimate"
+            and row["target_token_quantity"] is not None
+            and row["research_net_edge_usd"] is not None
+            for row in uni
+        ))
+        self.assertTrue(all(
+            row["opportunity_class"] == "unavailable"
+            and row["target_token_quantity"] is None
+            and row["gross_buy_cost_usd"] is None
+            and row["gross_sell_proceeds_usd"] is None
+            and row["research_net_edge_usd"] is None
+            and row["primary_reason"] in {
+                "buy_leg_unavailable", "sell_leg_unavailable",
+            }
+            for row in cake
+        ))
+        terminal_inputs = [
+            item for item in captured["inputs"]
+            if item["classified_opportunity"]["token_symbol"] == "CAKE"
+        ]
+        self.assertEqual(len(terminal_inputs), 10)
+        for item in terminal_inputs:
+            build = item["build_inputs"]
+            reason = item["classified_opportunity"]["primary_reason"]
+            self.assertEqual(build["input_kind"], "terminal_route")
+            self.assertEqual(item["source_members"], {})
+            self.assertEqual(len(build["cost_components"]), 3)
+            self.assertTrue(all(
+                component["value_status"] == "unavailable"
+                and component["target_token_quantity"] is None
+                and component["amount_usd"] is None
+                and component["rate_bps"] is None
+                and component["reason_code"] == reason
+                for component in build["cost_components"]
+            ))
+
+    def test_usable_cake_without_fee_rows_withholds_only_cake_economics(self):
+        data_dir, _fixture, _latest = self._install_public_core()
+        schedule = self._write_schedule([
+            self._schedule_row("binance", "10"),
+            self._schedule_row("bybit", "8"),
+        ])
+
+        self._finalize_public(data_dir, schedule)
+
+        bundle = load_latest_complete_route_bundle(
+            data_dir / "routes",
+            core_root=data_dir / "routes/core",
+        )["bundle"]
+        uni = [
+            row for row in bundle["opportunities"]
+            if row["token_symbol"] == "UNI"
+        ]
+        cake = [
+            row for row in bundle["opportunities"]
+            if row["token_symbol"] == "CAKE"
+        ]
+        self.assertEqual((len(uni), len(cake)), (10, 10))
+        self.assertTrue(all(
+            row["opportunity_class"] == "research_estimate"
+            and row["research_net_edge_usd"] is not None
+            for row in uni
+        ))
+        self.assertTrue(all(
+            row["opportunity_class"] == "unavailable"
+            and row["research_net_edge_usd"] is None
+            for row in cake
+        ))
+        fees = [
+            row for row in bundle["cost_components"]
+            if row["component_type"] == "venue_taker_fee"
+        ]
+        uni_fees = [
+            row for row in fees if ":UNI/USDT" in row["market_id"]
+        ]
+        cake_fees = [
+            row for row in fees if ":CAKE/USDT" in row["market_id"]
+        ]
+        self.assertEqual({row["rate_bps"] for row in uni_fees}, {"8", "10"})
+        self.assertTrue(all(
+            row["value_status"] == "bounded_estimate"
+            and row["amount_usd"] is not None
+            for row in uni_fees
+        ))
+        self.assertTrue(all(
+            row["value_status"] == "unavailable"
+            and row["reason_code"] == "cex_fee_public_bound_unavailable"
+            and row["rate_bps"] is None
+            and row["amount_usd"] is None
+            for row in cake_fees
+        ))
+
+    def test_terminal_core_inventory_and_lineage_mutations_preserve_pointer(self):
+        schedule = self._write_schedule()
+        data_dir, _fixture, latest = self._install_terminal_cake_core()
+        current = opportunity_pipeline.load_latest_route_cohort(
+            data_dir / "routes/core"
+        )
+        mutations = {}
+
+        def wrong_reason(cohort):
+            row = next(
+                item for item in cohort["route_rows"]
+                if item["timing_status"] != "within_sla"
+            )
+            row["reason_code"] = "route_deadline_exceeded"
+
+        mutations["wrong terminal route reason"] = wrong_reason
+        mutations["missing route timing"] = (
+            lambda cohort: cohort["route_rows"].pop()
+        )
+        mutations["missing route candidate"] = (
+            lambda cohort: cohort["routes"].pop()
+        )
+        mutations["missing leg"] = lambda cohort: cohort["legs"].pop()
+
+        def duplicate_route_id(cohort):
+            cohort["route_rows"][1]["route_id"] = cohort["route_rows"][0][
+                "route_id"
+            ]
+
+        mutations["duplicate route ID"] = duplicate_route_id
+
+        def false_terminal_lineage(cohort):
+            failed = next(
+                leg for leg in cohort["legs"]
+                if leg["market_id"] == "cex:bybit:CAKE/USDT"
+            )
+            observed = next(
+                leg for leg in cohort["legs"]
+                if leg["market_id"] == "cex:binance:UNI/USDT"
+            )
+            failed["typed_source_lineage"] = copy.deepcopy(
+                observed["typed_source_lineage"]
+            )
+
+        mutations["terminal leg with observed typed lineage"] = (
+            false_terminal_lineage
+        )
+
+        def terminal_leg(cohort):
+            return next(
+                leg for leg in cohort["legs"]
+                if leg["market_id"] == "cex:bybit:CAKE/USDT"
+            )
+
+        mutations["terminal leg missing leg_id"] = (
+            lambda cohort: terminal_leg(cohort).pop("leg_id")
+        )
+        mutations["terminal leg with state"] = lambda cohort: (
+            terminal_leg(cohort).__setitem__(
+                "state_observed_at", "2026-09-04T12:00:00Z"
+            )
+        )
+        mutations["terminal leg with snapshot"] = lambda cohort: (
+            terminal_leg(cohort).__setitem__(
+                "snapshot_id", cohort["raw_evidence_run_id"]
+            )
+        )
+        mutations["terminal leg with raw hash"] = lambda cohort: (
+            terminal_leg(cohort).__setitem__(
+                "raw_response_sha256", "a" * 64
+            )
+        )
+        mutations["terminal leg with endpoint"] = lambda cohort: (
+            terminal_leg(cohort).__setitem__(
+                "source_endpoint",
+                "https://api.bybit.com/v5/market/orderbook",
+            )
+        )
+
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                corrupted = copy.deepcopy(current)
+                mutate(corrupted["cohort"])
+                with patch(
+                    "scripts.route_opportunity_pipeline.load_latest_route_cohort",
+                    return_value=corrupted,
+                ), patch(
+                    "scripts.route_opportunity_pipeline."
+                    "publish_complete_route_bundle",
+                    wraps=opportunity_pipeline.publish_complete_route_bundle,
+                ) as publish, self.assertRaises(RouteOpportunityPipelineError):
+                    opportunity_pipeline.finalize_public_cex_research_opportunities(
+                        data_dir=data_dir,
+                        public_fee_schedule_path=schedule,
+                        expected_route_cohort_id=current["cohort"][
+                            "route_cohort_id"
+                        ],
+                        expected_core_manifest_sha256=current["manifest_sha256"],
+                    )
+                publish.assert_not_called()
+                self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
+    def test_extra_physical_accepted_market_directory_preserves_pointer(self):
+        schedule = self._write_schedule()
+        data_dir, _fixture, latest = self._install_public_core()
+        accepted_root = (
+            data_dir / "raw/route-cohort/task7-source-run/accepted"
+        )
+        observed = next(accepted_root.iterdir())
+        extra = accepted_root / hashlib.sha256(
+            b"cex:unknown:CAKE/USDT"
+        ).hexdigest()
+        extra.mkdir()
+        for member_name in (
+            "response.json", "attachment-authority.json"
+        ):
+            (extra / member_name).write_bytes(
+                (observed / member_name).read_bytes()
+            )
+
+        with self.assertRaises(RouteOpportunityPipelineError):
+            self._finalize_public(data_dir, schedule)
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
 
     def test_missing_public_fee_row_stays_unavailable_and_never_becomes_zero(self):
         data_dir, _fixture, _latest = self._install_public_core()

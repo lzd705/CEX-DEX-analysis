@@ -1100,6 +1100,75 @@ console.log(JSON.stringify({
             "unavailable": "2 routes",
         })
 
+    def test_mixed_uni_cake_rows_render_terminal_economics_as_unavailable(self):
+        result = run_app_javascript(
+            DOM_FIXTURE
+            + PAYLOAD_FIXTURE
+            + r"""
+const mixed = JSON.parse(JSON.stringify(opportunityPayload));
+const uni = mixed.routes[1];
+Object.assign(uni, {
+  route_id: "route:UNI:binance-to-bybit",
+  opportunity_id: "route:UNI:binance-to-bybit:10000",
+  token_symbol: "UNI",
+  buy_market_id: "cex:binance:UNI/USDT",
+  sell_market_id: "cex:bybit:UNI/USDT",
+  route_type: "cex_cex",
+});
+const cake = mixed.routes[3];
+Object.assign(cake, {
+  route_id: "route:CAKE:binance-to-bybit",
+  opportunity_id: "route:CAKE:binance-to-bybit:10000",
+  token_symbol: "CAKE",
+  buy_market_id: "cex:binance:CAKE/USDT",
+  sell_market_id: "cex:bybit:CAKE/USDT",
+  route_type: "cex_cex",
+  target_token_quantity: null,
+  net_edge_usd: null,
+  net_edge_bps: null,
+  gross_edge_usd: null,
+  gross_edge_bps: null,
+  primary_reason: "cex_fee_public_bound_unavailable",
+  reason_codes: ["cex_fee_public_bound_unavailable"],
+  availability: {
+    status: "unavailable",
+    reason: "cex_fee_public_bound_unavailable",
+  },
+});
+mixed.routes = [uni, cake];
+mixed.metadata.coverage = {
+  route_count: 4, scenario_count: 20, returned_count: 2,
+  class_counts: { research_estimate: 10, unavailable: 10 },
+  availability_counts: { available: 10, unavailable: 10 },
+};
+mixed.filters.token = null;
+renderOpportunities(mixed);
+console.log(JSON.stringify({
+  estimate: opportunityElements["estimate-opportunity-body"].innerHTML,
+  unavailable: opportunityElements["unavailable-opportunity-body"].innerHTML,
+  demoHidden: opportunityElements["current-opportunity-demo-label"].hidden,
+  status: opportunityElements["opportunity-status"].textContent,
+}));
+""",
+            prelude="globalThis.MarketMonitorNavigation = {};",
+        )
+
+        self.assertIn("UNI", result["estimate"])
+        self.assertNotIn("CAKE", result["estimate"])
+        self.assertIn("CAKE", result["unavailable"])
+        self.assertNotIn("UNI", result["unavailable"])
+        self.assertIn("N/A", result["unavailable"])
+        self.assertIn("Fee unavailable", result["unavailable"])
+        self.assertIn('data-net-edge-usd=""', result["unavailable"])
+        self.assertNotIn('data-net-edge-usd="0"', result["unavailable"])
+        self.assertTrue(result["demoHidden"])
+        self.assertEqual(
+            result["status"],
+            "2 published route scenarios match the current filters"
+            " · checked 2026-08-01 00:00:30 UTC"
+            " · SLA age ≤ 120s · skew ≤ 60s.",
+        )
+
     def test_cohort_badge_is_compact_but_keeps_full_identity(self):
         result = run_app_javascript(
             DOM_FIXTURE

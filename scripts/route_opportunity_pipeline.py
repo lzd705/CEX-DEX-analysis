@@ -27,8 +27,10 @@ from scripts.collect_route_cohort import (
     _ATTACHMENT_AUTHORITY_MAX_BYTES,
     _accepted_evidence_for_attachment,
     _canonical_raw_path,
+    _final_route_leg_projection,
     _validated_attachment_authority,
     _validated_typed_payload_inventory,
+    materialize_route_leg_rows,
 )
 from scripts.execution_cost_components import cost_component_row
 from scripts.fetch_cex_depth import (
@@ -57,6 +59,7 @@ from scripts.route_inventory import (
 )
 from scripts.route_opportunity import (
     build_route_opportunity,
+    build_terminal_route_opportunity,
     common_target_quantity,
     route_opportunity_id,
     usd_projection_evidence,
@@ -72,6 +75,7 @@ from scripts.route_publication import (
     _read_shadow_run_evidence,
     _validate_route_collector_context,
     _verify_open_path_identity,
+    _verify_open_path_snapshot,
     load_latest_route_cohort,
     load_latest_complete_route_bundle,
     load_shadow_result,
@@ -87,6 +91,7 @@ from scripts.route_shadow_inputs import (
     TYPED_SOURCE_ROLE_CONTRACTS,
     TYPED_SOURCE_LINEAGE_SCHEMA_V2,
     typed_source_lineage_observed_members,
+    validate_typed_source_lineage,
 )
 from scripts.timestamp_contract import exact_rfc3339_epoch_seconds
 
@@ -112,6 +117,77 @@ _RESEARCH_MEV_BPS = re.compile(
     r"(?:0|[1-9][0-9]{0,4})(?:\.[0-9]{1,6})?\Z",
     flags=re.ASCII,
 )
+
+
+def _terminal_cex_leg_matches_collector_contract(
+    leg: Mapping[str, Any],
+    selected_leg: Mapping[str, Any],
+) -> bool:
+    """Match the exact terminal projection emitted by the route collector."""
+    if not isinstance(leg, Mapping) or not isinstance(selected_leg, Mapping):
+        return False
+    market_id = leg.get("market_id")
+    status = leg.get("status")
+    reason = leg.get("reason_code")
+    if (
+        not isinstance(market_id, str)
+        or market_id != selected_leg.get("market_id")
+        or status not in {"failed", "deadline_exceeded"}
+        or not isinstance(reason, str)
+        or not reason
+    ):
+        return False
+    requested_leg = {
+        "market_id": market_id,
+        "market_type": "cex",
+        **{
+            key: selected_leg[key]
+            for key in (
+                "execution_adapter_supported",
+                "execution_adapter_status",
+                "target_token_address",
+                "target_token_side",
+            )
+            if key in selected_leg
+        },
+    }
+    try:
+        terminal_rows = materialize_route_leg_rows(
+            (market_id,),
+            {},
+            deadline_exceeded=(
+                {market_id} if status == "deadline_exceeded" else set()
+            ),
+            terminal_reasons={market_id: reason},
+        )
+        expected = _final_route_leg_projection(
+            requested_leg,
+            terminal_rows[0],
+            market_id=market_id,
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    actual = dict(leg)
+    lineage_present = "typed_source_lineage" in actual
+    lineage = actual.pop("typed_source_lineage", None)
+    if actual != expected:
+        return False
+    if not lineage_present:
+        return True
+    try:
+        normalized_lineage = validate_typed_source_lineage(
+            lineage, market_type="cex"
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        dict(lineage) == normalized_lineage
+        and all(
+            member["status"] == "unavailable"
+            for member in normalized_lineage["members"]
+        )
+    )
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -283,8 +359,17 @@ def _source_members_by_market(
     expected = {
         "cex_raw_book_response", "cex_market_rules", "quote_usd_conversion"
     }
-    for leg in cohort["legs"]:
+    legs = cohort.get("legs")
+    if not isinstance(legs, list):
+        raise RouteOpportunityPipelineError(
+            "CEX typed-source lineage is incomplete"
+        )
+    eligible_market_ids = set()
+    for leg in legs:
         try:
+            market_id = leg["market_id"]
+            if not isinstance(market_id, str):
+                raise ValueError("invalid market ID")
             observed = typed_source_lineage_observed_members(
                 leg["typed_source_lineage"], market_type="cex"
             )
@@ -293,11 +378,23 @@ def _source_members_by_market(
                 "CEX typed-source lineage is incomplete"
             ) from error
         members = {row["role"]: dict(row) for row in observed}
-        if set(members) != expected:
+        eligible = leg.get("status") in {"observed", "partial"}
+        if eligible:
+            eligible_market_ids.add(market_id)
+        if (
+            (eligible and set(members) != expected)
+            or (not eligible and members)
+            or market_id in result
+        ):
             raise RouteOpportunityPipelineError(
                 "CEX typed-source lineage is incomplete"
             )
-        result[leg["market_id"]] = members
+        if eligible:
+            result[market_id] = members
+    if set(result) != eligible_market_ids:
+        raise RouteOpportunityPipelineError(
+            "CEX typed-source lineage is incomplete"
+        )
     return result
 
 
@@ -723,24 +820,63 @@ def _load_cex_sources(
     legs_by_market = {row["market_id"]: row for row in cohort["legs"]}
     if len(legs_by_market) != len(cohort["legs"]):
         raise RouteOpportunityPipelineError("CEX core leg inventory is invalid")
+    eligible_market_ids = {
+        market_id for market_id, leg in legs_by_market.items()
+        if leg.get("status") in {"observed", "partial"}
+    }
+    expected_accepted_entries = {
+        hashlib.sha256(market_id.encode("utf-8")).hexdigest()
+        for market_id in eligible_market_ids
+    }
 
     try:
-        raw_members = _read_core_raw_members(
-            root / "raw/route-cohort",
-            cohort,
-            required_sidecar_limits=required_raw_sidecar_limits,
-            evidence_validator=raw_evidence_validator,
+        accepted_path, accepted_fd, accepted_details = (
+            _open_verified_directory(
+                root / "raw/route-cohort"
+                / cohort["raw_evidence_run_id"] / "accepted",
+                "retained CEX accepted raw root",
+            )
         )
+        try:
+            if set(os.listdir(accepted_fd)) != expected_accepted_entries:
+                raise RouteOpportunityPipelineError(
+                    "retained CEX accepted inventory differs from eligible legs"
+                )
+            raw_members = _read_core_raw_members(
+                root / "raw/route-cohort",
+                cohort,
+                required_sidecar_limits=required_raw_sidecar_limits,
+                evidence_validator=raw_evidence_validator,
+            )
+            if set(os.listdir(accepted_fd)) != expected_accepted_entries:
+                raise RouteOpportunityPipelineError(
+                    "retained CEX accepted inventory changed during read"
+                )
+            _verify_open_path_snapshot(
+                accepted_path,
+                accepted_details,
+                "retained CEX accepted raw root",
+            )
+        finally:
+            os.close(accepted_fd)
+        if (
+            set(raw_members) != eligible_market_ids
+            or set(members_by_market) != eligible_market_ids
+        ):
+            raise RouteOpportunityPipelineError(
+                "retained CEX source inventory differs from eligible legs"
+            )
         source_path, source_fd, source_details = _open_verified_directory(
             source_root, "route typed-source root"
         )
-    except (TypeError, ValueError) as error:
+    except (OSError, TypeError, ValueError) as error:
         raise RouteOpportunityPipelineError(
             "retained CEX source evidence is invalid"
         ) from error
     sources: Dict[str, Dict[str, Any]] = {}
     try:
-        for market_id, leg in legs_by_market.items():
+        for market_id in sorted(eligible_market_ids):
+            leg = legs_by_market[market_id]
             payload, raw_bytes, _raw_sha, _sidecar_fingerprint = (
                 raw_members[market_id]
             )
@@ -817,6 +953,43 @@ def _load_cex_sources(
     finally:
         os.close(source_fd)
     return sources, legs_by_market
+
+
+def _terminal_cex_cost_components(
+    *,
+    cohort_id: str,
+    route: Mapping[str, Any],
+    requested_notional_usd: Decimal,
+    reason_code: str,
+) -> List[Dict[str, Any]]:
+    opportunity_id = route_opportunity_id(
+        route["route_id"], requested_notional_usd
+    )
+    rows = []
+    for leg, component_type in sorted(
+        live_complete_cost_component_keys(route)
+    ):
+        rows.append(cost_component_row(
+            cohort_id=cohort_id,
+            opportunity_id=opportunity_id,
+            leg=leg,
+            market_id=("" if leg == "route" else route[leg + "_market_id"]),
+            direction=("route" if leg == "route" else leg + "_token"),
+            requested_notional_usd=requested_notional_usd,
+            target_token_quantity=None,
+            component_type=component_type,
+            value_status="unavailable",
+            amount_usd=None,
+            rate_bps=None,
+            basis="retained route timing proves route unavailable",
+            strict_eligible=False,
+            observed_at=None,
+            valid_until=None,
+            source="retained route timing",
+            source_record_sha256=None,
+            reason_code=reason_code,
+        ))
+    return rows
 
 
 def _build_inputs(
@@ -1105,9 +1278,77 @@ def _build_public_cex_research_inputs(
             "public CEX source evidence is invalid"
         ) from error
 
+    routes = cohort.get("routes")
+    route_rows = cohort.get("route_rows")
+    if not isinstance(routes, list) or not isinstance(route_rows, list):
+        raise RouteOpportunityPipelineError(
+            "public CEX route timing inventory is invalid"
+        )
+    timing_by_route = {
+        row.get("route_id"): row
+        for row in route_rows if isinstance(row, Mapping)
+    }
+    route_ids = [
+        route.get("route_id")
+        for route in routes if isinstance(route, Mapping)
+    ]
+    if (
+        len(route_ids) != len(routes)
+        or len(set(route_ids)) != len(routes)
+        or len(timing_by_route) != len(route_rows)
+        or set(timing_by_route) != set(route_ids)
+    ):
+        raise RouteOpportunityPipelineError(
+            "public CEX route timing inventory is invalid"
+        )
+
     opportunities: List[Dict[str, Any]] = []
-    for route in cohort["routes"]:
+    for route in routes:
         try:
+            route_timing = timing_by_route[route["route_id"]]
+            if route_timing.get("timing_status") != "within_sla":
+                terminal_timing = {
+                    key: route_timing[key]
+                    for key in (
+                        "route_id", "skew_seconds", "timing_status",
+                        "reason_code",
+                    )
+                }
+                buy_leg = legs_by_market[route["buy_market_id"]]
+                sell_leg = legs_by_market[route["sell_market_id"]]
+                mode = classify_route_mode_evidence(route, now=cohort_now)
+                for raw_notional in cohort["requested_notionals_usd"]:
+                    notional = Decimal(str(raw_notional))
+                    costs = _terminal_cex_cost_components(
+                        cohort_id=cohort["route_cohort_id"],
+                        route=route,
+                        requested_notional_usd=notional,
+                        reason_code=terminal_timing["reason_code"],
+                    )
+                    terminal_inputs = {
+                        "cohort_id": cohort["route_cohort_id"],
+                        "route": route,
+                        "requested_notional_usd": notional,
+                        "buy_leg": buy_leg,
+                        "sell_leg": sell_leg,
+                        "route_timing": terminal_timing,
+                        "cost_components": costs,
+                        "mode_evidence": mode,
+                        "now": cohort_now,
+                        "core_manifest_sha256": core_manifest_sha256,
+                    }
+                    classified = build_terminal_route_opportunity(
+                        **terminal_inputs
+                    )
+                    opportunities.append({
+                        "classified_opportunity": classified,
+                        "build_inputs": {
+                            "input_kind": "terminal_route",
+                            **terminal_inputs,
+                        },
+                        "source_members": {},
+                    })
+                continue
             buy_source = sources[route["buy_market_id"]]
             sell_source = sources[route["sell_market_id"]]
             buy_reference = (
@@ -2139,14 +2380,32 @@ def finalize_public_cex_research_opportunities(
             "public research finalization is CEX-only"
         )
     fixed_universe = build_live_cex_research_universe()
-    expected_leg_tokens = {
-        leg["market_id"]: leg["token_symbol"]
+    expected_legs_by_market = {
+        leg["market_id"]: leg
         for leg in fixed_universe["selected_legs"]
     }
-    actual_leg_tokens = {
-        leg.get("market_id"): leg.get("token_symbol")
-        for leg in legs if isinstance(leg, dict)
-    }
+    if (
+        set(leg_types) != set(expected_legs_by_market)
+        or any(
+            leg.get("status") in {"failed", "deadline_exceeded"}
+            and not _terminal_cex_leg_matches_collector_contract(
+                leg,
+                expected_legs_by_market.get(leg.get("market_id"), {}),
+            )
+            for leg in legs
+            if isinstance(leg, dict)
+        )
+        or any(
+            leg.get("status") in {"observed", "partial"}
+            and leg.get("token_symbol")
+            != expected_legs_by_market[leg["market_id"]]["token_symbol"]
+            for leg in legs
+            if isinstance(leg, dict)
+        )
+    ):
+        raise RouteOpportunityPipelineError(
+            "current public CEX core leg projection is invalid"
+        )
     fixed_generation = live_cex_research_generation()
     if (
         cohort.get("candidate_source_generation") != fixed_generation
@@ -2156,7 +2415,6 @@ def finalize_public_cex_research_opportunities(
         or cohort.get("requested_notionals_usd")
         != fixed_universe["requested_notionals_usd"]
         or routes != fixed_universe["routes"]
-        or actual_leg_tokens != expected_leg_tokens
     ):
         raise RouteOpportunityPipelineError(
             "current public CEX core is outside the fixed UNI+CAKE "

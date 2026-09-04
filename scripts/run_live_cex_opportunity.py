@@ -34,8 +34,10 @@ try:
         live_cex_research_generation,
     )
     from scripts.route_opportunity_pipeline import (
+        _terminal_cex_leg_matches_collector_contract,
         finalize_public_cex_research_opportunities,
     )
+    from scripts.route_cohort import classify_route_timing
     from scripts.route_publication import (
         load_latest_complete_route_bundle,
         publish_route_cohort_bundle,
@@ -57,8 +59,10 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
         live_cex_research_generation,
     )
     from route_opportunity_pipeline import (  # type: ignore
+        _terminal_cex_leg_matches_collector_contract,
         finalize_public_cex_research_opportunities,
     )
+    from route_cohort import classify_route_timing  # type: ignore
     from route_publication import (  # type: ignore
         load_latest_complete_route_bundle,
         publish_route_cohort_bundle,
@@ -81,6 +85,28 @@ _FAILURE_CODES = frozenset({
     "reload_failed",
     "serve_failed",
 })
+_CEX_LEG_REASONS_BY_STATUS = {
+    "observed": frozenset({None, "", "observed"}),
+    "partial": frozenset({"source_level_limit"}),
+    "failed": frozenset({
+        "source_no_two_sided_book",
+        "source_no_order_book",
+        "source_invalid_order_book",
+        "not_listed",
+        "rate_limit",
+        "source_unavailable",
+        "source_rejected_request",
+        "network",
+        "parse",
+        "unsupported_source",
+        "collection_failed",
+        "collector_identity_mismatch",
+        "raw_evidence_missing",
+        "raw_evidence_hash_mismatch",
+        "raw_evidence_path_unsafe",
+    }),
+    "deadline_exceeded": frozenset({"route_deadline_exceeded"}),
+}
 
 
 class LiveCexOpportunityRefreshError(RuntimeError):
@@ -144,9 +170,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse only local storage, bounded timing, and loopback serving controls."""
     parser = argparse.ArgumentParser(
         description=(
-            "Collect Binance and Bybit UNI/USDT public books, publish ten "
-            "read-only research scenarios, and optionally serve the normal "
-            "Current Opportunity page on loopback"
+            "Collect Binance and Bybit UNI/USDT and CAKE/USDT public books, "
+            "publish twenty read-only research scenarios, and optionally "
+            "serve the normal Current Opportunity page on loopback"
         )
     )
     parser.add_argument(
@@ -248,14 +274,22 @@ def _collection_is_publishable(
     cohort: Mapping[str, Any],
     *,
     expected_market_ids: Sequence[str],
+    expected_legs_by_market: Mapping[str, Mapping[str, Any]],
     expected_route_ids: Sequence[str],
 ) -> bool:
     legs = cohort.get("legs")
+    routes = cohort.get("routes")
     timing = cohort.get("route_rows")
     if (
         not isinstance(legs, list)
         or len(legs) != len(expected_market_ids)
         or len(set(expected_market_ids)) != len(expected_market_ids)
+    ):
+        return False
+    if (
+        not isinstance(routes, list)
+        or len(routes) != len(expected_route_ids)
+        or any(not isinstance(row, Mapping) for row in routes)
     ):
         return False
     if (
@@ -267,15 +301,72 @@ def _collection_is_publishable(
     if any(not isinstance(row, Mapping) for row in legs + timing):
         return False
     leg_ids = [row.get("market_id") for row in legs]
+    route_candidates = [row.get("route_id") for row in routes]
     route_ids = [row.get("route_id") for row in timing]
-    return (
-        len(set(leg_ids)) == len(expected_market_ids)
-        and set(leg_ids) == set(expected_market_ids)
-        and all(row.get("status") == "observed" for row in legs)
-        and len(set(route_ids)) == len(expected_route_ids)
-        and set(route_ids) == set(expected_route_ids)
-        and all(row.get("timing_status") == "within_sla" for row in timing)
-    )
+    if (
+        len(set(leg_ids)) != len(expected_market_ids)
+        or set(leg_ids) != set(expected_market_ids)
+        or len(set(route_candidates)) != len(expected_route_ids)
+        or set(route_candidates) != set(expected_route_ids)
+        or len(set(route_ids)) != len(expected_route_ids)
+        or set(route_ids) != set(expected_route_ids)
+    ):
+        return False
+    legs_by_market = {row["market_id"]: row for row in legs}
+    for market_id, leg in legs_by_market.items():
+        status = leg.get("status")
+        allowed_reasons = _CEX_LEG_REASONS_BY_STATUS.get(status)
+        if (
+            leg.get("leg_id") != market_id
+            or allowed_reasons is None
+            or leg.get("reason_code") not in allowed_reasons
+            or (
+                status in {"observed", "partial"}
+                and leg.get("available") is not True
+            )
+            or (
+                status in {"failed", "deadline_exceeded"}
+                and leg.get("available") is not False
+            )
+            or (
+                status in {"failed", "deadline_exceeded"}
+                and not _terminal_cex_leg_matches_collector_contract(
+                    leg, expected_legs_by_market.get(market_id, {})
+                )
+            )
+        ):
+            return False
+    routes_by_id = {row["route_id"]: row for row in routes}
+    for row in timing:
+        route = routes_by_id[row["route_id"]]
+        if (
+            any(row.get(key) != value for key, value in route.items())
+            or route.get("buy_market_id") not in legs_by_market
+            or route.get("sell_market_id") not in legs_by_market
+        ):
+            return False
+        candidate = {
+            **route,
+            "validated_at": row.get("validated_at"),
+            "skew_sla_seconds": cohort.get("skew_sla_seconds", "60"),
+        }
+        try:
+            expected_timing = classify_route_timing(
+                candidate,
+                legs_by_market[route["buy_market_id"]],
+                legs_by_market[route["sell_market_id"]],
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        actual_timing = {
+            key: row.get(key)
+            for key in (
+                "route_id", "skew_seconds", "timing_status", "reason_code"
+            )
+        }
+        if actual_timing != expected_timing:
+            return False
+    return True
 
 
 def collect_and_publish_live_cex_research(
@@ -323,11 +414,16 @@ def collect_and_publish_live_cex_research(
         ):
             raise ValueError("fixed route inventory differs")
         expected_market_ids = [leg.get("market_id") for leg in selected_legs]
+        expected_legs_by_market = {
+            leg.get("market_id"): leg
+            for leg in selected_legs if isinstance(leg, Mapping)
+        }
         expected_route_ids = [route.get("route_id") for route in routes]
         if (
             not all(isinstance(market_id, str) for market_id in expected_market_ids)
             or not all(isinstance(route_id, str) for route_id in expected_route_ids)
             or len(set(expected_market_ids)) != len(expected_market_ids)
+            or set(expected_legs_by_market) != set(expected_market_ids)
             or len(set(expected_route_ids)) != len(expected_route_ids)
             or not notionals
         ):
@@ -349,6 +445,7 @@ def collect_and_publish_live_cex_research(
             or not _collection_is_publishable(
                 cohort,
                 expected_market_ids=expected_market_ids,
+                expected_legs_by_market=expected_legs_by_market,
                 expected_route_ids=expected_route_ids,
             )
         ):
@@ -362,6 +459,7 @@ def collect_and_publish_live_cex_research(
             or not _collection_is_publishable(
                 cohort,
                 expected_market_ids=expected_market_ids,
+                expected_legs_by_market=expected_legs_by_market,
                 expected_route_ids=expected_route_ids,
             )
         ):

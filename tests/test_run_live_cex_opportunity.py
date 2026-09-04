@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timezone
 import io
 import json
@@ -12,6 +13,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from scripts import run_live_cex_opportunity as runner
+from scripts.route_shadow_inputs import TYPED_SOURCE_ROLE_CONTRACTS
 
 
 COHORT_ID = "cohort:" + "c" * 64
@@ -28,47 +30,136 @@ ROUTE_IDS = (
     "route:CAKE:cex:bybit:CAKE/USDT->cex:binance:CAKE/USDT:"
     "prepositioned_inventory",
 )
+ROUTES = (
+    {
+        "route_id": ROUTE_IDS[0],
+        "token_symbol": "UNI",
+        "buy_market_id": "cex:binance:UNI/USDT",
+        "sell_market_id": "cex:bybit:UNI/USDT",
+        "route_mode": "prepositioned_inventory",
+    },
+    {
+        "route_id": ROUTE_IDS[1],
+        "token_symbol": "UNI",
+        "buy_market_id": "cex:bybit:UNI/USDT",
+        "sell_market_id": "cex:binance:UNI/USDT",
+        "route_mode": "prepositioned_inventory",
+    },
+    {
+        "route_id": ROUTE_IDS[2],
+        "token_symbol": "CAKE",
+        "buy_market_id": "cex:binance:CAKE/USDT",
+        "sell_market_id": "cex:bybit:CAKE/USDT",
+        "route_mode": "prepositioned_inventory",
+    },
+    {
+        "route_id": ROUTE_IDS[3],
+        "token_symbol": "CAKE",
+        "buy_market_id": "cex:bybit:CAKE/USDT",
+        "sell_market_id": "cex:binance:CAKE/USDT",
+        "route_mode": "prepositioned_inventory",
+    },
+)
 
 
 def _cohort(*, second_status="observed", second_timing="within_sla"):
+    markets = (
+        "cex:binance:UNI/USDT",
+        "cex:bybit:UNI/USDT",
+        "cex:binance:CAKE/USDT",
+        "cex:bybit:CAKE/USDT",
+    )
+    legs = []
+    for index, market_id in enumerate(markets):
+        status = second_status if index == 1 else "observed"
+        observed = status in {"observed", "partial"}
+        legs.append({
+            "leg_id": market_id,
+            "market_id": market_id,
+            "status": status,
+            "available": observed,
+            "reason_code": "observed" if observed else "source_unavailable",
+            "state_observed_at": (
+                "2026-09-04T12:00:00Z" if observed else None
+            ),
+        })
+    route_rows = []
+    for index, route in enumerate(ROUTES):
+        timing_status = second_timing if index == 1 else "within_sla"
+        route_rows.append({
+            **route,
+            "validated_at": "2026-09-04T12:00:00Z",
+            "skew_seconds": "0" if timing_status == "within_sla" else None,
+            "timing_status": timing_status,
+            "reason_code": (
+                None if timing_status == "within_sla"
+                else "buy_leg_unavailable"
+            ),
+        })
     return {
         "route_cohort_id": COHORT_ID,
-        "legs": [
-            {
-                "market_id": "cex:binance:UNI/USDT",
-                "status": "observed",
-            },
-            {
-                "market_id": "cex:bybit:UNI/USDT",
-                "status": second_status,
-            },
-            {
-                "market_id": "cex:binance:CAKE/USDT",
-                "status": "observed",
-            },
-            {
-                "market_id": "cex:bybit:CAKE/USDT",
-                "status": "observed",
-            },
-        ],
-        "route_rows": [
-            {
-                "route_id": ROUTE_IDS[0],
-                "timing_status": "within_sla",
-            },
-            {
-                "route_id": ROUTE_IDS[1],
-                "timing_status": second_timing,
-            },
-            {
-                "route_id": ROUTE_IDS[2],
-                "timing_status": "within_sla",
-            },
-            {
-                "route_id": ROUTE_IDS[3],
-                "timing_status": "within_sla",
-            },
-        ],
+        "skew_sla_seconds": "60",
+        "routes": [dict(route) for route in ROUTES],
+        "legs": legs,
+        "route_rows": route_rows,
+    }
+
+
+def _terminal_cake_cohort():
+    cohort = _cohort()
+    failed = next(
+        row for row in cohort["legs"]
+        if row["market_id"] == "cex:bybit:CAKE/USDT"
+    )
+    market_id = failed["market_id"]
+    failed.clear()
+    failed.update({
+        "leg_id": market_id,
+        "market_id": market_id,
+        "market_type": "cex",
+        "status": "failed",
+        "available": False,
+        "reason_code": "source_unavailable",
+        "execution_adapter_status": "supported",
+        "execution_adapter_supported": True,
+    })
+    for row in cohort["route_rows"]:
+        if row["token_symbol"] != "CAKE":
+            continue
+        failed_is_buy = row["buy_market_id"] == failed["market_id"]
+        row.update({
+            "skew_seconds": None,
+            "timing_status": "unavailable",
+            "reason_code": (
+                "buy_leg_unavailable" if failed_is_buy
+                else "sell_leg_unavailable"
+            ),
+        })
+    return cohort
+
+
+def _observed_cex_typed_lineage():
+    members = []
+    for index, role in enumerate((
+        "cex_market_rules",
+        "cex_raw_book_response",
+        "quote_usd_conversion",
+    ), start=1):
+        contract = TYPED_SOURCE_ROLE_CONTRACTS[role]
+        members.append({
+            "role": role,
+            "status": "observed",
+            "reason_code": None,
+            "filename": "terminal-residue-{}.json".format(index),
+            "sha256": str(index) * 64,
+            "size": index,
+            "logical_generation": str(index) * 64,
+            "adapter_id": contract["adapter_id"],
+            "content_schema": contract["content_schema"],
+        })
+    return {
+        "schema": "route_leg_typed_source_lineage/v1",
+        "members": members,
     }
 
 
@@ -291,6 +382,53 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
             "served": False,
         })
 
+    def test_terminal_cake_cohort_still_publishes_twenty_row_receipt(self):
+        cohort = _terminal_cake_cohort()
+
+        def finalize(**kwargs):
+            validator = kwargs["_postcommit_validator"]
+            validator(_complete_pointer())
+            return _complete_pointer()
+
+        with patch.object(
+            runner,
+            "build_live_cex_research_universe",
+            return_value=self.universe,
+        ), patch.object(
+            runner, "collect_route_cohort", return_value=cohort,
+        ), patch.object(
+            runner,
+            "attach_typed_source_lineage",
+            return_value=(cohort, {"typed_source_manifest_sha256": "d" * 64}),
+        ), patch.object(
+            runner,
+            "publish_route_cohort_bundle",
+            return_value=self.core_pointer,
+        ) as publish, patch.object(
+            runner,
+            "finalize_public_cex_research_opportunities",
+            side_effect=finalize,
+        ) as finalize_mock, patch.object(
+            runner,
+            "load_latest_complete_route_bundle",
+            return_value=_loaded_bundle(),
+        ):
+            receipt = runner.collect_and_publish_live_cex_research(
+                data_dir=self.data_dir,
+                public_fee_schedule_path=self.schedule,
+                deadline_seconds=30,
+                wall_clock=lambda: NOW,
+            )
+
+        publish.assert_called_once_with(
+            cohort, core_root=self.data_dir / "routes/core"
+        )
+        finalize_mock.assert_called_once()
+        self.assertEqual(receipt["status"], "published")
+        self.assertEqual(receipt["market_count"], 4)
+        self.assertEqual(receipt["route_count"], 4)
+        self.assertEqual(receipt["opportunity_count"], 20)
+
     def test_typed_lineage_attachment_failure_never_publishes(self):
         with patch.object(
             runner,
@@ -349,6 +487,44 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
         publish.assert_not_called()
 
     def test_incomplete_collection_never_publishes_or_finalizes(self):
+        terminal = _terminal_cake_cohort()
+        wrong_reason = copy.deepcopy(terminal)
+        next(
+            row for row in wrong_reason["route_rows"]
+            if row["timing_status"] != "within_sla"
+        )["reason_code"] = "route_deadline_exceeded"
+        missing_terminal_route = copy.deepcopy(terminal)
+        missing_terminal_route["route_rows"].pop()
+        missing_route_candidate = copy.deepcopy(terminal)
+        missing_route_candidate["routes"].pop()
+        missing_terminal_leg = copy.deepcopy(terminal)
+        missing_terminal_leg["legs"].pop()
+        duplicate_terminal_route = copy.deepcopy(terminal)
+        duplicate_terminal_route["route_rows"][3]["route_id"] = (
+            duplicate_terminal_route["route_rows"][2]["route_id"]
+        )
+        unknown_terminal_status = copy.deepcopy(terminal)
+        unknown_terminal_status["legs"][-1]["status"] = "missing"
+        terminal_missing_leg_id = copy.deepcopy(terminal)
+        terminal_missing_leg_id["legs"][-1].pop("leg_id")
+        terminal_with_state = copy.deepcopy(terminal)
+        terminal_with_state["legs"][-1][
+            "state_observed_at"
+        ] = "2026-09-04T12:00:00Z"
+        terminal_with_snapshot = copy.deepcopy(terminal)
+        terminal_with_snapshot["legs"][-1]["snapshot_id"] = "source-run"
+        terminal_with_raw_hash = copy.deepcopy(terminal)
+        terminal_with_raw_hash["legs"][-1][
+            "raw_response_sha256"
+        ] = "a" * 64
+        terminal_with_endpoint = copy.deepcopy(terminal)
+        terminal_with_endpoint["legs"][-1][
+            "source_endpoint"
+        ] = "https://api.bybit.com/v5/market/orderbook"
+        terminal_with_observed_typed_member = copy.deepcopy(terminal)
+        terminal_with_observed_typed_member["legs"][-1][
+            "typed_source_lineage"
+        ] = _observed_cex_typed_lineage()
         invalid_cohorts = (
             _cohort(second_status="failed"),
             _cohort(second_timing="outside_sla"),
@@ -360,9 +536,25 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
                 **_cohort(),
                 "route_rows": _cohort()["route_rows"][:1],
             },
+            wrong_reason,
+            missing_terminal_route,
+            missing_route_candidate,
+            missing_terminal_leg,
+            duplicate_terminal_route,
+            unknown_terminal_status,
+            terminal_missing_leg_id,
+            terminal_with_state,
+            terminal_with_snapshot,
+            terminal_with_raw_hash,
+            terminal_with_endpoint,
+            terminal_with_observed_typed_member,
         )
+        prior = b'{"prior":"complete-pointer"}\n'
+        pointer_path = self.data_dir / "routes/latest.json"
+        pointer_path.parent.mkdir(exist_ok=True)
         for cohort in invalid_cohorts:
             with self.subTest(cohort=cohort):
+                pointer_path.write_bytes(prior)
                 with patch.object(
                     runner,
                     "build_live_cex_research_universe",
@@ -386,6 +578,7 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
                         )
                 publish.assert_not_called()
                 finalize.assert_not_called()
+                self.assertEqual(pointer_path.read_bytes(), prior)
 
     def test_collector_exception_never_calls_publication(self):
         prior = b'{"prior":"complete-pointer"}\n'

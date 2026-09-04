@@ -1,5 +1,12 @@
 # Live CEX Opportunity Research Workflow Design
 
+> Historical design context: this document records the original single-token
+> `UNI/USDT` increment and its acceptance boundary. The
+> [Live CEX Multi-Token Opportunity Design](2026-09-04-live-cex-multi-token-opportunity-design.md)
+> supersedes it for the four-market, four-route, twenty-scenario UNI+CAKE
+> workflow, v2 receipt, route-local terminal isolation, and CAKE fee-evidence
+> limitation. Historical acceptance evidence below is unchanged.
+
 ## Outcome
 
 The repository will provide one real-data, read-only Opportunity workflow for

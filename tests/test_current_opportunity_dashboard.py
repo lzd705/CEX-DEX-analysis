@@ -170,6 +170,34 @@ class CurrentOpportunityDashboardTests(unittest.TestCase):
             "/api/markets/opportunities?notional=1000",
         )
 
+    def test_opportunity_handler_preserves_distinct_uni_and_cake_filters(self):
+        from scripts import run_current_opportunity_dashboard as runner
+
+        handler_factory = runner._current_opportunity_handler
+
+        class BaseHandler:
+            def do_GET(self):  # noqa: N802
+                self.delegated_path = self.path
+
+        handler_type = handler_factory(SimpleNamespace(
+            MarketMonitorHandler=BaseHandler
+        ))
+        for token in ("UNI", "CAKE"):
+            with self.subTest(token=token):
+                handler = object.__new__(handler_type)
+                handler.path = (
+                    "/api/markets/opportunities?token={}&sort=net_edge_usd"
+                    .format(token)
+                )
+
+                handler.do_GET()
+
+                self.assertEqual(
+                    handler.delegated_path,
+                    "/api/markets/opportunities?token={}"
+                    "&sort=net_edge_usd".format(token),
+                )
+
     def test_fresh_process_isolates_inherited_admin_state_before_import(self):
         project_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temporary:
