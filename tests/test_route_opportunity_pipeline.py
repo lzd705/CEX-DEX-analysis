@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timezone
+from decimal import Decimal
 import hashlib
 import http.client
 import io
@@ -19,10 +21,13 @@ from unittest.mock import patch
 
 from scripts.route_cost_evidence import (
     build_unavailable_route_cost_evidence_manifest,
+    physical_sha256,
+    typed_sha256,
 )
 from scripts.fetch_dex_depth import ROUTE_V2_FEE_PROOF_SHA256
 from scripts.route_publication import (
     load_latest_complete_route_bundle,
+    publish_complete_route_bundle,
     publish_route_cohort_bundle,
     publish_shadow_result,
 )
@@ -34,7 +39,12 @@ from scripts.route_shadow_inputs import (
     _candidate_source_generation,
     write_run_universe,
 )
-from scripts.route_quantity import V2PoolState, V2_FEE_FORMULA
+from scripts.route_quantity import (
+    CommonTarget,
+    MarketRules,
+    V2PoolState,
+    V2_FEE_FORMULA,
+)
 from scripts.route_universe import route_universe_sha256
 import scripts.route_opportunity_pipeline as opportunity_pipeline
 from scripts.route_opportunity_pipeline import (
@@ -49,6 +59,138 @@ def _physical_json(value):
     return json.dumps(
         value, ensure_ascii=False, indent=2, sort_keys=True
     ).encode("utf-8") + b"\n"
+
+
+def _observed_dex_cost_sidecar(cohort, sources):
+    """Small already-replayed sidecar projection fixture for pipeline tests."""
+    targets = {}
+    for route in cohort["routes"]:
+        buy_source = sources[route["buy_market_id"]]
+        sell_source = sources[route["sell_market_id"]]
+        for raw_notional in cohort["requested_notionals_usd"]:
+            target = opportunity_pipeline.common_target_quantity(
+                requested_notional_usd=raw_notional,
+                buy_reference_price_usd=buy_source["reference_price_usd"],
+                sell_reference_price_usd=sell_source["reference_price_usd"],
+                buy_market_rules=buy_source["rules"],
+                sell_market_rules=sell_source["rules"],
+            )
+            for market_id in (
+                route["buy_market_id"], route["sell_market_id"]
+            ):
+                key = (market_id, str(raw_notional))
+                prior = targets.setdefault(key, target)
+                if prior != target:
+                    raise AssertionError("fixture target differs by route")
+    transcripts = []
+    transcript_by_scope = {}
+    for leg in sorted(cohort["legs"], key=lambda row: row["market_id"]):
+        market_id = leg["market_id"]
+        for direction in ("buy", "sell"):
+            for raw_notional in cohort["requested_notionals_usd"]:
+                notional = str(raw_notional)
+                source = sources[market_id]
+                target = targets[(market_id, notional)]
+                target_address = source["conversion"]["target_token_address"]
+                target_value = {
+                    "schema": "route_cost_simulation_target/v1",
+                    "token_address": target_address,
+                    "unit_decimals": str(target.unit_decimals),
+                    "raw_quantity": str(target.raw_quantity),
+                    "lattice_raw": str(target.lattice_raw),
+                }
+                transcript = {
+                    "market_id": market_id,
+                    "direction": direction,
+                    "requested_notional_usd": notional,
+                    "simulation_target_token_address": target_address,
+                    "simulation_target_unit_decimals": target_value[
+                        "unit_decimals"
+                    ],
+                    "simulation_target_raw_quantity": target_value[
+                        "raw_quantity"
+                    ],
+                    "simulation_target_lattice_raw": target_value[
+                        "lattice_raw"
+                    ],
+                    "simulation_target_sha256": typed_sha256(
+                        b"route-cost-simulation-target/v1\n", target_value
+                    ),
+                    "core_pool_state_id": source["state"].state_id,
+                    "core_pool_state_sha256": source["pool_sha256"],
+                    "status": "observed",
+                    "completed_stage": "transfer_tax",
+                    "reason_code": None,
+                    "gas_evidence": {
+                        "gas_units": "21000",
+                        "max_fee_per_gas_wei": "20000000000",
+                        "native_price_usd": "3000",
+                        "observed_at": "2026-08-01T12:00:00Z",
+                        "valid_until": "2026-08-01T12:05:00Z",
+                    },
+                    "router_fee_evidence": {
+                        "status": "not_applicable",
+                        "source_record_sha256": "7" * 64,
+                    },
+                    "transfer_tax_evidence": {
+                        "status": "not_applicable",
+                        "trace_sha256": "8" * 64,
+                    },
+                    # This is a calldata loss ceiling, not an MEV cost.
+                    "call_evidence": {
+                        "submission_loss_bound_bps": "9999",
+                    },
+                }
+                transcripts.append(transcript)
+                transcript_by_scope[(market_id, direction, notional)] = (
+                    transcript
+                )
+    bindings = []
+    for route in sorted(cohort["routes"], key=lambda row: row["route_id"]):
+        for raw_notional in cohort["requested_notionals_usd"]:
+            notional = str(raw_notional)
+            binding = {
+                "route_id": route["route_id"],
+                "requested_notional_usd": notional,
+                "buy_transcript_sha256": typed_sha256(
+                    b"route-cost-evidence-transcript/v1\n",
+                    transcript_by_scope[(
+                        route["buy_market_id"], "buy", notional
+                    )],
+                ),
+                "sell_transcript_sha256": typed_sha256(
+                    b"route-cost-evidence-transcript/v1\n",
+                    transcript_by_scope[(
+                        route["sell_market_id"], "sell", notional
+                    )],
+                ),
+                "status": "unavailable",
+                "reason_code": "submission_policy_unavailable",
+            }
+            bindings.append(binding)
+    sidecar = {"transcripts": transcripts, "bindings": bindings}
+    sidecar_sha = physical_sha256(sidecar)
+    route_by_id = {route["route_id"]: route for route in cohort["routes"]}
+    outcomes = [
+        {
+            "route_id": binding["route_id"],
+            "requested_notional_usd": binding["requested_notional_usd"],
+            "status": binding["status"],
+            "reason_code": binding["reason_code"],
+            "coverage_kind": "binding",
+            "covered_dex_market_ids": sorted((
+                route_by_id[binding["route_id"]]["buy_market_id"],
+                route_by_id[binding["route_id"]]["sell_market_id"],
+            )),
+            "uncovered_dex_market_ids": [],
+            "scoped_binding_sha256": typed_sha256(
+                b"route-cost-evidence-binding/v1\n", binding
+            ),
+            "route_cost_evidence_sha256": sidecar_sha,
+        }
+        for binding in bindings
+    ]
+    return sidecar, outcomes
 
 
 def _v2_pool_payload(
@@ -133,6 +275,52 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("--shadow-run-id", completed.stdout)
         self.assertIn("--expected-joint-pointer-sha256", completed.stdout)
+        self.assertIn("--research-mev-bps", completed.stdout)
+
+    def test_research_mev_bps_cli_is_explicit_dex_only_and_bounded(self):
+        for value in ("0", "0.000001", "25", "10000"):
+            with self.subTest(valid=value):
+                self.assertEqual(
+                    opportunity_pipeline._canonical_research_mev_bps(value),
+                    value,
+                )
+        for value in (
+            "", " 1", "1.0", "1e1", "1e100000000", "-1",
+            "0.0000001", "10000.1",
+        ):
+            with self.subTest(invalid=value):
+                with self.assertRaises(RouteOpportunityPipelineError):
+                    opportunity_pipeline._canonical_research_mev_bps(value)
+
+        pointer = {"schema": "route_opportunity_pointer/v1"}
+        with ExitStack() as stack:
+            finalizer = stack.enter_context(patch.object(
+                opportunity_pipeline,
+                "finalize_eth_uniswap_v2_research_opportunities",
+                return_value=pointer,
+            ))
+            stack.enter_context(patch.object(
+                opportunity_pipeline,
+                "load_latest_complete_route_bundle",
+                return_value={"pointer": pointer},
+            ))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            self.assertEqual(opportunity_pipeline.main([
+                "--finalizer", "eth-uniswap-v2-research",
+                "--data-dir", str(self.data_dir),
+                "--shadow-run-id", self.run_id,
+                "--expected-joint-pointer-sha256", self.expected_joint_sha256,
+                "--research-mev-bps", "25",
+            ]), 0)
+        self.assertEqual(finalizer.call_args.kwargs["research_mev_bps"], "25")
+
+        with self.assertRaises(SystemExit):
+            opportunity_pipeline.main([
+                "--data-dir", str(self.data_dir),
+                "--shadow-run-id", self.run_id,
+                "--expected-joint-pointer-sha256", self.expected_joint_sha256,
+                "--research-mev-bps", "25",
+            ])
 
     def test_cli_serve_publishes_then_execs_read_only_loopback_dashboard(self):
         data_dir, fixture, joint = self._install_real_cex_run()
@@ -1179,6 +1367,389 @@ class RouteOpportunityPipelineTests(unittest.TestCase):
             {row["opportunity_class"] for row in payload["routes"]},
             {"unavailable"},
         )
+
+    def test_observed_dex_transcripts_and_explicit_mev_close_research_grid(self):
+        data_dir, cohort, joint = self._install_real_dex_run()
+        now = "2026-08-01T12:00:03Z"
+        sources, _retained = opportunity_pipeline._load_dex_sources(
+            root=data_dir,
+            cohort=cohort,
+            source_root=(
+                data_dir / "raw/route-cohort"
+                / cohort["raw_evidence_run_id"] / "typed"
+            ),
+            now=now,
+        )
+        cost_evidence, outcomes = _observed_dex_cost_sidecar(cohort, sources)
+
+        built = opportunity_pipeline._build_dex_inputs(
+            cohort=cohort,
+            core_manifest_sha256=joint["pointer"]["core_manifest_sha256"],
+            sources=sources,
+            outcomes=outcomes,
+            cost_evidence=cost_evidence,
+            research_mev_bps="25",
+            now=now,
+        )
+
+        self.assertEqual(len(built), len(cohort["routes"]) * 5)
+        for item in built:
+            opportunity = item["classified_opportunity"]
+            costs = item["build_inputs"]["cost_components"]
+            notional = Decimal(opportunity["requested_notional_usd"])
+            self.assertEqual(opportunity["opportunity_class"], "research_estimate")
+            self.assertEqual(opportunity["scenario_cost_completeness"], "complete")
+            self.assertEqual(opportunity["cost_completeness"], "incomplete")
+            self.assertIsNotNone(opportunity["gross_edge_usd"])
+            self.assertEqual(opportunity["strict_nonembedded_cost_usd"], "2.52")
+            self.assertEqual(
+                Decimal(opportunity["research_assumed_cost_usd"]),
+                notional * Decimal("25") / Decimal("10000"),
+            )
+            self.assertEqual(
+                Decimal(opportunity["research_net_edge_usd"]),
+                Decimal(opportunity["gross_edge_usd"])
+                - Decimal("2.52")
+                - notional * Decimal("25") / Decimal("10000"),
+            )
+            self.assertFalse(opportunity["strict_eligible"])
+            self.assertFalse(opportunity["strict_ready_for_publication"])
+            self.assertIsNone(opportunity["publication_attestation_sha256"])
+            self.assertEqual(
+                opportunity["primary_reason"],
+                "quantity_quote_evidence_not_strict",
+            )
+            self.assertIn(
+                "mode_expected_request_unavailable",
+                opportunity["reason_codes"],
+            )
+            self.assertEqual(len(costs), 10)
+            by_key = {
+                (row["leg"], row["component_type"]): row for row in costs
+            }
+            for leg in ("buy", "sell"):
+                self.assertEqual(
+                    by_key[(leg, "pool_swap_fee")]["value_status"],
+                    "measured",
+                )
+                self.assertTrue(
+                    by_key[(leg, "pool_swap_fee")][
+                        "embedded_in_leg_quote"
+                    ]
+                )
+                self.assertEqual(
+                    by_key[(leg, "network_gas")]["amount_usd"], "1.26"
+                )
+                self.assertEqual(
+                    by_key[(leg, "network_gas")]["value_status"], "quoted"
+                )
+                self.assertEqual(
+                    by_key[(leg, "router_or_integrator_fee")][
+                        "value_status"
+                    ],
+                    "not_applicable",
+                )
+                self.assertEqual(
+                    by_key[(leg, "token_transfer_tax")]["value_status"],
+                    "not_applicable",
+                )
+            mev = by_key[("route", "mev_buffer")]
+            self.assertEqual(mev["value_status"], "assumed")
+            self.assertEqual(mev["rate_bps"], "25")
+            self.assertEqual(
+                Decimal(mev["amount_usd"]),
+                notional * Decimal("25") / Decimal("10000"),
+            )
+            self.assertEqual(mev["source"], "explicit operator research scenario")
+            self.assertNotEqual(mev["rate_bps"], "9999")
+
+        source_root = (
+            data_dir / "raw/route-cohort"
+            / cohort["raw_evidence_run_id"] / "typed"
+        )
+        publish_complete_route_bundle(
+            core_root=data_dir / "routes/core",
+            routes_root=data_dir / "routes",
+            raw_root=data_dir / "raw/route-cohort",
+            opportunity_inputs=built,
+            source_root=source_root,
+        )
+        loaded = load_latest_complete_route_bundle(
+            data_dir / "routes", core_root=data_dir / "routes/core"
+        )
+        from dashboard.opportunity_facts import build_opportunity_payload
+
+        payload = build_opportunity_payload(
+            loaded["opportunities"],
+            manifest=loaded["manifest"],
+            legs=loaded["legs"],
+            cost_components=loaded["cost_components"],
+            route_candidates=loaded["bundle"]["routes"],
+            manifest_sha256=loaded["manifest_sha256"],
+            notional_usd="1000",
+            now=datetime(2026, 8, 1, 12, 0, 3, tzinfo=timezone.utc),
+        )
+        self.assertEqual(len(payload["routes"]), len(cohort["routes"]))
+        for route in payload["routes"]:
+            self.assertEqual(
+                route["availability"], {"status": "available", "reason": None}
+            )
+            self.assertEqual(route["opportunity_class"], "research_estimate")
+            self.assertIsNotNone(route["gross_edge_usd"])
+            self.assertIsNotNone(route["net_edge_usd"])
+            self.assertEqual(
+                route["cost_breakdown"]["strict_nonembedded_usd"], "2.52"
+            )
+            self.assertEqual(
+                route["cost_breakdown"]["research_assumed_usd"], "2.5"
+            )
+            self.assertEqual(len(route["cost_components"]), 10)
+
+    def test_observed_dex_cost_projection_fails_closed_and_never_invents_mev(self):
+        data_dir, cohort, joint = self._install_real_dex_run()
+        now = "2026-08-01T12:00:03Z"
+        sources, _retained = opportunity_pipeline._load_dex_sources(
+            root=data_dir,
+            cohort=cohort,
+            source_root=(
+                data_dir / "raw/route-cohort"
+                / cohort["raw_evidence_run_id"] / "typed"
+            ),
+            now=now,
+        )
+        cost_evidence, outcomes = _observed_dex_cost_sidecar(cohort, sources)
+        kwargs = {
+            "cohort": cohort,
+            "core_manifest_sha256": joint["pointer"]["core_manifest_sha256"],
+            "sources": sources,
+            "outcomes": outcomes,
+            "cost_evidence": cost_evidence,
+            "research_mev_bps": None,
+            "now": now,
+        }
+
+        built = opportunity_pipeline._build_dex_inputs(**kwargs)
+        for item in built:
+            opportunity = item["classified_opportunity"]
+            mev = next(
+                row
+                for row in item["build_inputs"]["cost_components"]
+                if row["component_type"] == "mev_buffer"
+            )
+            self.assertEqual(opportunity["opportunity_class"], "research_estimate")
+            self.assertEqual(opportunity["scenario_cost_completeness"], "incomplete")
+            self.assertIsNotNone(opportunity["strict_net_edge_usd"])
+            self.assertIsNone(opportunity["research_net_edge_usd"])
+            self.assertEqual(mev["value_status"], "unavailable")
+            self.assertIsNone(mev["amount_usd"])
+            self.assertIsNone(mev["rate_bps"])
+            self.assertEqual(mev["reason_code"], "mev_protection_unavailable")
+
+        mutated = copy.deepcopy(cost_evidence)
+        mutated["transcripts"][0]["gas_evidence"]["gas_units"] = "1"
+        with self.assertRaisesRegex(
+            RouteOpportunityPipelineError, "sidecar hash differs"
+        ):
+            opportunity_pipeline._build_dex_inputs(
+                **{**kwargs, "cost_evidence": mutated}
+            )
+
+    def test_authenticated_route_cost_kat_projects_exact_dex_cost_rows(self):
+        from tests.test_route_cost_evidence import (
+            supported_observed_manifest,
+        )
+
+        cost_evidence, universe, retained = supported_observed_manifest()
+        outcomes = opportunity_pipeline.replay_route_cost_coverage_outcomes(
+            cost_evidence,
+            universe=universe,
+            expected_run_id=cost_evidence["run_id"],
+            expected_route_cohort_id=cost_evidence["route_cohort_id"],
+            expected_phase=cost_evidence["phase"],
+            expected_candidate_source_generation=cost_evidence[
+                "candidate_source_generation"
+            ],
+            expected_route_universe_sha256=cost_evidence[
+                "route_universe_sha256"
+            ],
+            retained_typed_pool_state_members=retained,
+        )
+        route = universe["routes"][0]
+        coverage = next(
+            row for row in outcomes
+            if row["route_id"] == route["route_id"]
+            and row["requested_notional_usd"] == "1000"
+        )
+        states = {
+            market_id: opportunity_pipeline._frozen_v2_state(
+                json.loads(member["payload"])
+            )
+            for market_id, member in retained.items()
+        }
+        target_transcript = next(
+            row for row in cost_evidence["transcripts"]
+            if row["market_id"] == route["buy_market_id"]
+            and row["direction"] == "buy"
+            and row["requested_notional_usd"] == "1000"
+        )
+        target = CommonTarget(
+            asset="AAA",
+            unit_decimals=int(
+                target_transcript["simulation_target_unit_decimals"]
+            ),
+            raw_quantity=int(
+                target_transcript["simulation_target_raw_quantity"]
+            ),
+            lattice_raw=int(
+                target_transcript["simulation_target_lattice_raw"]
+            ),
+        )
+        sources = {
+            market_id: None for market_id in states
+        }
+        for market_id, state in states.items():
+            target_address = target_transcript[
+                "simulation_target_token_address"
+            ]
+            target_is_token0 = target_address == state.token0_address
+            quote_address = (
+                state.token1_address if target_is_token0 else state.token0_address
+            )
+            target_decimals = (
+                state.token0_decimals
+                if target_is_token0 else state.token1_decimals
+            )
+            quote_decimals = (
+                state.token1_decimals
+                if target_is_token0 else state.token0_decimals
+            )
+            sources[market_id] = {
+                "state": state,
+                "pool_sha256": retained[market_id]["descriptor"]["sha256"],
+                "rules": MarketRules(
+                    market_id=market_id,
+                    base_asset="AAA",
+                    quote_asset="WETH",
+                    base_unit_decimals=target_decimals,
+                    quote_unit_decimals=quote_decimals,
+                    base_increment=Decimal(1) / (Decimal(10) ** target_decimals),
+                    quote_increment=Decimal(1) / (Decimal(10) ** quote_decimals),
+                    min_base_quantity=Decimal(0),
+                    min_quote_notional=Decimal(0),
+                    observed_at=state.observed_at,
+                    valid_until="2026-08-01T12:05:00Z",
+                    source_record_sha256="9" * 64,
+                ),
+                "conversion": {
+                    "target_token_address": target_address,
+                    "quote_token_address": quote_address,
+                    "quote_asset": "WETH",
+                    "observed_at": "2026-08-01T12:00:00Z",
+                    "valid_until": "2026-08-01T12:05:00Z",
+                    "source": "authenticated local KAT",
+                },
+                "usd_rate": Decimal("3000"),
+                "usd_sha": "a" * 64,
+                # Deliberately differs from the KAT's pool-derived target.
+                "reference_price_usd": Decimal("95"),
+                "filenames": {
+                    role: "{}-{}.json".format(index, role)
+                    for index, role in enumerate(sorted({
+                        "dex_market_rules", "dex_pool_state",
+                        "dex_usd_conversion", "dex_usd_price_context",
+                    }))
+                },
+            }
+        cohort = {
+            "route_cohort_id": cost_evidence["route_cohort_id"],
+            "collection_completed_at": cost_evidence["evaluated_at"],
+            "requested_notionals_usd": list(universe[
+                "requested_notionals_usd"
+            ]),
+            "routes": [copy.deepcopy(route)],
+            "legs": [
+                {
+                    "market_id": market_id,
+                    "market_type": "dex",
+                    "status": "observed",
+                    "available": True,
+                    "reason_code": None,
+                    "state_observed_at": state.observed_at,
+                    "raw_response_sha256": state.raw_response_sha256,
+                    "snapshot_id": "kat-snapshot",
+                }
+                for market_id, state in sorted(states.items())
+            ],
+        }
+        built = opportunity_pipeline._build_dex_inputs(
+            cohort=cohort,
+            core_manifest_sha256="b" * 64,
+            sources=sources,
+            outcomes=outcomes,
+            cost_evidence=cost_evidence,
+            research_mev_bps="25",
+            now=cost_evidence["evaluated_at"],
+        )
+        self.assertEqual(len(built), 5)
+        self.assertTrue(all(
+            item["classified_opportunity"]["opportunity_class"]
+            == "research_estimate"
+            and item["classified_opportunity"][
+                "scenario_cost_completeness"
+            ] == "complete"
+            and item["classified_opportunity"]["research_net_edge_usd"]
+            is not None
+            for item in built
+        ))
+        self.assertTrue(any(
+            Decimal(item["classified_opportunity"]["research_net_edge_usd"])
+            < 0
+            for item in built
+        ))
+        rows = built[0]["build_inputs"]["cost_components"]
+        self.assertEqual(len(rows), 10)
+        by_key = {
+            (row["leg"], row["component_type"]): row for row in rows
+        }
+        self.assertEqual(
+            by_key[("buy", "network_gas")]["amount_usd"],
+            "0.000000012789",
+        )
+        self.assertEqual(
+            by_key[("sell", "network_gas")]["amount_usd"],
+            "0.000000012789",
+        )
+        self.assertEqual(
+            by_key[("buy", "pool_swap_fee")]["amount_usd"], "3"
+        )
+        self.assertEqual(
+            by_key[("sell", "pool_swap_fee")]["amount_usd"], "3"
+        )
+        self.assertEqual(
+            by_key[("route", "mev_buffer")]["amount_usd"], "2.5"
+        )
+        with self.assertRaisesRegex(
+            RouteOpportunityPipelineError, "target or state differs"
+        ):
+            opportunity_pipeline._observed_dex_cost_components(
+                cohort_id=cost_evidence["route_cohort_id"],
+                route=route,
+                requested_notional_usd=Decimal("1000"),
+                common_target=CommonTarget(
+                    asset="AAA",
+                    unit_decimals=target.unit_decimals,
+                    raw_quantity=target.raw_quantity + target.lattice_raw,
+                    lattice_raw=target.lattice_raw,
+                ),
+                coverage=coverage,
+                projection_index=(
+                    opportunity_pipeline._dex_cost_projection_index(
+                        cost_evidence, outcomes
+                    )
+                ),
+                sources=sources,
+                research_mev_bps="25",
+            )
 
     def test_dex_supported_cost_pool_filter_is_exact_and_fail_closed(self):
         retained = {

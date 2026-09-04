@@ -374,17 +374,34 @@ python3 scripts/route_opportunity_pipeline.py \
   --data-dir /absolute/local-data \
   --shadow-run-id RUN_ID \
   --expected-joint-pointer-sha256 64_HEX_SHA256 \
+  --research-mev-bps 25 \
   --serve \
   --port 8765
 ```
 
 This mode rereads and replays only the retained local bytes; it performs no RPC
-or HTTP collection. It never issues an executable attestation. If the pinned
-route-cost sidecar cannot establish gas, router, tax, transfer, pool-fee, or
-MEV costs, all required component rows remain terminal with null amounts and
-the page shows the route as `unavailable` rather than treating an unknown cost
-as zero. A DEX result is therefore either `research_estimate` or `unavailable`,
-never `executable_candidate`.
+or HTTP collection. It never issues an executable attestation. When both
+binding-referenced leg transcripts are observed, it projects the embedded pool
+fee, per-leg max-fee gas quote, proved no-integrator-fee and no-transfer-tax
+facts, and same-chain topology into the ten-row cost inventory. The optional
+`--research-mev-bps` value is an explicit operator scenario, not a fact inferred
+from the signed submission-loss bounds. Supplying it closes the scenario-cost
+arithmetic so the page can show gross edge, known strict costs, the assumed MEV
+cost, and research net edge even when the result is negative. Omitting it keeps
+MEV unavailable and research net null. The option accepts canonical decimal
+text from 0 through 10000 with at most six decimal places and is rejected for
+the CEX finalizer.
+
+If the pinned route-cost sidecar cannot establish either leg transcript, all
+required component rows remain terminal with null amounts and the page shows
+the route as `unavailable`; the MEV option does not override missing evidence.
+A DEX result is therefore either `research_estimate` or `unavailable`, never
+`executable_candidate`. The checked-in adapter authority currently identifies
+only one supported UNI/WETH V2 pair, while this DEX-only finalizer requires two
+distinct supported markets. A real two-pool result therefore also requires a
+second locally retained, independently authorized pair; the test KAT proves the
+full calculation path with two local synthetic pools but is not current market
+data.
 
 Each sealed route candidate also carries its two ranking-volume inputs and a
 derived `route_volume_usd`. CEX legs bind the route-universe selected-window

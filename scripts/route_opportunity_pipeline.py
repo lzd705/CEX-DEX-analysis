@@ -8,8 +8,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 if __package__ in {None, ""}:  # Support ``python scripts/<name>.py``.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -27,7 +28,10 @@ from scripts.fetch_cex_depth import (
 from scripts.fetch_dex_depth import freeze_v2_pool_state
 from scripts.route_cost_evidence import (
     RouteCostEvidenceError,
+    network_gas_usd,
+    physical_sha256,
     replay_route_cost_coverage_outcomes,
+    typed_sha256,
     validate_retained_v2_pool_state_member,
 )
 from scripts.route_cost_topology import live_complete_cost_component_keys
@@ -59,6 +63,7 @@ from scripts.route_publication import (
     publish_complete_route_bundle,
 )
 from scripts.route_quantity import (
+    CommonTarget,
     FeeSemantics,
     MarketRules,
     quote_v2_pool_quantity,
@@ -87,6 +92,10 @@ _DEX_POOL_INTEGER_FIELDS = frozenset({
     "reserve1_raw", "reserve_timestamp_last_raw", "fee_bps",
     "fee_numerator", "fee_denominator", "block_number",
 })
+_RESEARCH_MEV_BPS = re.compile(
+    r"(?:0|[1-9][0-9]{0,4})(?:\.[0-9]{1,6})?\Z",
+    flags=re.ASCII,
+)
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -439,6 +448,7 @@ def _load_dex_sources(
             }
             sources[market_id] = {
                 "state": state,
+                "pool_sha256": full_descriptors["dex_pool_state"]["sha256"],
                 "rules": rules,
                 "conversion": conversion,
                 "usd_rate": Decimal(conversion["usd_per_quote"]),
@@ -929,12 +939,512 @@ def _terminal_dex_cost_components(
     return rows
 
 
+def _canonical_research_mev_bps(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) > 32
+        or _RESEARCH_MEV_BPS.fullmatch(value) is None
+    ):
+        raise RouteOpportunityPipelineError(
+            "research MEV bps must be canonical decimal text"
+        )
+    try:
+        number = Decimal(value)
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise RouteOpportunityPipelineError(
+            "research MEV bps must be canonical decimal text"
+        ) from error
+    canonical = format(number, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    if number == 0:
+        canonical = "0"
+    if (
+        not number.is_finite()
+        or number < 0
+        or number > 10000
+        or canonical != value
+        or number.as_tuple().exponent < -6
+    ):
+        raise RouteOpportunityPipelineError(
+            "research MEV bps must be canonical decimal text from 0 to 10000 "
+            "with at most 6 decimal places"
+        )
+    return canonical
+
+
+def _research_mev_bps_argument(value: str) -> str:
+    try:
+        return _canonical_research_mev_bps(value)
+    except RouteOpportunityPipelineError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _dex_cost_projection_index(
+    cost_evidence: Mapping[str, Any],
+    outcomes: List[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Freeze hash-addressed views of one replay-validated cost sidecar."""
+    try:
+        sidecar_sha256 = physical_sha256(cost_evidence)
+        if {
+            row.get("route_cost_evidence_sha256") for row in outcomes
+            if isinstance(row, Mapping)
+        } != {sidecar_sha256}:
+            raise RouteOpportunityPipelineError(
+                "pinned DEX route-cost sidecar hash differs after replay"
+            )
+        bindings = cost_evidence.get("bindings")
+        transcripts = cost_evidence.get("transcripts")
+        if not isinstance(bindings, list) or not isinstance(transcripts, list):
+            raise RouteOpportunityPipelineError(
+                "pinned DEX route-cost projection inventory is invalid"
+            )
+        binding_by_sha: Dict[str, Mapping[str, Any]] = {}
+        for binding in bindings:
+            if not isinstance(binding, Mapping):
+                raise RouteOpportunityPipelineError(
+                    "pinned DEX route-cost binding is invalid"
+                )
+            digest = typed_sha256(
+                b"route-cost-evidence-binding/v1\n", binding
+            )
+            if digest in binding_by_sha:
+                raise RouteOpportunityPipelineError(
+                    "pinned DEX route-cost binding hash is duplicated"
+                )
+            binding_by_sha[digest] = binding
+        transcript_by_sha: Dict[str, Mapping[str, Any]] = {}
+        for transcript in transcripts:
+            if not isinstance(transcript, Mapping):
+                raise RouteOpportunityPipelineError(
+                    "pinned DEX route-cost transcript is invalid"
+                )
+            digest = typed_sha256(
+                b"route-cost-evidence-transcript/v1\n", transcript
+            )
+            if digest in transcript_by_sha:
+                raise RouteOpportunityPipelineError(
+                    "pinned DEX route-cost transcript hash is duplicated"
+                )
+            transcript_by_sha[digest] = transcript
+        return {
+            "sidecar_sha256": sidecar_sha256,
+            "binding_by_sha": binding_by_sha,
+            "transcript_by_sha": transcript_by_sha,
+        }
+    except (
+        RouteCostEvidenceError,
+        TypeError,
+        ValueError,
+    ) as error:
+        if isinstance(error, RouteOpportunityPipelineError):
+            raise
+        raise RouteOpportunityPipelineError(
+            "DEX route-cost projection index is invalid"
+        ) from error
+
+
+def _resolved_observed_dex_cost_evidence(
+    *,
+    route: Mapping[str, Any],
+    requested_notional_usd: Decimal,
+    coverage: Mapping[str, Any],
+    projection_index: Mapping[str, Any],
+    sources: Mapping[str, Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Resolve one exact observed binding and its shared transaction target."""
+    try:
+        if projection_index.get("sidecar_sha256") != coverage.get(
+            "route_cost_evidence_sha256"
+        ):
+            raise RouteOpportunityPipelineError(
+                "pinned DEX route-cost sidecar hash differs after replay"
+            )
+        if coverage.get("coverage_kind") != "binding":
+            return None
+        expected_markets = sorted((
+            route.get("buy_market_id"), route.get("sell_market_id")
+        ))
+        if (
+            coverage.get("status")
+            not in {"observed", "unavailable", "failed"}
+            or coverage.get("covered_dex_market_ids") != expected_markets
+            or coverage.get("uncovered_dex_market_ids") != []
+        ):
+            raise RouteOpportunityPipelineError(
+                "pinned DEX route-cost binding coverage differs"
+            )
+        binding_sha = coverage.get("scoped_binding_sha256")
+        if not isinstance(binding_sha, str):
+            raise RouteOpportunityPipelineError(
+                "pinned DEX route-cost binding hash is missing"
+            )
+        binding_by_sha = projection_index.get("binding_by_sha")
+        transcript_by_sha = projection_index.get("transcript_by_sha")
+        if not isinstance(binding_by_sha, Mapping) or not isinstance(
+            transcript_by_sha, Mapping
+        ):
+            raise RouteOpportunityPipelineError(
+                "pinned DEX route-cost projection inventory is invalid"
+            )
+        binding = binding_by_sha.get(binding_sha)
+        if not isinstance(binding, Mapping):
+            raise RouteOpportunityPipelineError(
+                "pinned DEX route-cost binding does not resolve exactly"
+            )
+        notional_text = format(requested_notional_usd, "f")
+        if (
+            binding.get("route_id") != route.get("route_id")
+            or binding.get("requested_notional_usd") != notional_text
+            or binding.get("status") != coverage.get("status")
+            or binding.get("reason_code") != coverage.get("reason_code")
+        ):
+            raise RouteOpportunityPipelineError(
+                "pinned DEX route-cost binding scenario differs"
+            )
+        resolved: Dict[str, Tuple[Mapping[str, Any], str]] = {}
+        shared_target: Optional[Dict[str, str]] = None
+        for leg in ("buy", "sell"):
+            market_id = route.get(leg + "_market_id")
+            source = sources.get(market_id)
+            if not isinstance(source, Mapping):
+                raise RouteOpportunityPipelineError(
+                    "DEX cost projection source is missing"
+                )
+            state = source.get("state")
+            conversion = source.get("conversion")
+            pool_sha256 = source.get("pool_sha256")
+            if (
+                state is None
+                or not isinstance(conversion, Mapping)
+                or not isinstance(pool_sha256, str)
+            ):
+                raise RouteOpportunityPipelineError(
+                    "DEX cost projection source is incomplete"
+                )
+            transcript_sha = binding.get(leg + "_transcript_sha256")
+            transcript = transcript_by_sha.get(transcript_sha)
+            if transcript is None:
+                raise RouteOpportunityPipelineError(
+                    "pinned DEX route-cost transcript does not resolve"
+                )
+            if (
+                transcript.get("market_id") != market_id
+                or transcript.get("direction") != leg
+                or transcript.get("requested_notional_usd") != notional_text
+            ):
+                raise RouteOpportunityPipelineError(
+                    "pinned DEX route-cost transcript scenario differs"
+                )
+            if transcript.get("status") != "observed":
+                return None
+            target_address = conversion.get("target_token_address")
+            target_value = {
+                "schema": "route_cost_simulation_target/v1",
+                "token_address": target_address,
+                "unit_decimals": transcript.get(
+                    "simulation_target_unit_decimals"
+                ),
+                "raw_quantity": transcript.get(
+                    "simulation_target_raw_quantity"
+                ),
+                "lattice_raw": transcript.get(
+                    "simulation_target_lattice_raw"
+                ),
+            }
+            if any((
+                transcript.get("simulation_target_token_address")
+                != target_address,
+                transcript.get("simulation_target_sha256")
+                != typed_sha256(
+                    b"route-cost-simulation-target/v1\n", target_value
+                ),
+                transcript.get("core_pool_state_id") != state.state_id,
+                transcript.get("core_pool_state_sha256") != pool_sha256,
+            )):
+                raise RouteOpportunityPipelineError(
+                    "pinned DEX route-cost transcript target or state differs"
+                )
+            if not all(
+                isinstance(target_value[field], str)
+                and target_value[field]
+                and target_value[field].isdigit()
+                and str(int(target_value[field])) == target_value[field]
+                for field in (
+                    "unit_decimals", "raw_quantity", "lattice_raw"
+                )
+            ):
+                raise RouteOpportunityPipelineError(
+                    "pinned DEX route-cost transcript target is invalid"
+                )
+            comparable_target = dict(target_value)
+            if shared_target is None:
+                shared_target = comparable_target
+            elif comparable_target != shared_target:
+                raise RouteOpportunityPipelineError(
+                    "pinned DEX route-cost leg targets differ"
+                )
+            if (
+                transcript.get("completed_stage") != "transfer_tax"
+                or transcript.get("reason_code") is not None
+            ):
+                raise RouteOpportunityPipelineError(
+                    "observed DEX route-cost transcript is not terminal"
+                )
+            gas = transcript.get("gas_evidence")
+            router = transcript.get("router_fee_evidence")
+            transfer = transcript.get("transfer_tax_evidence")
+            if (
+                not isinstance(gas, Mapping)
+                or not isinstance(router, Mapping)
+                or not isinstance(transfer, Mapping)
+                or router.get("status") != "not_applicable"
+                or transfer.get("status") != "not_applicable"
+            ):
+                raise RouteOpportunityPipelineError(
+                    "observed DEX cost-component evidence is incomplete"
+                )
+            resolved[leg] = (transcript, str(transcript_sha))
+        if shared_target is None:
+            raise RouteOpportunityPipelineError(
+                "pinned DEX route-cost target is absent"
+            )
+        target = CommonTarget(
+            asset=route["token_symbol"],
+            unit_decimals=int(shared_target["unit_decimals"]),
+            raw_quantity=int(shared_target["raw_quantity"]),
+            lattice_raw=int(shared_target["lattice_raw"]),
+        )
+        return {"target": target, "legs": resolved}
+    except (
+        KeyError,
+        InvalidOperation,
+        RouteCostEvidenceError,
+        TypeError,
+        ValueError,
+    ) as error:
+        if isinstance(error, RouteOpportunityPipelineError):
+            raise
+        raise RouteOpportunityPipelineError(
+            "observed DEX route-cost evidence cannot be resolved"
+        ) from error
+
+
+def _observed_dex_cost_components(
+    *,
+    cohort_id: str,
+    route: Mapping[str, Any],
+    requested_notional_usd: Decimal,
+    common_target: CommonTarget,
+    coverage: Mapping[str, Any],
+    projection_index: Mapping[str, Any],
+    sources: Mapping[str, Mapping[str, Any]],
+    research_mev_bps: Optional[str],
+) -> Optional[List[Dict[str, Any]]]:
+    """Project one resolved V2 binding into the exact ten cost rows."""
+    try:
+        context = _resolved_observed_dex_cost_evidence(
+            route=route,
+            requested_notional_usd=requested_notional_usd,
+            coverage=coverage,
+            projection_index=projection_index,
+            sources=sources,
+        )
+        if context is None:
+            return None
+        if context["target"] != common_target:
+            raise RouteOpportunityPipelineError(
+                "pinned DEX route-cost transcript target or state differs"
+            )
+        resolved = context["legs"]
+
+        opportunity_id = route_opportunity_id(
+            route["route_id"], requested_notional_usd
+        )
+        rows: List[Dict[str, Any]] = []
+        for leg in ("buy", "sell"):
+            market_id = route[leg + "_market_id"]
+            state = sources[market_id]["state"]
+            transcript, transcript_sha = resolved[leg]
+            gas = transcript["gas_evidence"]
+            router = transcript["router_fee_evidence"]
+            transfer = transcript["transfer_tax_evidence"]
+            gas_amount = network_gas_usd(
+                gas_units=int(gas["gas_units"]),
+                max_fee_per_gas_wei_value=int(
+                    gas["max_fee_per_gas_wei"]
+                ),
+                native_price_usd=gas["native_price_usd"],
+            )
+            gas_rate = (
+                Decimal(gas_amount) * Decimal(10000)
+                / requested_notional_usd
+            )
+            fee_rate = Decimal(state.fee_bps)
+            fee_amount = (
+                requested_notional_usd * fee_rate / Decimal(10000)
+            )
+            common = {
+                "cohort_id": cohort_id,
+                "opportunity_id": opportunity_id,
+                "leg": leg,
+                "market_id": market_id,
+                "direction": leg + "_token",
+                "requested_notional_usd": requested_notional_usd,
+                "target_token_quantity": common_target.quantity,
+            }
+            rows.extend((
+                cost_component_row(
+                    **common,
+                    component_type="pool_swap_fee",
+                    value_status="measured",
+                    amount_usd=fee_amount,
+                    rate_bps=fee_rate,
+                    basis=(
+                        "retained Uniswap V2 fee rate; informational "
+                        "notional equivalent already embedded in the quote"
+                    ),
+                    strict_eligible=True,
+                    embedded_in_leg_quote=True,
+                    observed_at=state.observed_at,
+                    valid_until=None,
+                    source="retained Uniswap V2 pool state",
+                    source_record_sha256=state.fee_proof_sha256,
+                ),
+                cost_component_row(
+                    **common,
+                    component_type="network_gas",
+                    value_status="quoted",
+                    amount_usd=gas_amount,
+                    rate_bps=gas_rate,
+                    basis=(
+                        "fixed-block gas units times max fee per gas times "
+                        "pinned native-token USD price"
+                    ),
+                    strict_eligible=True,
+                    observed_at=gas["observed_at"],
+                    valid_until=gas["valid_until"],
+                    source="pinned route-cost gas transcript",
+                    source_record_sha256=transcript_sha,
+                ),
+                cost_component_row(
+                    **common,
+                    component_type="router_or_integrator_fee",
+                    value_status="not_applicable",
+                    amount_usd=None,
+                    rate_bps=None,
+                    basis="validated Uniswap V2 Router02 adapter has no integrator fee",
+                    strict_eligible=True,
+                    observed_at=None,
+                    valid_until=None,
+                    source="validated route adapter contract",
+                    source_record_sha256=router["source_record_sha256"],
+                ),
+                cost_component_row(
+                    **common,
+                    component_type="token_transfer_tax",
+                    value_status="not_applicable",
+                    amount_usd=None,
+                    rate_bps=None,
+                    basis="validated trace balance deltas prove no transfer tax",
+                    strict_eligible=True,
+                    observed_at=None,
+                    valid_until=None,
+                    source="validated route adapter contract",
+                    source_record_sha256=transfer["trace_sha256"],
+                ),
+            ))
+
+        route_common = {
+            "cohort_id": cohort_id,
+            "opportunity_id": opportunity_id,
+            "leg": "route",
+            "market_id": "",
+            "direction": "route",
+            "requested_notional_usd": requested_notional_usd,
+            "target_token_quantity": common_target.quantity,
+        }
+        rows.append(cost_component_row(
+            **route_common,
+            component_type="rebalancing_or_transfer",
+            value_status="not_applicable",
+            amount_usd=None,
+            rate_bps=None,
+            basis="same-chain atomic route proves no external rebalance leg",
+            strict_eligible=True,
+            observed_at=None,
+            valid_until=None,
+            source="validated route topology",
+            source_record_sha256=None,
+        ))
+        if research_mev_bps is None:
+            rows.append(cost_component_row(
+                **route_common,
+                component_type="mev_buffer",
+                value_status="unavailable",
+                amount_usd=None,
+                rate_bps=None,
+                basis="validated sidecar contains no independent MEV estimate",
+                strict_eligible=False,
+                observed_at=None,
+                valid_until=None,
+                source="pinned route-cost evidence",
+                source_record_sha256=coverage[
+                    "route_cost_evidence_sha256"
+                ],
+                reason_code="mev_protection_unavailable",
+            ))
+        else:
+            mev_text = _canonical_research_mev_bps(research_mev_bps)
+            mev_rate = Decimal(mev_text)
+            rows.append(cost_component_row(
+                **route_common,
+                component_type="mev_buffer",
+                value_status="assumed",
+                amount_usd=(
+                    requested_notional_usd * mev_rate / Decimal(10000)
+                ),
+                rate_bps=mev_rate,
+                basis=(
+                    "explicit operator research scenario of {} bps; not "
+                    "derived from submission-loss bounds"
+                ).format(mev_text),
+                strict_eligible=False,
+                observed_at=None,
+                valid_until=None,
+                source="explicit operator research scenario",
+                source_record_sha256=None,
+            ))
+        if {
+            (row["leg"], row["component_type"]) for row in rows
+        } != set(live_complete_cost_component_keys(route)):
+            raise RouteOpportunityPipelineError(
+                "DEX cost projection topology is incomplete"
+            )
+        return rows
+    except (
+        KeyError,
+        InvalidOperation,
+        RouteCostEvidenceError,
+        TypeError,
+        ValueError,
+    ) as error:
+        if isinstance(error, RouteOpportunityPipelineError):
+            raise
+        raise RouteOpportunityPipelineError(
+            "observed DEX route-cost evidence cannot be projected"
+        ) from error
+
+
 def _build_dex_inputs(
     *,
     cohort: Mapping[str, Any],
     core_manifest_sha256: str,
     sources: Mapping[str, Mapping[str, Any]],
     outcomes: List[Mapping[str, Any]],
+    cost_evidence: Mapping[str, Any],
+    research_mev_bps: Optional[str],
     now: str,
 ) -> List[Dict[str, Any]]:
     legs_by_market = {
@@ -957,6 +1467,9 @@ def _build_dex_inputs(
         raise RouteOpportunityPipelineError(
             "DEX route-cost coverage scenario inventory differs"
         )
+    if research_mev_bps is not None:
+        research_mev_bps = _canonical_research_mev_bps(research_mev_bps)
+    projection_index = _dex_cost_projection_index(cost_evidence, outcomes)
 
     opportunities: List[Dict[str, Any]] = []
     cohort_now = cohort["collection_completed_at"]
@@ -966,16 +1479,30 @@ def _build_dex_inputs(
         for raw_notional in cohort["requested_notionals_usd"]:
             notional = Decimal(str(raw_notional))
             try:
-                target = common_target_quantity(
+                coverage = outcome_by_key[(
+                    route["route_id"], str(raw_notional)
+                )]
+                observed_cost = _resolved_observed_dex_cost_evidence(
+                    route=route,
                     requested_notional_usd=notional,
-                    buy_reference_price_usd=buy_source[
-                        "reference_price_usd"
-                    ],
-                    sell_reference_price_usd=sell_source[
-                        "reference_price_usd"
-                    ],
-                    buy_market_rules=buy_source["rules"],
-                    sell_market_rules=sell_source["rules"],
+                    coverage=coverage,
+                    projection_index=projection_index,
+                    sources=sources,
+                )
+                target = (
+                    observed_cost["target"]
+                    if observed_cost is not None
+                    else common_target_quantity(
+                        requested_notional_usd=notional,
+                        buy_reference_price_usd=buy_source[
+                            "reference_price_usd"
+                        ],
+                        sell_reference_price_usd=sell_source[
+                            "reference_price_usd"
+                        ],
+                        buy_market_rules=buy_source["rules"],
+                        sell_market_rules=sell_source["rules"],
+                    )
                 )
                 quotes: Dict[str, Any] = {}
                 quote_evidence: Dict[str, Dict[str, Any]] = {}
@@ -1051,15 +1578,24 @@ def _build_dex_inputs(
                         for role, filename in source["filenames"].items()
                     })
 
-                costs = _terminal_dex_cost_components(
+                costs = _observed_dex_cost_components(
                     cohort_id=cohort["route_cohort_id"],
                     route=route,
                     requested_notional_usd=notional,
-                    target_token_quantity=target.quantity,
-                    coverage=outcome_by_key[(
-                        route["route_id"], str(raw_notional)
-                    )],
+                    common_target=target,
+                    coverage=coverage,
+                    projection_index=projection_index,
+                    sources=sources,
+                    research_mev_bps=research_mev_bps,
                 )
+                if costs is None:
+                    costs = _terminal_dex_cost_components(
+                        cohort_id=cohort["route_cohort_id"],
+                        route=route,
+                        requested_notional_usd=notional,
+                        target_token_quantity=target.quantity,
+                        coverage=coverage,
+                    )
                 mode = classify_route_mode_evidence(route, now=now)
                 build_inputs = {
                     "cohort_id": cohort["route_cohort_id"],
@@ -1288,8 +1824,11 @@ def finalize_eth_uniswap_v2_research_opportunities(
     data_dir: Path,
     shadow_run_id: str,
     expected_joint_pointer_sha256: str,
+    research_mev_bps: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Replay one pinned DEX-only Shadow run without strict upgrading."""
+    if research_mev_bps is not None:
+        research_mev_bps = _canonical_research_mev_bps(research_mev_bps)
     root = Path(data_dir)
     try:
         shadow = load_shadow_result(
@@ -1439,6 +1978,8 @@ def finalize_eth_uniswap_v2_research_opportunities(
         core_manifest_sha256=pointer["core_manifest_sha256"],
         sources=sources,
         outcomes=outcomes,
+        cost_evidence=cost_evidence,
+        research_mev_bps=research_mev_bps,
         now=now,
     )
 
@@ -1503,18 +2044,39 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=8765,
         help="loopback dashboard port used with --serve (default: 8765)",
     )
+    parser.add_argument(
+        "--research-mev-bps",
+        type=_research_mev_bps_argument,
+        help=(
+            "explicit nonnegative MEV cost assumption for the DEX research "
+            "scenario; no value is inferred when omitted"
+        ),
+    )
     arguments = parser.parse_args(argv)
+    if (
+        arguments.finalizer != "eth-uniswap-v2-research"
+        and arguments.research_mev_bps is not None
+    ):
+        parser.error(
+            "--research-mev-bps is only valid with "
+            "--finalizer eth-uniswap-v2-research"
+        )
     finalizer = (
         finalize_cex_route_opportunities
         if arguments.finalizer == "cex"
         else finalize_eth_uniswap_v2_research_opportunities
     )
-    pointer = finalizer(
-        data_dir=arguments.data_dir,
-        shadow_run_id=arguments.shadow_run_id,
-        expected_joint_pointer_sha256=(
+    finalizer_kwargs = {
+        "data_dir": arguments.data_dir,
+        "shadow_run_id": arguments.shadow_run_id,
+        "expected_joint_pointer_sha256": (
             arguments.expected_joint_pointer_sha256
         ),
+    }
+    if arguments.finalizer == "eth-uniswap-v2-research":
+        finalizer_kwargs["research_mev_bps"] = arguments.research_mev_bps
+    pointer = finalizer(
+        **finalizer_kwargs
     )
     try:
         loaded = load_latest_complete_route_bundle(
