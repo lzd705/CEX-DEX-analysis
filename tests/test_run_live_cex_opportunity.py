@@ -1,0 +1,644 @@
+"""Tests for the fixed, read-only live CEX Opportunity entrypoint."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import io
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
+
+from scripts import run_live_cex_opportunity as runner
+
+
+COHORT_ID = "cohort:" + "c" * 64
+CORE_MANIFEST_SHA256 = "a" * 64
+COMPLETE_MANIFEST_SHA256 = "b" * 64
+NOW = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+ROUTE_IDS = (
+    "route:UNI:cex:binance:UNI/USDT->cex:bybit:UNI/USDT:"
+    "prepositioned_inventory",
+    "route:UNI:cex:bybit:UNI/USDT->cex:binance:UNI/USDT:"
+    "prepositioned_inventory",
+)
+
+
+def _cohort(*, second_status="observed", second_timing="within_sla"):
+    return {
+        "route_cohort_id": COHORT_ID,
+        "legs": [
+            {
+                "market_id": "cex:binance:UNI/USDT",
+                "status": "observed",
+            },
+            {
+                "market_id": "cex:bybit:UNI/USDT",
+                "status": second_status,
+            },
+        ],
+        "route_rows": [
+            {
+                "route_id": ROUTE_IDS[0],
+                "timing_status": "within_sla",
+            },
+            {
+                "route_id": ROUTE_IDS[1],
+                "timing_status": second_timing,
+            },
+        ],
+    }
+
+
+def _complete_pointer():
+    return {
+        "route_cohort_id": COHORT_ID,
+        "manifest_sha256": COMPLETE_MANIFEST_SHA256,
+    }
+
+
+def _loaded_bundle(*, pointer=None, count=10, strict=False):
+    return {
+        "pointer": dict(pointer or _complete_pointer()),
+        "bundle": {
+            "opportunities": [
+                {
+                    "opportunity_id": "opportunity:{}".format(index),
+                    "strict_eligible": strict,
+                }
+                for index in range(count)
+            ],
+        },
+    }
+
+
+class LiveCexOpportunityParserTests(unittest.TestCase):
+    def test_parser_exposes_only_fixed_safe_controls(self):
+        parsed = runner.parse_args([
+            "--data-dir", "/tmp/live-cex-data",
+            "--public-fee-schedule", "/tmp/fees.csv",
+            "--deadline-seconds", "10",
+            "--serve",
+            "--port", "65535",
+        ])
+
+        self.assertEqual(set(vars(parsed)), {
+            "data_dir",
+            "public_fee_schedule",
+            "deadline_seconds",
+            "serve",
+            "port",
+        })
+        self.assertEqual(parsed.data_dir, Path("/tmp/live-cex-data"))
+        self.assertEqual(parsed.public_fee_schedule, Path("/tmp/fees.csv"))
+        self.assertEqual(parsed.deadline_seconds, 10)
+        self.assertTrue(parsed.serve)
+        self.assertEqual(parsed.port, 65535)
+
+        defaults = runner.parse_args([
+            "--data-dir", "/tmp/live-cex-data",
+        ])
+        self.assertTrue(defaults.public_fee_schedule.is_absolute())
+        self.assertEqual(
+            defaults.public_fee_schedule.name,
+            "cex_public_fee_schedules.csv",
+        )
+        self.assertEqual(defaults.deadline_seconds, 60)
+        self.assertFalse(defaults.serve)
+        self.assertEqual(defaults.port, 8765)
+
+    def test_parser_rejects_relative_data_deadline_and_port_bounds(self):
+        invalid_arguments = (
+            ["--data-dir", "relative/data"],
+            ["--data-dir", "/tmp/data", "--deadline-seconds", "9"],
+            ["--data-dir", "/tmp/data", "--deadline-seconds", "61"],
+            ["--data-dir", "/tmp/data", "--deadline-seconds", "10.5"],
+            ["--data-dir", "/tmp/data", "--port", "0"],
+            ["--data-dir", "/tmp/data", "--port", "65536"],
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                with redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        runner.parse_args(arguments)
+
+    def test_parser_rejects_all_dynamic_market_and_execution_controls(self):
+        forbidden = (
+            "--token", "--tokens", "--venue", "--venues", "--url",
+            "--endpoint", "--profile", "--run-id", "--finalizer",
+            "--host", "--rpc", "--api-key",
+        )
+        for option in forbidden:
+            with self.subTest(option=option):
+                with redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        runner.parse_args([
+                            "--data-dir", "/tmp/data", option, "value",
+                        ])
+
+
+class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.data_dir = Path(self.temporary.name) / "market-data"
+        self.data_dir.mkdir()
+        self.schedule = Path(self.temporary.name) / "fees.csv"
+        self.schedule.write_text("schedule\n", encoding="utf-8")
+        self.universe = runner.build_live_cex_research_universe()
+        self.core_pointer = {
+            "route_cohort_id": COHORT_ID,
+            "manifest_sha256": CORE_MANIFEST_SHA256,
+        }
+
+    def _patch_happy_path(self, events):
+        def build():
+            events.append("build fixed universe")
+            return self.universe
+
+        def collect(universe, **kwargs):
+            events.append("collect_route_cohort")
+            self.assertIs(universe, self.universe)
+            self.assertEqual(kwargs["deadline_seconds"], 30)
+            self.assertEqual(kwargs["max_workers"], 4)
+            self.assertEqual(kwargs["cex_workers_per_venue"], 2)
+            self.assertEqual(
+                kwargs["raw_root"], self.data_dir / "raw/route-cohort"
+            )
+            self.assertIs(kwargs["cex_collector"], runner.collect_cex_market_observation)
+            self.assertIs(kwargs["source_generation_reader"], runner.live_cex_research_generation)
+            self.assertEqual(
+                kwargs["expected_source_generation"],
+                runner.live_cex_research_generation(),
+            )
+            self.assertIs(kwargs["wall_clock"], self.wall_clock)
+            return _cohort()
+
+        def publish(cohort, **kwargs):
+            events.append("publish_route_cohort_bundle")
+            self.assertEqual(cohort, _cohort())
+            self.assertEqual(kwargs["core_root"], self.data_dir / "routes/core")
+            return self.core_pointer
+
+        def finalize(**kwargs):
+            events.append("finalize_public_cex_research_opportunities")
+            validator = kwargs.pop("_postcommit_validator")
+            self.assertEqual(kwargs, {
+                "data_dir": self.data_dir,
+                "public_fee_schedule_path": self.schedule,
+                "expected_route_cohort_id": COHORT_ID,
+                "expected_core_manifest_sha256": CORE_MANIFEST_SHA256,
+            })
+            validator(_complete_pointer())
+            return _complete_pointer()
+
+        def load(routes_root, **kwargs):
+            events.append("load_latest_complete_route_bundle")
+            self.assertEqual(routes_root, self.data_dir / "routes")
+            self.assertEqual(kwargs["core_root"], self.data_dir / "routes/core")
+            return _loaded_bundle()
+
+        self.wall_clock = lambda: NOW
+        return (
+            patch.object(runner, "build_live_cex_research_universe", side_effect=build),
+            patch.object(runner, "collect_route_cohort", side_effect=collect),
+            patch.object(runner, "publish_route_cohort_bundle", side_effect=publish),
+            patch.object(
+                runner,
+                "finalize_public_cex_research_opportunities",
+                side_effect=finalize,
+            ),
+            patch.object(runner, "load_latest_complete_route_bundle", side_effect=load),
+        )
+
+    def test_exact_pipeline_order_identity_binding_and_minimal_receipt(self):
+        events = []
+        patches = self._patch_happy_path(events)
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            receipt = runner.collect_and_publish_live_cex_research(
+                data_dir=self.data_dir,
+                public_fee_schedule_path=self.schedule,
+                deadline_seconds=30,
+                wall_clock=self.wall_clock,
+            )
+
+        self.assertEqual(events, [
+            "build fixed universe",
+            "collect_route_cohort",
+            "publish_route_cohort_bundle",
+            "finalize_public_cex_research_opportunities",
+            "load_latest_complete_route_bundle",
+        ])
+        self.assertEqual(receipt, {
+            "schema": "live_cex_opportunity_refresh/v1",
+            "status": "published",
+            "token_pair": "UNI/USDT",
+            "venues": ["binance", "bybit"],
+            "route_cohort_id": COHORT_ID,
+            "manifest_sha256": COMPLETE_MANIFEST_SHA256,
+            "opportunity_count": 10,
+            "strict_eligible_count": 0,
+            "served": False,
+        })
+
+    def test_incomplete_collection_never_publishes_or_finalizes(self):
+        invalid_cohorts = (
+            _cohort(second_status="failed"),
+            _cohort(second_timing="outside_sla"),
+            {
+                **_cohort(),
+                "legs": _cohort()["legs"][:1],
+            },
+            {
+                **_cohort(),
+                "route_rows": _cohort()["route_rows"][:1],
+            },
+        )
+        for cohort in invalid_cohorts:
+            with self.subTest(cohort=cohort):
+                with patch.object(
+                    runner,
+                    "build_live_cex_research_universe",
+                    return_value=self.universe,
+                ), patch.object(
+                    runner, "collect_route_cohort", return_value=cohort,
+                ), patch.object(
+                    runner, "publish_route_cohort_bundle"
+                ) as publish, patch.object(
+                    runner, "finalize_public_cex_research_opportunities"
+                ) as finalize:
+                    with self.assertRaisesRegex(
+                        runner.LiveCexOpportunityRefreshError,
+                        "collection_failed",
+                    ):
+                        runner.collect_and_publish_live_cex_research(
+                            data_dir=self.data_dir,
+                            public_fee_schedule_path=self.schedule,
+                            deadline_seconds=30,
+                            wall_clock=lambda: NOW,
+                        )
+                publish.assert_not_called()
+                finalize.assert_not_called()
+
+    def test_collector_exception_never_calls_publication(self):
+        prior = b'{"prior":"complete-pointer"}\n'
+        pointer_path = self.data_dir / "routes/latest.json"
+        pointer_path.parent.mkdir()
+        pointer_path.write_bytes(prior)
+        with patch.object(
+            runner,
+            "build_live_cex_research_universe",
+            return_value=self.universe,
+        ), patch.object(
+            runner, "collect_route_cohort", side_effect=TimeoutError("secret")
+        ), patch.object(
+            runner, "publish_route_cohort_bundle"
+        ) as publish, patch.object(
+            runner, "finalize_public_cex_research_opportunities"
+        ) as finalize:
+            with self.assertRaisesRegex(
+                runner.LiveCexOpportunityRefreshError, "collection_failed"
+            ):
+                runner.collect_and_publish_live_cex_research(
+                    data_dir=self.data_dir,
+                    public_fee_schedule_path=self.schedule,
+                    deadline_seconds=30,
+                    wall_clock=lambda: NOW,
+                )
+        publish.assert_not_called()
+        finalize.assert_not_called()
+        self.assertEqual(pointer_path.read_bytes(), prior)
+
+    def test_finalizer_failure_preserves_prior_complete_pointer(self):
+        prior = b'{"prior":"complete-pointer"}\n'
+        pointer_path = self.data_dir / "routes/latest.json"
+        pointer_path.parent.mkdir()
+        pointer_path.write_bytes(prior)
+        with patch.object(
+            runner,
+            "build_live_cex_research_universe",
+            return_value=self.universe,
+        ), patch.object(
+            runner, "collect_route_cohort", return_value=_cohort(),
+        ), patch.object(
+            runner, "publish_route_cohort_bundle", return_value=self.core_pointer,
+        ), patch.object(
+            runner,
+            "finalize_public_cex_research_opportunities",
+            side_effect=ValueError("private details"),
+        ), patch.object(
+            runner, "load_latest_complete_route_bundle"
+        ) as load:
+            with self.assertRaisesRegex(
+                runner.LiveCexOpportunityRefreshError, "publication_failed"
+            ):
+                runner.collect_and_publish_live_cex_research(
+                    data_dir=self.data_dir,
+                    public_fee_schedule_path=self.schedule,
+                    deadline_seconds=30,
+                    wall_clock=lambda: NOW,
+                )
+        load.assert_not_called()
+        self.assertEqual(pointer_path.read_bytes(), prior)
+
+    def test_reload_mismatch_or_invalid_rows_is_terminal(self):
+        prior = b'{"prior":"complete-pointer"}\n'
+        attempted = b'{"attempted":"complete-pointer"}\n'
+        pointer_path = self.data_dir / "routes/latest.json"
+        pointer_path.parent.mkdir()
+        bad_loaded = (
+            _loaded_bundle(pointer={
+                "route_cohort_id": COHORT_ID,
+                "manifest_sha256": "d" * 64,
+            }),
+            _loaded_bundle(count=9),
+            _loaded_bundle(strict=True),
+        )
+        for loaded in bad_loaded:
+            with self.subTest(loaded=loaded):
+                pointer_path.write_bytes(prior)
+
+                def finalize(**kwargs):
+                    pointer_path.write_bytes(attempted)
+                    validator = kwargs.get("_postcommit_validator")
+                    if validator is None:
+                        return _complete_pointer()
+                    try:
+                        validator(_complete_pointer())
+                    except BaseException:
+                        if pointer_path.read_bytes() == attempted:
+                            pointer_path.write_bytes(prior)
+                        raise
+                    return _complete_pointer()
+
+                with patch.object(
+                    runner,
+                    "build_live_cex_research_universe",
+                    return_value=self.universe,
+                ), patch.object(
+                    runner, "collect_route_cohort", return_value=_cohort(),
+                ), patch.object(
+                    runner,
+                    "publish_route_cohort_bundle",
+                    return_value=self.core_pointer,
+                ), patch.object(
+                    runner,
+                    "finalize_public_cex_research_opportunities",
+                    side_effect=finalize,
+                ), patch.object(
+                    runner,
+                    "load_latest_complete_route_bundle",
+                    return_value=loaded,
+                ):
+                    with self.assertRaisesRegex(
+                        runner.LiveCexOpportunityRefreshError,
+                        "reload_failed",
+                    ):
+                        runner.collect_and_publish_live_cex_research(
+                            data_dir=self.data_dir,
+                            public_fee_schedule_path=self.schedule,
+                            deadline_seconds=30,
+                            wall_clock=lambda: NOW,
+                        )
+                self.assertEqual(pointer_path.read_bytes(), prior)
+
+    def test_direct_api_rejects_unsafe_paths_before_collection(self):
+        symlink_schedule = Path(self.temporary.name) / "fee-link.csv"
+        symlink_schedule.symlink_to(self.schedule)
+        with patch.object(runner, "collect_route_cohort") as collect:
+            with self.assertRaisesRegex(
+                runner.LiveCexOpportunityRefreshError,
+                "preflight_failed",
+            ):
+                runner.collect_and_publish_live_cex_research(
+                    data_dir=self.data_dir,
+                    public_fee_schedule_path=symlink_schedule,
+                    deadline_seconds=30,
+                    wall_clock=lambda: NOW,
+                )
+        collect.assert_not_called()
+
+
+class LiveCexOpportunityMainTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.parent = Path(self.temporary.name)
+        self.data_dir = self.parent / "new-data"
+        self.schedule = self.parent / "fees.csv"
+        self.schedule.write_text("schedule\n", encoding="utf-8")
+        self.arguments = [
+            "--data-dir", str(self.data_dir),
+            "--public-fee-schedule", str(self.schedule),
+        ]
+
+    def test_main_creates_data_dir_and_prints_compact_receipt(self):
+        receipt = {
+            "schema": "live_cex_opportunity_refresh/v1",
+            "status": "published",
+            "token_pair": "UNI/USDT",
+            "venues": ["binance", "bybit"],
+            "route_cohort_id": COHORT_ID,
+            "manifest_sha256": COMPLETE_MANIFEST_SHA256,
+            "opportunity_count": 10,
+            "strict_eligible_count": 0,
+            "served": False,
+        }
+        output = io.StringIO()
+        with patch.object(
+            runner,
+            "collect_and_publish_live_cex_research",
+            return_value=receipt,
+        ) as collect, redirect_stdout(output):
+            result = runner.main(self.arguments)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(self.data_dir.is_dir())
+        collect.assert_called_once()
+        call = collect.call_args.kwargs
+        self.assertEqual(call["data_dir"], self.data_dir)
+        self.assertEqual(call["public_fee_schedule_path"], self.schedule)
+        self.assertEqual(call["deadline_seconds"], 60)
+        self.assertTrue(callable(call["wall_clock"]))
+        self.assertEqual(json.loads(output.getvalue()), receipt)
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+
+    def test_main_prints_before_loopback_server_and_serves_only_after_success(self):
+        receipt = {
+            "schema": "live_cex_opportunity_refresh/v1",
+            "status": "published",
+            "token_pair": "UNI/USDT",
+            "venues": ["binance", "bybit"],
+            "route_cohort_id": COHORT_ID,
+            "manifest_sha256": COMPLETE_MANIFEST_SHA256,
+            "opportunity_count": 10,
+            "strict_eligible_count": 0,
+            "served": False,
+        }
+        output = io.StringIO()
+
+        def serve(**kwargs):
+            self.assertTrue(output.getvalue())
+            published = json.loads(output.getvalue())
+            self.assertTrue(published["served"])
+            self.assertEqual(kwargs, {"data_dir": self.data_dir, "port": 8765})
+
+        with patch.object(
+            runner,
+            "collect_and_publish_live_cex_research",
+            return_value=receipt,
+        ), patch.object(
+            runner, "serve_current_dashboard", side_effect=serve,
+        ) as server, redirect_stdout(output):
+            result = runner.main(self.arguments + ["--serve"])
+
+        self.assertEqual(result, 0)
+        server.assert_called_once()
+
+    def test_reload_failure_never_serves_and_does_not_leak_exception(self):
+        output = io.StringIO()
+        errors = io.StringIO()
+        failure = runner.LiveCexOpportunityRefreshError("reload_failed")
+        with patch.object(
+            runner,
+            "collect_and_publish_live_cex_research",
+            side_effect=failure,
+        ), patch.object(
+            runner, "serve_current_dashboard"
+        ) as server, redirect_stdout(output), redirect_stderr(errors):
+            result = runner.main(self.arguments + ["--serve"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "reload_failed\n")
+        self.assertNotIn("exception", errors.getvalue())
+        server.assert_not_called()
+
+    def test_stable_failure_codes_and_interrupt_exit(self):
+        for code in (
+            "collection_failed", "publication_failed", "reload_failed",
+        ):
+            with self.subTest(code=code):
+                errors = io.StringIO()
+                with patch.object(
+                    runner,
+                    "collect_and_publish_live_cex_research",
+                    side_effect=runner.LiveCexOpportunityRefreshError(code),
+                ), redirect_stderr(errors):
+                    result = runner.main(self.arguments)
+                self.assertEqual(result, 1)
+                self.assertEqual(errors.getvalue(), code + "\n")
+
+        errors = io.StringIO()
+        with patch.object(
+            runner,
+            "collect_and_publish_live_cex_research",
+            side_effect=KeyboardInterrupt,
+        ), redirect_stderr(errors):
+            result = runner.main(self.arguments)
+        self.assertEqual(result, 130)
+        self.assertEqual(errors.getvalue(), "interrupted\n")
+
+    def test_unsafe_paths_fail_preflight_before_collection(self):
+        missing_parent_data = self.parent / "missing" / "data"
+        symlink_parent = self.parent / "symlink-parent"
+        real_parent = self.parent / "real-parent"
+        real_parent.mkdir()
+        symlink_parent.symlink_to(real_parent, target_is_directory=True)
+        symlink_schedule = self.parent / "fees-link.csv"
+        symlink_schedule.symlink_to(self.schedule)
+        cases = (
+            [
+                "--data-dir", str(missing_parent_data),
+                "--public-fee-schedule", str(self.schedule),
+            ],
+            [
+                "--data-dir", str(symlink_parent / "data"),
+                "--public-fee-schedule", str(self.schedule),
+            ],
+            [
+                "--data-dir", str(self.data_dir),
+                "--public-fee-schedule", str(symlink_schedule),
+            ],
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                errors = io.StringIO()
+                with patch.object(
+                    runner, "collect_and_publish_live_cex_research"
+                ) as collect, redirect_stderr(errors):
+                    result = runner.main(arguments)
+                self.assertEqual(result, 1)
+                self.assertEqual(errors.getvalue(), "preflight_failed\n")
+                collect.assert_not_called()
+
+    def test_main_parse_failures_never_echo_values_and_help_returns_zero(self):
+        cases = (
+            ([
+                "--data-dir", str(self.data_dir),
+                "--api-key", "TOPSECRET-API-KEY",
+            ], "TOPSECRET-API-KEY"),
+            (["--data-dir", "RELATIVE-SECRET-PATH"], "RELATIVE-SECRET-PATH"),
+            ([
+                "--data-dir", str(self.data_dir),
+                "--deadline-seconds", "SECRET-DEADLINE",
+            ], "SECRET-DEADLINE"),
+            ([
+                "--data-dir", str(self.data_dir),
+                "--port", "SECRET-PORT",
+            ], "SECRET-PORT"),
+        )
+        for arguments, secret in cases:
+            with self.subTest(arguments=arguments):
+                output = io.StringIO()
+                errors = io.StringIO()
+                with redirect_stdout(output), redirect_stderr(errors):
+                    result = runner.main(arguments)
+                self.assertEqual(result, 1)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(errors.getvalue(), "preflight_failed\n")
+                self.assertNotIn(secret, errors.getvalue())
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            result = runner.main(["--help"])
+        self.assertEqual(result, 0)
+        self.assertIn("usage:", output.getvalue())
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_serve_failure_uses_stable_code_without_payload(self):
+        receipt = {
+            "schema": "live_cex_opportunity_refresh/v1",
+            "status": "published",
+            "token_pair": "UNI/USDT",
+            "venues": ["binance", "bybit"],
+            "route_cohort_id": COHORT_ID,
+            "manifest_sha256": COMPLETE_MANIFEST_SHA256,
+            "opportunity_count": 10,
+            "strict_eligible_count": 0,
+            "served": False,
+        }
+        output = io.StringIO()
+        errors = io.StringIO()
+        with patch.object(
+            runner,
+            "collect_and_publish_live_cex_research",
+            return_value=receipt,
+        ), patch.object(
+            runner,
+            "serve_current_dashboard",
+            side_effect=RuntimeError("private server detail"),
+        ), redirect_stdout(output), redirect_stderr(errors):
+            result = runner.main(self.arguments + ["--serve"])
+
+        self.assertEqual(result, 1)
+        self.assertTrue(json.loads(output.getvalue())["served"])
+        self.assertEqual(errors.getvalue(), "serve_failed\n")
+        self.assertNotIn("private server detail", errors.getvalue())
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 if __package__ in {None, ""}:  # Support ``python scripts/<name>.py``.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -1908,8 +1908,18 @@ def finalize_public_cex_research_opportunities(
     public_fee_schedule_path: Path,
     expected_route_cohort_id: str,
     expected_core_manifest_sha256: str,
+    _postcommit_validator: Optional[
+        Callable[[Mapping[str, Any]], None]
+    ] = None,
 ) -> Dict[str, Any]:
     """Finalize the current CEX core as public, non-strict research."""
+    if (
+        _postcommit_validator is not None
+        and not callable(_postcommit_validator)
+    ):
+        raise RouteOpportunityPipelineError(
+            "public CEX postcommit validator is invalid"
+        )
     root = Path(data_dir)
     schedule_path = Path(public_fee_schedule_path)
     try:
@@ -2043,6 +2053,8 @@ def finalize_public_cex_research_opportunities(
                 "published public CEX pointer failed cold reload"
             )
         cold_loaded["pointer"] = loaded["pointer"]
+        if _postcommit_validator is not None:
+            _postcommit_validator(committed_pointer)
 
     try:
         pointer = publish_complete_route_bundle(

@@ -237,6 +237,18 @@ publisher's postcommit validation transaction. Failure restores the prior
 pointer only if the attempted pointer is still current; a concurrent pointer is
 never overwritten.
 
+The one-command runner adds its exact-pointer, ten-row, and non-strict checks
+through a private postcommit validator hook on that same transaction. It does
+not perform a fallible second verification only after the complete pointer has
+become irreversible.
+
+The complete-pointer publisher records the exact installed bytes and stat
+identity immediately after atomic replacement and before directory fsync. A
+failure restores the prior pointer only when the current entry still owns that
+exact snapshot. A same-bytes replacement on a new inode is treated as a
+concurrent writer and is preserved. A restored pointer is likewise captured
+and rechecked for ownership after its directory fsync.
+
 The command prints a receipt containing only schema/status, route cohort ID,
 complete pointer identity, source venues, token pair, row counts, and optional
 loopback URL. It never prints absolute paths, environment values, raw source
@@ -272,6 +284,10 @@ Arguments are limited to:
 
 There is no token, venue, endpoint, direction, finalizer, profile, API-key,
 host, or RPC argument.
+
+At the executable `main()` boundary, malformed and forbidden arguments emit
+only `preflight_failed` and return 1; raw argv and argparse diagnostics are not
+echoed. `--help` continues to print normal help to stdout and return zero.
 
 ## Failure behavior
 
@@ -318,6 +334,8 @@ Implementation is complete only when all of these pass:
    cold loader, and API projection.
 3. Mutating a book, rule member, fee schedule row, core pointer, or complete
    pointer is rejected without replacing the previous current pointer.
+   Complete-pointer rollback tests also cover same-bytes/new-inode concurrent
+   replacement during postcommit validation and post-replace fsync.
 4. Missing/stale/ambiguous fee bounds never become zero and never yield an
    executable candidate.
 5. Every successful public research result has strict fields forced false/null

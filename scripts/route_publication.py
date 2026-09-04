@@ -5903,23 +5903,36 @@ def _restore_pointer_after_failure(
     routes_fd: int,
     routes_path: Path,
     old_pointer: Optional[Tuple[bytes, os.stat_result]],
-    attempted_pointer_bytes: bytes,
+    committed_pointer: Optional[Tuple[bytes, os.stat_result]],
 ) -> None:
+    """Rollback only the exact complete pointer inode we installed."""
     current = _optional_pointer_snapshot_at(routes_fd)
-    old_bytes = None if old_pointer is None else old_pointer[0]
-    if (None if current is None else current[0]) == old_bytes:
+    if old_pointer is None:
+        if current is None:
+            return
+    elif _pointer_snapshot_is_owned(current, old_pointer):
         return
-    if current is None or current[0] != attempted_pointer_bytes:
+    if (
+        committed_pointer is None
+        or not _pointer_snapshot_is_owned(current, committed_pointer)
+    ):
         raise RoutePublicationError(
             "complete route pointer commit is uncertain due to a concurrent writer"
         )
-    if old_bytes is None:
+    if old_pointer is None:
         os.unlink("latest.json", dir_fd=routes_fd)
-    else:
-        _replace_pointer_bytes_at(routes_fd, old_bytes)
-    _fsync_directory(routes_path, directory_fd=routes_fd)
+        _fsync_directory(routes_path, directory_fd=routes_fd)
+        if _optional_pointer_snapshot_at(routes_fd) is not None:
+            raise RoutePublicationError("complete route pointer rollback failed")
+        return
+    _replace_pointer_bytes_at(routes_fd, old_pointer[0])
     restored = _optional_pointer_snapshot_at(routes_fd)
-    if (None if restored is None else restored[0]) != old_bytes:
+    if restored is None or restored[0] != old_pointer[0]:
+        raise RoutePublicationError("complete route pointer rollback failed")
+    _fsync_directory(routes_path, directory_fd=routes_fd)
+    if not _pointer_snapshot_is_owned(
+        _optional_pointer_snapshot_at(routes_fd), restored
+    ):
         raise RoutePublicationError("complete route pointer rollback failed")
 
 
@@ -5949,16 +5962,24 @@ def _commit_complete_pointer_at_locked(
     routes_fd: int,
     routes_path: Path,
     pointer_bytes: bytes,
-) -> None:
+    *,
+    commit_state: Optional[Dict[str, Any]] = None,
+) -> Tuple[bytes, os.stat_result]:
     _replace_pointer_bytes_at(routes_fd, pointer_bytes)
     committed = _optional_pointer_snapshot_at(routes_fd)
     if committed is None or committed[0] != pointer_bytes:
         raise RoutePublicationError("complete route pointer commit is uncertain")
+    if commit_state is not None:
+        commit_state["pointer_snapshot"] = committed
     _fsync_directory(routes_path, directory_fd=routes_fd)
     if not _pointer_snapshot_is_owned(
         _optional_pointer_snapshot_at(routes_fd), committed
     ):
         raise RoutePublicationError("complete route pointer commit is uncertain")
+    directory_snapshot = os.fstat(routes_fd)
+    if commit_state is not None:
+        commit_state["directory_snapshot"] = directory_snapshot
+    return committed
 
 
 def _verify_complete_core_lineage(
@@ -6112,6 +6133,8 @@ def publish_complete_route_bundle(
     core_locked = False
     routes_locked = False
     old_pointer: Optional[Tuple[bytes, os.stat_result]] = None
+    committed_pointer: Optional[Tuple[bytes, os.stat_result]] = None
+    commit_state: Dict[str, Any] = {}
     try:
         try:
             fcntl.flock(core_fd, fcntl.LOCK_SH)
@@ -6213,7 +6236,12 @@ def publish_complete_route_bundle(
                 expected_manifest_sha256=bundle["core_manifest_sha256"],
                 expected_pointer_sha256=bundle["core_pointer_sha256"],
             )
-            _commit_complete_pointer_at_locked(routes_fd, routes, pointer_bytes)
+            committed_pointer = _commit_complete_pointer_at_locked(
+                routes_fd,
+                routes,
+                pointer_bytes,
+                commit_state=commit_state,
+            )
             _verify_complete_core_lineage_at_locked(
                 core,
                 core_fd,
@@ -6225,7 +6253,10 @@ def publish_complete_route_bundle(
                 postcommit_validator(pointer)
         except BaseException:
             _restore_pointer_after_failure(
-                routes_fd, routes, old_pointer, pointer_bytes
+                routes_fd,
+                routes,
+                old_pointer,
+                committed_pointer or commit_state.get("pointer_snapshot"),
             )
             raise
         return pointer

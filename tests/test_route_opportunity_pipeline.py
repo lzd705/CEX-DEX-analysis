@@ -2715,6 +2715,30 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
 
         self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
 
+    def test_runner_postcommit_validator_failure_restores_prior_pointer(self):
+        data_dir, _fixture, latest = self._install_public_core()
+        schedule = self._write_schedule()
+        current = opportunity_pipeline.load_latest_route_cohort(
+            data_dir / "routes/core"
+        )
+
+        class RunnerReloadFailure(RuntimeError):
+            pass
+
+        def reject_loaded_bundle(_pointer):
+            raise RunnerReloadFailure("runner rejected cold-loaded bundle")
+
+        with self.assertRaises(RunnerReloadFailure):
+            opportunity_pipeline.finalize_public_cex_research_opportunities(
+                data_dir=data_dir,
+                public_fee_schedule_path=schedule,
+                expected_route_cohort_id=current["cohort"]["route_cohort_id"],
+                expected_core_manifest_sha256=current["manifest_sha256"],
+                _postcommit_validator=reject_loaded_bundle,
+            )
+
+        self.assertEqual(latest.read_bytes(), self.old_pointer_bytes)
+
     def test_cold_reload_failure_never_overwrites_concurrent_pointer(self):
         data_dir, _fixture, latest = self._install_public_core()
         schedule = self._write_schedule()

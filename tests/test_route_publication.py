@@ -1719,6 +1719,99 @@ class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
             pointer,
         )
 
+    def test_postcommit_rollback_never_overwrites_same_bytes_new_inode(self):
+        raw_root = Path(self.temporary.name) / "raw/route-cohort"
+        fixture = _task7_cex_inputs(
+            self.root,
+            raw_root,
+            Path(self.temporary.name) / "typed-sources",
+            Path(self.temporary.name) / "private-profiles",
+        )
+        routes_root = Path(self.temporary.name) / "routes"
+        routes_root.mkdir()
+        pointer_path = routes_root / "latest.json"
+        pointer_path.write_bytes(b'{"schema":"old-complete-pointer"}\n')
+        observed = {}
+
+        def replace_same_bytes_then_fail(_pointer):
+            attempted = pointer_path.read_bytes()
+            replacement = routes_root / ".same-bytes-postcommit"
+            replacement.write_bytes(attempted)
+            os.replace(replacement, pointer_path)
+            observed["bytes"] = attempted
+            observed["inode"] = os.stat(pointer_path).st_ino
+            raise RuntimeError("injected same-byte concurrent writer")
+
+        with self.assertRaisesRegex(Exception, "concurrent|uncertain"):
+            route_publication.publish_complete_route_bundle(
+                core_root=self.root,
+                routes_root=routes_root,
+                raw_root=raw_root,
+                source_root=fixture["source_root"],
+                fee_profile_path=fixture["fee_profile_path"],
+                fee_profile_id=fixture["fee_profile_id"],
+                inventory_profile_path=fixture["inventory_profile_path"],
+                opportunity_inputs=fixture["opportunity_inputs"],
+                postcommit_validator=replace_same_bytes_then_fail,
+            )
+
+        self.assertEqual(pointer_path.read_bytes(), observed["bytes"])
+        self.assertEqual(os.stat(pointer_path).st_ino, observed["inode"])
+
+    def test_fsync_rollback_never_overwrites_same_bytes_new_inode(self):
+        raw_root = Path(self.temporary.name) / "fsync/raw/route-cohort"
+        core_root = Path(self.temporary.name) / "fsync/routes/core"
+        fixture = _task7_cex_inputs(
+            core_root,
+            raw_root,
+            Path(self.temporary.name) / "fsync/typed-sources",
+            Path(self.temporary.name) / "fsync/private-profiles",
+        )
+        routes_root = Path(self.temporary.name) / "fsync/routes-public"
+        routes_root.mkdir(parents=True)
+        pointer_path = routes_root / "latest.json"
+        old_pointer = b'{"schema":"old-complete-pointer"}\n'
+        pointer_path.write_bytes(old_pointer)
+        original_fsync = route_publication._fsync_directory
+        observed = {"injected": False}
+
+        def replace_same_bytes_during_fsync(path, *, directory_fd=None):
+            if (
+                Path(path).resolve() == routes_root.resolve()
+                and pointer_path.read_bytes() != old_pointer
+                and not observed["injected"]
+            ):
+                observed["injected"] = True
+                attempted = pointer_path.read_bytes()
+                replacement = routes_root / ".same-bytes-fsync"
+                replacement.write_bytes(attempted)
+                os.replace(replacement, pointer_path)
+                observed["bytes"] = attempted
+                observed["inode"] = os.stat(pointer_path).st_ino
+                raise OSError("injected complete pointer fsync failure")
+            return original_fsync(path, directory_fd=directory_fd)
+
+        with patch.object(
+            route_publication,
+            "_fsync_directory",
+            side_effect=replace_same_bytes_during_fsync,
+        ):
+            with self.assertRaisesRegex(Exception, "concurrent|uncertain"):
+                route_publication.publish_complete_route_bundle(
+                    core_root=core_root,
+                    routes_root=routes_root,
+                    raw_root=raw_root,
+                    source_root=fixture["source_root"],
+                    fee_profile_path=fixture["fee_profile_path"],
+                    fee_profile_id=fixture["fee_profile_id"],
+                    inventory_profile_path=fixture["inventory_profile_path"],
+                    opportunity_inputs=fixture["opportunity_inputs"],
+                )
+
+        self.assertTrue(observed["injected"])
+        self.assertEqual(pointer_path.read_bytes(), observed["bytes"])
+        self.assertEqual(os.stat(pointer_path).st_ino, observed["inode"])
+
     def test_real_core_pointer_advance_preserves_old_complete_pointer(self):
         raw_root = Path(self.temporary.name) / "raw/route-cohort"
         fixture = _task7_cex_inputs(
@@ -2382,10 +2475,16 @@ class CompleteRouteBundleTests(TemporaryRouteRootTestCase):
         routes_fd = os.open(str(routes_root), os.O_RDONLY)
         try:
             snapshot = route_publication._optional_pointer_snapshot_at(routes_fd)
-            pointer_path.write_bytes(third_party)
+            attempted_path = routes_root / ".attempted-pointer"
+            attempted_path.write_bytes(attempted)
+            os.replace(attempted_path, pointer_path)
+            committed = route_publication._optional_pointer_snapshot_at(routes_fd)
+            third_party_path = routes_root / ".third-party-pointer"
+            third_party_path.write_bytes(third_party)
+            os.replace(third_party_path, pointer_path)
             with self.assertRaisesRegex(ValueError, "concurrent writer"):
                 route_publication._restore_pointer_after_failure(
-                    routes_fd, routes_root, snapshot, attempted
+                    routes_fd, routes_root, snapshot, committed
                 )
             self.assertEqual(pointer_path.read_bytes(), third_party)
         finally:

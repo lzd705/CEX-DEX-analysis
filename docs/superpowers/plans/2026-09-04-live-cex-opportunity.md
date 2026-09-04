@@ -229,6 +229,10 @@ git push origin codex/historical-foundry-opportunity
 - Create: `scripts/run_live_cex_opportunity.py`
 - Create: `tests/test_run_live_cex_opportunity.py`
 - Modify: `scripts/live_cex_research.py`
+- Modify: `scripts/route_opportunity_pipeline.py`
+- Modify: `scripts/route_publication.py`
+- Modify: `tests/test_route_opportunity_pipeline.py`
+- Modify: `tests/test_route_publication.py`
 
 **Interfaces:**
 - Produces: `collect_and_publish_live_cex_research(*, data_dir: Path, public_fee_schedule_path: Path, deadline_seconds: int, wall_clock: Callable[[], datetime]) -> Dict[str, Any]`.
@@ -253,6 +257,12 @@ optional serve_current_dashboard
 
 Assert the finalizer receives the cohort ID and core manifest hash just published, a collector failure never calls it, a reload mismatch never serves, and a failure leaves prior complete-pointer bytes unchanged.
 
+At the executable entrypoint, assert malformed or forbidden arguments return
+`preflight_failed` without echoing raw argument values, while `--help` still
+prints normal help and returns zero. Add complete-pointer rollback cases in
+which a non-cooperating writer installs a new inode with the same bytes both
+during postcommit validation and during the post-replace directory fsync.
+
 - [ ] **Step 2: Run orchestration tests and verify RED**
 
 Run: `python3 -m unittest tests.test_run_live_cex_opportunity -v`
@@ -262,6 +272,19 @@ Expected: FAIL because the runner does not exist.
 - [ ] **Step 3: Implement collection and publication orchestration**
 
 Call `collect_route_cohort()` with the fixed universe, generation reader, raw root, existing CEX collector, `max_workers=4`, `cex_workers_per_venue=2`, and the validated deadline. Require both legs observed and both route timing rows `within_sla` before publishing core. Then pass the returned cohort ID and manifest hash to the public finalizer and cold loader.
+
+Run the runner's exact pointer, ten-row, and non-strict cold-load checks through
+the public finalizer's internal postcommit validator hook. This keeps the
+runner-specific cold reload inside the existing locked, CAS-safe complete
+pointer rollback transaction rather than checking only after the pointer has
+already advanced.
+
+Record the exact complete-pointer bytes and stat identity immediately after
+the atomic replacement and before directory fsync. Rollback may restore the
+prior pointer only while that exact installed snapshot is still owned; a
+same-bytes/new-inode replacement is a concurrent writer and must be preserved.
+After restoring prior bytes, capture the restored snapshot and verify its
+ownership again after fsync.
 
 Return a receipt with exactly:
 
@@ -285,12 +308,17 @@ Do not include paths, raw URLs, exception payloads, or environment values.
 
 Create the data directory if its absolute parent is real and non-symlinked. Resolve the default schedule to the tracked repository file. Print the compact JSON receipt. With `--serve`, set `served=true`, print before entering the blocking server, then call the existing normal dashboard runner. On failure print one stable code among `preflight_failed`, `collection_failed`, `publication_failed`, `reload_failed`, or `serve_failed`, and return 1; return 130 on interruption.
 
+Contain argparse failures inside `main()`: invalid or forbidden arguments print
+only `preflight_failed` and return 1, without raw argv or argparse diagnostics;
+`--help` retains its normal stdout help and zero status.
+
 - [ ] **Step 5: Run orchestration and dashboard regressions and verify GREEN**
 
 Run:
 
 ```bash
 python3 -m unittest \
+  tests.test_route_publication \
   tests.test_run_live_cex_opportunity \
   tests.test_current_opportunity_dashboard \
   tests.test_opportunity_api \
@@ -302,7 +330,7 @@ Expected: PASS; the normal server remains loopback-only with write surfaces disa
 - [ ] **Step 6: Commit and push Task 3**
 
 ```bash
-git add scripts/run_live_cex_opportunity.py scripts/live_cex_research.py tests/test_run_live_cex_opportunity.py
+git add scripts/run_live_cex_opportunity.py scripts/live_cex_research.py scripts/route_opportunity_pipeline.py scripts/route_publication.py tests/test_run_live_cex_opportunity.py tests/test_route_opportunity_pipeline.py tests/test_route_publication.py
 git commit -m "feat(opportunities): add one-command live CEX refresh"
 git push origin codex/historical-foundry-opportunity
 ```

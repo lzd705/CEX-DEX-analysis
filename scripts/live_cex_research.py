@@ -27,10 +27,13 @@ except ModuleNotFoundError:
     from timestamp_contract import exact_rfc3339_epoch_seconds  # type: ignore
 
 
+LIVE_CEX_TOKEN_PAIR = "UNI/USDT"
+LIVE_CEX_VENUES = ("binance", "bybit")
+
 _SELECTION_WINDOW = {"start": "2026-09-04", "end": "2026-09-04"}
-_CEX_MARKETS = (
-    ("binance", "cex:binance:UNI/USDT"),
-    ("bybit", "cex:bybit:UNI/USDT"),
+_CEX_MARKETS = tuple(
+    (venue, "cex:{}:{}".format(venue, LIVE_CEX_TOKEN_PAIR))
+    for venue in LIVE_CEX_VENUES
 )
 _ROUTE_VOLUME_BASIS = "minimum_leg_source_horizon_usd"
 
