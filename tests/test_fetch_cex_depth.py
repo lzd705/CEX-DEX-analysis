@@ -1,8 +1,10 @@
 import csv
 import hashlib
+import http.server
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 import urllib.error
 from decimal import Decimal
@@ -91,6 +93,49 @@ def write_snapshot_rows(path, rows):
 
 
 class FetchCexDepthTest(unittest.TestCase):
+    def test_request_json_does_not_follow_redirects(self):
+        from scripts.fetch_cex_depth import request_json
+
+        class RedirectHandler(http.server.BaseHTTPRequestHandler):
+            target_requests = 0
+
+            def do_GET(self):
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/target")
+                    self.end_headers()
+                    return
+                if self.path == "/target":
+                    type(self).target_requests += 1
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), RedirectHandler
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                request_json(
+                    "http://127.0.0.1:{}/redirect".format(server.server_port),
+                    max_retries=1,
+                )
+            self.assertEqual(raised.exception.code, 302)
+            self.assertEqual(RedirectHandler.target_requests, 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_shared_binance_rules_projection_preserves_exact_filters(self):
         payload = {
             "symbols": [{
@@ -782,7 +827,10 @@ class FetchCexDepthTest(unittest.TestCase):
                 return b"{}"
 
         response = BoundedResponse()
-        with patch("urllib.request.urlopen", return_value=response):
+        with patch(
+            "scripts.fetch_cex_depth.open_public_json_request",
+            return_value=response,
+        ):
             payload, raw = request_json(
                 "https://api.binance.com/api/v3/exchangeInfo?symbol=UNIUSDT",
                 max_bytes=MAX_CEX_TYPED_RULE_RESPONSE_BYTES,
@@ -810,7 +858,10 @@ class FetchCexDepthTest(unittest.TestCase):
             def read(self, size=-1):
                 return b"{" + b" " * (size - 1)
 
-        with patch("urllib.request.urlopen", return_value=OversizedResponse()):
+        with patch(
+            "scripts.fetch_cex_depth.open_public_json_request",
+            return_value=OversizedResponse(),
+        ):
             with self.assertRaisesRegex(ValueError, "response exceeds"):
                 request_json(
                     "https://api.binance.com/api/v3/exchangeInfo?symbol=UNIUSDT",

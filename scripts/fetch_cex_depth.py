@@ -879,11 +879,7 @@ def request_json(
                 if deadline is not None
                 else timeout_seconds
             )
-            with urllib.request.urlopen(
-                request,
-                timeout=timeout,
-                context=TLS_CONTEXT,
-            ) as response:
+            with open_public_json_request(request, timeout=timeout) as response:
                 raw = (
                     response.read()
                     if max_bytes is None
@@ -915,6 +911,22 @@ def request_json(
             else:
                 time.sleep(delay)
     raise RuntimeError(f"Failed after retries: {url}")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+def open_public_json_request(
+    request: urllib.request.Request, *, timeout: float
+) -> Any:
+    """Open one public JSON request without widening its endpoint by redirect."""
+    opener = urllib.request.build_opener(
+        _NoRedirectHandler(),
+        urllib.request.HTTPSHandler(context=TLS_CONTEXT),
+    )
+    return opener.open(request, timeout=timeout)
 
 
 def source_request(exchange: str, cex_symbol: str) -> tuple[str, str, str, bool]:

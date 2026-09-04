@@ -3251,9 +3251,9 @@ class CollectionDeadlineTest(unittest.TestCase):
         )
         raw = json.dumps({"ok": True}).encode("utf-8")
         with patch(
-            "urllib.request.urlopen",
+            "scripts.fetch_cex_depth.open_public_json_request",
             return_value=FakeResponse(raw),
-        ) as urlopen:
+        ) as open_public_json_request:
             payload, returned_raw = request_json(
                 "https://example.test/book",
                 deadline=deadline,
@@ -3263,7 +3263,9 @@ class CollectionDeadlineTest(unittest.TestCase):
 
         self.assertEqual(payload, {"ok": True})
         self.assertEqual(returned_raw, raw)
-        self.assertEqual(urlopen.call_args.kwargs["timeout"], 2.5)
+        self.assertEqual(
+            open_public_json_request.call_args.kwargs["timeout"], 2.5
+        )
 
     def test_retry_sleep_is_clamped_and_exhaustion_raises_stable_exception(self):
         from scripts.collection_deadline import (
@@ -3294,17 +3296,23 @@ class CollectionDeadlineTest(unittest.TestCase):
         from scripts.fetch_cex_depth import request_json
         from scripts.fetch_dex_depth import http_json_rpc
 
-        for request_call in (
-            lambda deadline: request_json(
-                "https://example.test/book",
-                deadline=deadline,
-                max_retries=1,
+        for transport_target, request_call in (
+            (
+                "scripts.fetch_cex_depth.open_public_json_request",
+                lambda deadline: request_json(
+                    "https://example.test/book",
+                    deadline=deadline,
+                    max_retries=1,
+                ),
             ),
-            lambda deadline: http_json_rpc(
-                "https://example.test/rpc",
-                {"jsonrpc": "2.0", "id": 1, "method": "test", "params": []},
-                deadline=deadline,
-                max_retries=1,
+            (
+                "urllib.request.urlopen",
+                lambda deadline: http_json_rpc(
+                    "https://example.test/rpc",
+                    {"jsonrpc": "2.0", "id": 1, "method": "test", "params": []},
+                    deadline=deadline,
+                    max_retries=1,
+                ),
             ),
         ):
             clock = FakeClock()
@@ -3318,7 +3326,7 @@ class CollectionDeadlineTest(unittest.TestCase):
                 clock.now = 2
                 raise urllib.error.URLError("transport timed out")
 
-            with patch("urllib.request.urlopen", side_effect=expire_then_fail):
+            with patch(transport_target, side_effect=expire_then_fail):
                 with self.assertRaisesRegex(
                     CollectionDeadlineExceeded,
                     "^collection deadline exceeded$",
