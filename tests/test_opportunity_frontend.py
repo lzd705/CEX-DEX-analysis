@@ -81,7 +81,7 @@ PAYLOAD_FIXTURE = r"""
 const opportunityPayload = {
   availability: { status: "available", reason: "complete_bundle_published" },
   metadata: {
-    contract_version: "opportunity_dashboard/v1",
+    contract_version: "opportunity_summary/v1",
     route_cohort_id: "cohort:" + "a".repeat(64),
     manifest_sha256: "a".repeat(64),
     publication_status: "published",
@@ -474,6 +474,67 @@ Promise.resolve(applyRouteFromLocation()).then(
 
 
 class OpportunityRendererTest(unittest.TestCase):
+    def test_current_production_payload_accepts_only_canonical_contract(self):
+        result = run_app_javascript(
+            r"""
+const filters = normalizedOpportunityFilters({
+  notionalUsd: "1000", opportunityClass: "all", routeType: "cex_cex",
+  availability: "all", sort: "net_edge_usd", dir: "desc",
+});
+const canonical = {
+  availability: { status: "available", reason: null },
+  metadata: {
+    contract_version: "opportunity_summary/v1",
+    publication_status: "available",
+    checked_at: "2026-09-04T12:07:03+00:00",
+    max_route_age_seconds: 120,
+    max_route_skew_seconds: 60,
+    available_venues: ["binance", "bybit"],
+    available_notionals_usd: ["1000", "5000", "10000", "50000", "100000"],
+    coverage: {
+      route_count: 2, scenario_count: 10, returned_count: 2,
+      class_counts: { research_estimate: 10 },
+      availability_counts: { available: 10 },
+    },
+  },
+  filters: {
+    token: null, venue: null, notional_usd: "1000",
+    opportunity_class: "all", route_type: "cex_cex",
+    availability: "all", sort: "net_edge_usd", direction: "desc",
+  },
+  routes: [
+    {
+      route_id: "route:UNI:bybit-to-binance",
+      opportunity_id: "route:UNI:bybit-to-binance:1000",
+      token_symbol: "UNI", buy_market_id: "cex:bybit:UNI/USDT",
+      sell_market_id: "cex:binance:UNI/USDT", route_type: "cex_cex",
+      requested_notional_usd: "1000", opportunity_class: "research_estimate",
+      availability: { status: "available", reason: null },
+      net_edge_usd: "-3.2266265",
+    },
+    {
+      route_id: "route:UNI:binance-to-bybit",
+      opportunity_id: "route:UNI:binance-to-bybit:1000",
+      token_symbol: "UNI", buy_market_id: "cex:binance:UNI/USDT",
+      sell_market_id: "cex:bybit:UNI/USDT", route_type: "cex_cex",
+      requested_notional_usd: "1000", opportunity_class: "research_estimate",
+      availability: { status: "available", reason: null },
+      net_edge_usd: "-4.19634",
+    },
+  ],
+};
+const obsolete = JSON.parse(JSON.stringify(canonical));
+obsolete.metadata.contract_version = "opportunity_dashboard/v1";
+console.log(JSON.stringify({
+  canonical: opportunityResponseMatchesRequest(canonical, filters),
+  obsolete: opportunityResponseMatchesRequest(obsolete, filters),
+}));
+""",
+        )
+
+        self.assertTrue(result["canonical"])
+        self.assertFalse(result["obsolete"])
+
     def test_current_demo_banner_requires_loopback_fragment_and_exact_metadata(self):
         result = run_app_javascript(
             DOM_FIXTURE
@@ -1267,7 +1328,7 @@ function basePayload() {
   return {
     availability: { status: "available", reason: null },
     metadata: {
-      contract_version: "opportunity_dashboard/v1",
+      contract_version: "opportunity_summary/v1",
       coverage: { returned_count: 2 },
     },
     filters: {

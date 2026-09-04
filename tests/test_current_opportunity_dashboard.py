@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import io
 import os
+from http import HTTPStatus
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +19,157 @@ from scripts.token_registry import TokenRegistry
 
 
 class CurrentOpportunityDashboardTests(unittest.TestCase):
+    def test_health_reports_every_readable_opportunity_state_without_base_data(self):
+        from scripts import run_current_opportunity_dashboard as runner
+
+        handler_factory = getattr(
+            runner, "_current_opportunity_handler", None
+        )
+        self.assertIsNotNone(handler_factory)
+
+        class BaseHandler:
+            def do_GET(self):  # noqa: N802
+                raise AssertionError(
+                    "route-only health delegated to base market health"
+                )
+
+        for route_status, reason in (
+            ("current", None),
+            ("stale", "cohort_stale"),
+            ("unavailable", "snapshot_skew_exceeded"),
+        ):
+            with self.subTest(route_status=route_status):
+                route_health = {
+                    "status": route_status,
+                    "reason": reason,
+                    "route_cohort_id": "cohort:" + "c" * 64,
+                    "manifest_sha256": "d" * 64,
+                    "observed_at": "2026-09-04T12:00:00+00:00",
+                    "age_seconds": 30,
+                    "max_age_seconds": 120,
+                    "max_skew_seconds": 60,
+                    "scenario_count": 10,
+                }
+                dashboard = SimpleNamespace(
+                    MarketMonitorHandler=BaseHandler,
+                    opportunity_publication_health=lambda: route_health,
+                    application_release_sha=lambda: "a" * 40,
+                    static_asset_sha=lambda: "b" * 64,
+                    static_asset_version=lambda: (
+                        "a" * 12 + "-" + "b" * 12
+                    ),
+                )
+                handler_type = handler_factory(dashboard)
+                handler = object.__new__(handler_type)
+                handler.path = "/health?probe=current-opportunity"
+                responses = []
+                handler.send_json = lambda payload, status=HTTPStatus.OK: (
+                    responses.append((status, payload))
+                )
+
+                handler.do_GET()
+
+                self.assertEqual(responses, [(HTTPStatus.OK, {
+                    "status": "ok",
+                    "data_ready": True,
+                    "storage": "route_bundle",
+                    "data_status": route_status,
+                    "route_opportunities": route_health,
+                    "application_sha": "a" * 40,
+                    "asset_sha": "b" * 64,
+                    "asset_version": "a" * 12 + "-" + "b" * 12,
+                })])
+
+    def test_health_fails_closed_for_missing_and_invalid_opportunity_data(self):
+        from scripts import run_current_opportunity_dashboard as runner
+
+        handler_factory = getattr(
+            runner, "_current_opportunity_handler", None
+        )
+        self.assertIsNotNone(handler_factory)
+
+        class BaseHandler:
+            def do_GET(self):  # noqa: N802
+                raise AssertionError(
+                    "route-only health delegated to base market health"
+                )
+
+        for route_status, reason in (
+            ("missing", "complete_pointer_absent"),
+            ("invalid", "opportunity_bundle_validation_failed"),
+        ):
+            with self.subTest(route_status=route_status):
+                route_health = {
+                    "status": route_status,
+                    "reason": reason,
+                    "route_cohort_id": None,
+                    "manifest_sha256": None,
+                    "observed_at": None,
+                    "age_seconds": None,
+                    "max_age_seconds": 120,
+                    "max_skew_seconds": 60,
+                }
+                dashboard = SimpleNamespace(
+                    MarketMonitorHandler=BaseHandler,
+                    opportunity_publication_health=lambda: route_health,
+                    application_release_sha=lambda: "a" * 40,
+                    static_asset_sha=lambda: "b" * 64,
+                    static_asset_version=lambda: (
+                        "a" * 12 + "-" + "b" * 12
+                    ),
+                )
+                handler_type = handler_factory(dashboard)
+                handler = object.__new__(handler_type)
+                handler.path = "/health"
+                responses = []
+                handler.send_json = lambda payload, status=HTTPStatus.OK: (
+                    responses.append((status, payload))
+                )
+
+                handler.do_GET()
+
+                self.assertEqual(responses, [(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {
+                        "status": "degraded",
+                        "data_ready": False,
+                        "storage": "route_bundle",
+                        "data_status": route_status,
+                        "route_opportunities": route_health,
+                        "application_sha": "a" * 40,
+                        "asset_sha": "b" * 64,
+                        "asset_version": "a" * 12 + "-" + "b" * 12,
+                    },
+                )])
+                self.assertNotIn(
+                    "/private/",
+                    json.dumps(responses[0][1], sort_keys=True),
+                )
+
+    def test_opportunity_handler_delegates_non_health_gets(self):
+        from scripts import run_current_opportunity_dashboard as runner
+
+        handler_factory = getattr(
+            runner, "_current_opportunity_handler", None
+        )
+        self.assertIsNotNone(handler_factory)
+
+        class BaseHandler:
+            def do_GET(self):  # noqa: N802
+                self.delegated_path = self.path
+
+        dashboard = SimpleNamespace(MarketMonitorHandler=BaseHandler)
+        handler_type = handler_factory(dashboard)
+        handler = object.__new__(handler_type)
+        handler.path = "/api/markets/opportunities?notional=1000"
+
+        handler.do_GET()
+
+        self.assertEqual(
+            handler.delegated_path,
+            "/api/markets/opportunities?notional=1000",
+        )
+
     def test_fresh_process_isolates_inherited_admin_state_before_import(self):
         project_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as temporary:
@@ -161,6 +313,10 @@ with _isolated_dashboard_environment(data_dir, runtime_root):
                 self.closed = True
 
         clear_runtime_caches = Mock()
+
+        class FakeMarketMonitorHandler:
+            pass
+
         dashboard_server = SimpleNamespace(
             ADMIN_SERVICE=SimpleNamespace(enabled=False),
             PUBLIC_ACTION_POLICY=SimpleNamespace(
@@ -168,7 +324,7 @@ with _isolated_dashboard_environment(data_dir, runtime_root):
                 quality_retry_enabled=False,
                 fact_refresh_enabled=False,
             ),
-            MarketMonitorHandler=object(),
+            MarketMonitorHandler=FakeMarketMonitorHandler,
             ThreadingHTTPServer=FakeHttpServer,
             clear_runtime_caches=clear_runtime_caches,
             write_surface_enabled=lambda: False,
@@ -193,7 +349,14 @@ with _isolated_dashboard_environment(data_dir, runtime_root):
         self.assertEqual(len(server_instances), 1)
         instance = server_instances[0]
         self.assertEqual(instance.address, ("127.0.0.1", 43210))
-        self.assertIs(instance.handler, dashboard_server.MarketMonitorHandler)
+        self.assertTrue(issubclass(
+            instance.handler,
+            dashboard_server.MarketMonitorHandler,
+        ))
+        self.assertIsNot(
+            instance.handler,
+            dashboard_server.MarketMonitorHandler,
+        )
         self.assertFalse(instance.daemon_threads)
         self.assertTrue(instance.served)
         self.assertTrue(instance.closed)

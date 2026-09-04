@@ -2541,7 +2541,7 @@ function currentOpportunityResponseContractMatches(payload) {
   );
   if (claimsDemoContract) return isCurrentOpportunityDemoPayload(payload);
   return (
-    metadata?.contract_version === "opportunity_dashboard/v1"
+    metadata?.contract_version === "opportunity_summary/v1"
     && metadata?.demo_fixture !== true
   );
 }

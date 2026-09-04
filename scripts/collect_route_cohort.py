@@ -3660,6 +3660,8 @@ def _final_route_leg_projection(
     if market_type == "cex" and row.get("status") in {
         "observed", "partial"
     }:
+        if row.get("status") == "observed" and "available" not in row:
+            row["available"] = True
         state_observed_at = row.get("state_observed_at")
         if state_observed_at not in (None, ""):
             row["state_observed_at"] = _canonical_utc(

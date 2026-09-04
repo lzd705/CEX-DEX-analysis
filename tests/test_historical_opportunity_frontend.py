@@ -268,12 +268,17 @@ class HistoricalOpportunityShellTests(unittest.TestCase):
             self.assertIn(attribute, page)
 
     def test_historical_route_identity_wraps_before_hiding_value_columns(self):
+        page = INDEX_PATH.read_text(encoding="utf-8")
         styles = STYLES_PATH.read_text(encoding="utf-8")
         route_rule = re.search(
-            r"\.historical-opportunity-table td:nth-child\(2\)\s*\{([^}]+)\}",
+            r"\.opportunity-table td:nth-child\(2\)\s*\{([^}]+)\}",
             styles,
         )
 
+        self.assertIn(
+            'class="opportunity-table historical-opportunity-table"',
+            page,
+        )
         self.assertIsNotNone(route_rule)
         self.assertIn("max-width:", route_rule.group(1))
         self.assertIn("white-space: normal", route_rule.group(1))

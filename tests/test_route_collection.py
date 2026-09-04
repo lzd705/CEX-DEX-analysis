@@ -1173,6 +1173,7 @@ class TypedSourceProducerTests(unittest.TestCase):
                     "market_id": market_id,
                     "market_type": "cex",
                     "status": "observed",
+                    "available": True,
                     "state_observed_at": "2026-08-02T12:00:00Z",
                     "raw_response_sha256": hashlib.sha256(raw).hexdigest(),
                     "source_quote_asset": "USDT",
@@ -1238,6 +1239,7 @@ class TypedSourceProducerTests(unittest.TestCase):
                     "market_id": market_id,
                     "market_type": "cex",
                     "status": "observed",
+                    "available": True,
                     "state_observed_at": "2026-08-02T12:00:00Z",
                     "raw_response_sha256": hashlib.sha256(raw).hexdigest(),
                     "source_quote_asset": "USDT",
@@ -1376,6 +1378,7 @@ class TypedSourceProducerTests(unittest.TestCase):
                     "market_id": market_id,
                     "market_type": "cex",
                     "status": "observed",
+                    "available": True,
                     "state_observed_at": "2026-08-02T12:00:00Z",
                     "raw_response_sha256": hashlib.sha256(raw).hexdigest(),
                 }],
@@ -3352,6 +3355,47 @@ class CexRouteStateTimestampProjectionTests(unittest.TestCase):
                     "2026-08-01T12:00:02+00:00",
                 )
 
+    def test_real_observed_cex_depth_defaults_route_availability_to_true(self):
+        market_id = "cex:binance:UNI/USDT"
+        collector_row = _public_cex_depth_row()
+
+        projected = _final_route_leg_projection(
+            {"market_id": market_id, "market_type": "cex"},
+            collector_row,
+            market_id=market_id,
+        )
+
+        self.assertNotIn("available", collector_row)
+        self.assertIs(projected["available"], True)
+
+    def test_explicit_false_cex_availability_is_not_promoted(self):
+        market_id = "cex:binance:UNI/USDT"
+        collector_row = _public_cex_depth_row()
+        collector_row["available"] = False
+
+        projected = _final_route_leg_projection(
+            {"market_id": market_id, "market_type": "cex"},
+            collector_row,
+            market_id=market_id,
+        )
+
+        self.assertIs(projected["available"], False)
+
+    def test_non_observed_cex_rows_do_not_promote_route_availability(self):
+        market_id = "cex:binance:UNI/USDT"
+        for status in ("partial", "failed", "deadline_exceeded"):
+            with self.subTest(status=status):
+                collector_row = _public_cex_depth_row()
+                collector_row["status"] = status
+
+                projected = _final_route_leg_projection(
+                    {"market_id": market_id, "market_type": "cex"},
+                    collector_row,
+                    market_id=market_id,
+                )
+
+                self.assertIsNot(projected.get("available"), True)
+
     def test_terminal_cex_rows_do_not_promote_book_timestamp(self):
         market_id = "cex:binance:UNI/USDT"
         for status in ("failed", "unavailable"):
@@ -3631,6 +3675,21 @@ class CexRouteStateTimestampProjectionTests(unittest.TestCase):
 
         self.assertEqual(loaded["pointer"], pointer)
         self.assertEqual(len(loaded["bundle"]["opportunities"]), 10)
+        covered = [
+            row for row in loaded["bundle"]["opportunities"]
+            if row["requested_notional_usd"] == "1000"
+        ]
+        self.assertEqual(len(covered), 2)
+        for row in covered:
+            self.assertEqual(row["opportunity_class"], "research_estimate")
+            for field in (
+                "gross_buy_cost_usd",
+                "gross_sell_proceeds_usd",
+                "gross_edge_usd",
+                "research_net_edge_usd",
+                "research_net_edge_bps",
+            ):
+                self.assertIsNotNone(row[field])
         self.assertTrue(all(
             row["strict_eligible"] is False
             for row in loaded["bundle"]["opportunities"]

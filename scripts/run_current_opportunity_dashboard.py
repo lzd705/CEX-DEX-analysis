@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from http import HTTPStatus
 import importlib
 import json
 import os
@@ -12,6 +13,7 @@ from pathlib import Path
 import sys
 import tempfile
 from typing import Iterator, Optional, Sequence, TextIO
+from urllib.parse import urlparse
 
 
 if __package__ in {None, ""}:  # pragma: no cover - direct script bootstrap
@@ -23,6 +25,9 @@ if __package__ in {None, ""}:  # pragma: no cover - direct script bootstrap
 CURRENT_DASHBOARD_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 CURRENT_OPPORTUNITY_PATH = "/opportunities"
+READABLE_OPPORTUNITY_HEALTH_STATUSES = frozenset({
+    "current", "stale", "unavailable",
+})
 WRITE_SURFACE_ENVIRONMENT_FLAGS = (
     "ADMIN_ENABLED",
     "PUBLIC_ADD_TOKEN_ENABLED",
@@ -69,6 +74,47 @@ def _load_dashboard_server():
             "dashboard import"
         )
     return importlib.import_module("dashboard.server")
+
+
+def _current_opportunity_handler(dashboard_server: object):
+    """Use route-publication health for the route-only dashboard."""
+
+    class CurrentOpportunityHandler(
+        dashboard_server.MarketMonitorHandler
+    ):
+        def do_GET(self) -> None:  # noqa: N802
+            if urlparse(self.path).path != "/health":
+                super().do_GET()
+                return
+
+            route_health = dashboard_server.opportunity_publication_health()
+            route_status = route_health.get("status")
+            data_ready = (
+                route_status in READABLE_OPPORTUNITY_HEALTH_STATUSES
+            )
+            self.send_json(
+                {
+                    "status": "ok" if data_ready else "degraded",
+                    "data_ready": data_ready,
+                    "storage": "route_bundle",
+                    "data_status": route_status,
+                    "route_opportunities": route_health,
+                    "application_sha": (
+                        dashboard_server.application_release_sha()
+                    ),
+                    "asset_sha": dashboard_server.static_asset_sha(),
+                    "asset_version": (
+                        dashboard_server.static_asset_version()
+                    ),
+                },
+                (
+                    HTTPStatus.OK
+                    if data_ready
+                    else HTTPStatus.SERVICE_UNAVAILABLE
+                ),
+            )
+
+    return CurrentOpportunityHandler
 
 
 @contextmanager
@@ -181,9 +227,10 @@ def serve_current_dashboard(
             http_server = None
             try:
                 dashboard_server.clear_runtime_caches()
+                handler = _current_opportunity_handler(dashboard_server)
                 http_server = dashboard_server.ThreadingHTTPServer(
                     (CURRENT_DASHBOARD_HOST, port),
-                    dashboard_server.MarketMonitorHandler,
+                    handler,
                 )
                 http_server.daemon_threads = False
                 bound_port = int(http_server.server_address[1])
