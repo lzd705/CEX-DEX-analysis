@@ -150,10 +150,10 @@ class PublicFeeSemanticsTests(unittest.TestCase):
 
 
 class LiveCexResearchUniverseTests(unittest.TestCase):
-    def test_fixed_uni_usdt_universe_is_complete_and_reproducible(self):
+    def test_fixed_uni_and_cake_universe_is_complete_and_reproducible(self):
         universe = build_live_cex_research_universe()
         generation = (
-            "9b742170b0c0af598adc16528523e306758a7a35d3f84e419e7e8aeb4dc2a3ce"
+            "2b473d16979914513eb60843c0c3574141b01ba0f0d193628aa54d62c101bb9b"
         )
 
         self.assertEqual(universe["schema"], "route_universe/v1")
@@ -166,11 +166,17 @@ class LiveCexResearchUniverseTests(unittest.TestCase):
             [
                 "cex:binance:UNI/USDT",
                 "cex:bybit:UNI/USDT",
+                "cex:binance:CAKE/USDT",
+                "cex:bybit:CAKE/USDT",
             ],
         )
         self.assertEqual(
             [route["route_id"] for route in universe["routes"]],
             [
+                "route:CAKE:cex:binance:CAKE/USDT->cex:bybit:CAKE/USDT:"
+                "prepositioned_inventory",
+                "route:CAKE:cex:bybit:CAKE/USDT->cex:binance:CAKE/USDT:"
+                "prepositioned_inventory",
                 "route:UNI:cex:binance:UNI/USDT->cex:bybit:UNI/USDT:"
                 "prepositioned_inventory",
                 "route:UNI:cex:bybit:UNI/USDT->cex:binance:UNI/USDT:"
@@ -186,6 +192,10 @@ class LiveCexResearchUniverseTests(unittest.TestCase):
             for leg in universe["selected_legs"]
         ))
         for route in universe["routes"]:
+            self.assertEqual(
+                route["buy_market_id"].split(":", 2)[2],
+                route["sell_market_id"].split(":", 2)[2],
+            )
             self.assertEqual(route["candidate_source_generation"], generation)
             self.assertEqual(
                 route["requested_notionals_usd"],

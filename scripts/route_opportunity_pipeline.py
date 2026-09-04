@@ -2139,10 +2139,10 @@ def finalize_public_cex_research_opportunities(
             "public research finalization is CEX-only"
         )
     fixed_universe = build_live_cex_research_universe()
-    expected_leg_ids = {
-        leg["market_id"] for leg in fixed_universe["selected_legs"]
+    expected_leg_tokens = {
+        leg["market_id"]: leg["token_symbol"]
+        for leg in fixed_universe["selected_legs"]
     }
-    actual_leg_ids = set(leg_types)
     actual_leg_tokens = {
         leg.get("market_id"): leg.get("token_symbol")
         for leg in legs if isinstance(leg, dict)
@@ -2156,11 +2156,10 @@ def finalize_public_cex_research_opportunities(
         or cohort.get("requested_notionals_usd")
         != fixed_universe["requested_notionals_usd"]
         or routes != fixed_universe["routes"]
-        or actual_leg_ids != expected_leg_ids
-        or set(actual_leg_tokens.values()) != {"UNI"}
+        or actual_leg_tokens != expected_leg_tokens
     ):
         raise RouteOpportunityPipelineError(
-            "current public CEX core is outside the fixed UNI/USDT "
+            "current public CEX core is outside the fixed UNI+CAKE "
             "Binance/Bybit research universe"
         )
 

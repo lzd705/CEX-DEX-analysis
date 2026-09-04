@@ -25,7 +25,10 @@ from scripts.route_cost_evidence import (
     physical_sha256,
     typed_sha256,
 )
-from scripts.cex_fee_facts import PUBLIC_FEE_SCHEDULE_COLUMNS
+from scripts.cex_fee_facts import (
+    PUBLIC_FEE_SCHEDULE_COLUMNS,
+    collect_cex_fee_snapshot,
+)
 from scripts.collect_route_cohort import _attachment_authority_bytes
 from scripts.live_cex_research import build_live_cex_research_universe
 from scripts.route_cohort import canonical_route_id
@@ -2244,9 +2247,11 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
         }
         fixed_legs = []
         manifest_members = []
+        expected_typed_filenames = set()
         for selected in universe["selected_legs"]:
             venue = selected["exchange"]
             market_id = selected["market_id"]
+            token_symbol = selected["token_symbol"]
             old_leg = old_legs[venue]
             old_market_id = old_leg["market_id"]
             old_response = (
@@ -2254,7 +2259,9 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
                 / hashlib.sha256(old_market_id.encode("utf-8")).hexdigest()
                 / "response.json"
             ).read_bytes()
-            response = old_response.replace(b"AAVEUSDT", b"UNIUSDT")
+            response = old_response.replace(
+                b"AAVEUSDT", (token_symbol + "USDT").encode("ascii")
+            )
             accepted = (
                 raw_root / run_id / "accepted"
                 / hashlib.sha256(market_id.encode("utf-8")).hexdigest()
@@ -2266,7 +2273,7 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
             leg.update({
                 "leg_id": market_id,
                 "market_id": market_id,
-                "token_symbol": "UNI",
+                "token_symbol": token_symbol,
                 "execution_adapter_status": selected[
                     "execution_adapter_status"
                 ],
@@ -2283,18 +2290,22 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
             for old_member in old_leg["typed_source_lineage"]["members"]:
                 member = copy.deepcopy(old_member)
                 filename = member["filename"]
+                member["filename"] = "{}-{}".format(
+                    token_symbol.lower(), filename
+                )
+                expected_typed_filenames.add(member["filename"])
                 payload = json.loads(
                     (typed_root / filename).read_text(encoding="utf-8")
                 )
                 if member["role"] == "cex_market_rules":
                     payload["market_id"] = market_id
-                    payload["base_asset"] = "UNI"
+                    payload["base_asset"] = token_symbol
                 elif member["role"] == "cex_raw_book_response":
                     result = payload.get("result")
                     if isinstance(result, dict) and result.get("s") == "AAVEUSDT":
-                        result["s"] = "UNIUSDT"
+                        result["s"] = token_symbol + "USDT"
                 payload_bytes = _shadow_json_bytes(payload)
-                (typed_root / filename).write_bytes(payload_bytes)
+                (typed_root / member["filename"]).write_bytes(payload_bytes)
                 digest = hashlib.sha256(payload_bytes).hexdigest()
                 member.update({
                     "sha256": digest,
@@ -2319,6 +2330,9 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
             }
             fixed_legs.append(leg)
 
+        for member_path in typed_root.iterdir():
+            if member_path.name not in expected_typed_filenames:
+                member_path.unlink()
         manifest_members.sort(key=lambda row: (row["market_id"], row["role"]))
         (raw_root / run_id / "typed-manifest.json").write_bytes(
             _shadow_json_bytes({
@@ -2410,6 +2424,12 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
             rows = [
                 self._schedule_row("binance", "10"),
                 self._schedule_row("bybit", "8"),
+                self._schedule_row(
+                    "binance", "10", instrument_pattern="CAKE/USDT"
+                ),
+                self._schedule_row(
+                    "bybit", "8", instrument_pattern="CAKE/USDT"
+                ),
             ]
         with schedule.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(
@@ -2554,7 +2574,7 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
         )
         self.assertEqual(pointer, loaded["pointer"])
         opportunities = loaded["bundle"]["opportunities"]
-        self.assertEqual(len(opportunities), 10)
+        self.assertEqual(len(opportunities), 20)
         self.assertEqual(
             {row["requested_notional_usd"] for row in opportunities},
             {"1000", "5000", "10000", "50000", "100000"},
@@ -2567,7 +2587,7 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
             self.assertIs(row["mode_evidence_eligible"], False)
             self.assertIsNone(row["inventory_profile_hash"])
 
-        self.assertEqual(len(captured["inputs"]), 10)
+        self.assertEqual(len(captured["inputs"]), 20)
         for item in captured["inputs"]:
             build = item["build_inputs"]
             target = build["common_target"].quantity
@@ -2620,6 +2640,9 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
         data_dir, _fixture, _latest = self._install_public_core()
         schedule = self._write_schedule([
             self._schedule_row("binance", "10"),
+            self._schedule_row(
+                "binance", "10", instrument_pattern="CAKE/USDT"
+            ),
         ])
         self._finalize_public(data_dir, schedule)
         bundle = load_latest_complete_route_bundle(
@@ -2631,7 +2654,7 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
             if row["market_id"].startswith("cex:bybit:")
             and row["component_type"] == "venue_taker_fee"
         ]
-        self.assertEqual(len(missing), 10)
+        self.assertEqual(len(missing), 20)
         self.assertTrue(all(
             row["value_status"] == "unavailable"
             and row["rate_bps"] is None
@@ -2644,6 +2667,32 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
             and row["publication_attestation_sha256"] is None
             for row in bundle["opportunities"]
         ))
+
+    def test_repository_schedule_leaves_cake_fee_economics_unavailable(self):
+        schedule = (
+            Path(__file__).resolve().parents[1]
+            / "config/cex_public_fee_schedules.csv"
+        )
+        component = collect_cex_fee_snapshot(
+            cohort_id="cohort:" + "c" * 64,
+            opportunity_id="opportunity:" + "d" * 64,
+            leg="buy",
+            market_id="cex:binance:CAKE/USDT",
+            venue="binance",
+            instrument="CAKE/USDT",
+            side="buy",
+            requested_notional_usd="1000",
+            target_token_quantity="10",
+            now="2026-09-04T12:00:00Z",
+            allow_public_estimate=True,
+            public_schedule_path=schedule,
+        )
+        self.assertEqual(component["value_status"], "unavailable")
+        self.assertEqual(
+            component["reason_code"], "cex_fee_public_bound_unavailable"
+        )
+        self.assertIsNone(component["rate_bps"])
+        self.assertIsNone(component["amount_usd"])
 
     def test_stale_public_schedule_preserves_prior_pointer(self):
         schedule = self._write_schedule([
@@ -3009,7 +3058,7 @@ class PublicCexResearchFinalizerTests(unittest.TestCase):
             if row["market_id"].startswith("cex:binance:")
             and row["component_type"] == "venue_taker_fee"
         ]
-        self.assertEqual(len(binance_fees), 10)
+        self.assertEqual(len(binance_fees), 20)
         self.assertEqual({row["rate_bps"] for row in binance_fees}, {"10"})
 
     def test_same_bytes_fee_schedule_inode_swap_preserves_prior_pointer(self):

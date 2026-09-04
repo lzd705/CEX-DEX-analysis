@@ -1,4 +1,4 @@
-"""Fixed, pure inputs for the public UNI/USDT CEX research workflow."""
+"""Fixed, pure inputs for the public UNI+CAKE CEX research workflow."""
 
 from __future__ import annotations
 
@@ -27,12 +27,16 @@ except ModuleNotFoundError:
     from timestamp_contract import exact_rfc3339_epoch_seconds  # type: ignore
 
 
-LIVE_CEX_TOKEN_PAIR = "UNI/USDT"
+LIVE_CEX_RESEARCH_PAIRS = (
+    ("UNI", "UNI/USDT"),
+    ("CAKE", "CAKE/USDT"),
+)
 LIVE_CEX_VENUES = ("binance", "bybit")
 
 _SELECTION_WINDOW = {"start": "2026-09-04", "end": "2026-09-04"}
 _CEX_MARKETS = tuple(
-    (venue, "cex:{}:{}".format(venue, LIVE_CEX_TOKEN_PAIR))
+    (token_symbol, token_pair, venue, "cex:{}:{}".format(venue, token_pair))
+    for token_symbol, token_pair in LIVE_CEX_RESEARCH_PAIRS
     for venue in LIVE_CEX_VENUES
 )
 _ROUTE_VOLUME_BASIS = "minimum_leg_source_horizon_usd"
@@ -126,13 +130,15 @@ def public_fee_semantics(
 
 def _fixed_universe_contract() -> Dict[str, Any]:
     selected_legs = []
-    for rank, (exchange, market_id) in enumerate(_CEX_MARKETS, start=1):
+    for rank, (token_symbol, token_pair, exchange, market_id) in enumerate(
+        _CEX_MARKETS, start=1
+    ):
         selected_legs.append({
             "market_id": market_id,
             "market_type": "cex",
             "exchange": exchange,
-            "cex_symbol": "UNI/USDT",
-            "token_symbol": "UNI",
+            "cex_symbol": token_pair,
+            "token_symbol": token_symbol,
             "selection_inputs": {
                 "execution_capability": "supported",
                 "proved_execution_capacity_usd": None,
@@ -147,12 +153,19 @@ def _fixed_universe_contract() -> Dict[str, Any]:
         })
 
     routes = []
-    for _buy_exchange, buy_market_id in _CEX_MARKETS:
-        for _sell_exchange, sell_market_id in _CEX_MARKETS:
+    for token_symbol, _token_pair, _buy_exchange, buy_market_id in _CEX_MARKETS:
+        for (
+            sell_token_symbol,
+            _sell_token_pair,
+            _sell_exchange,
+            sell_market_id,
+        ) in _CEX_MARKETS:
             if buy_market_id == sell_market_id:
                 continue
+            if sell_token_symbol != token_symbol:
+                continue
             identity = {
-                "token_symbol": "UNI",
+                "token_symbol": token_symbol,
                 "buy_market_id": buy_market_id,
                 "sell_market_id": sell_market_id,
                 "route_mode": "prepositioned_inventory",
@@ -186,7 +199,7 @@ def live_cex_research_generation() -> str:
 
 
 def build_live_cex_research_universe() -> Dict[str, Any]:
-    """Build the fixed Binance/Bybit UNI/USDT point-in-time universe."""
+    """Build the fixed Binance/Bybit UNI+CAKE point-in-time universe."""
     generation = live_cex_research_generation()
     universe = _fixed_universe_contract()
     universe["candidate_source_generation"] = generation

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect and publish the fixed public UNI/USDT CEX research workflow."""
+"""Collect and publish the fixed public UNI+CAKE CEX research workflow."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ try:
     )
     from scripts.fetch_cex_depth import collect_cex_market_observation
     from scripts.live_cex_research import (
-        LIVE_CEX_TOKEN_PAIR,
+        LIVE_CEX_RESEARCH_PAIRS,
         LIVE_CEX_VENUES,
         build_live_cex_research_universe,
         live_cex_research_generation,
@@ -51,7 +51,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
     )
     from fetch_cex_depth import collect_cex_market_observation  # type: ignore
     from live_cex_research import (  # type: ignore
-        LIVE_CEX_TOKEN_PAIR,
+        LIVE_CEX_RESEARCH_PAIRS,
         LIVE_CEX_VENUES,
         build_live_cex_research_universe,
         live_cex_research_generation,
@@ -72,10 +72,6 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _REPOSITORY_SCHEDULE = Path("config/cex_public_fee_schedules.csv")
 DEFAULT_PUBLIC_FEE_SCHEDULE = _PROJECT_ROOT / _REPOSITORY_SCHEDULE
-_EXPECTED_MARKET_IDS = frozenset(
-    "cex:{}:{}".format(venue, LIVE_CEX_TOKEN_PAIR)
-    for venue in LIVE_CEX_VENUES
-)
 _COHORT_ID = re.compile(r"cohort:[0-9a-f]{64}\Z", re.ASCII)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _FAILURE_CODES = frozenset({
@@ -251,23 +247,32 @@ def _prepare_schedule_path(path: Path) -> Path:
 def _collection_is_publishable(
     cohort: Mapping[str, Any],
     *,
+    expected_market_ids: Sequence[str],
     expected_route_ids: Sequence[str],
 ) -> bool:
     legs = cohort.get("legs")
     timing = cohort.get("route_rows")
-    if not isinstance(legs, list) or len(legs) != 2:
+    if (
+        not isinstance(legs, list)
+        or len(legs) != len(expected_market_ids)
+        or len(set(expected_market_ids)) != len(expected_market_ids)
+    ):
         return False
-    if not isinstance(timing, list) or len(timing) != 2:
+    if (
+        not isinstance(timing, list)
+        or len(timing) != len(expected_route_ids)
+        or len(set(expected_route_ids)) != len(expected_route_ids)
+    ):
         return False
     if any(not isinstance(row, Mapping) for row in legs + timing):
         return False
     leg_ids = [row.get("market_id") for row in legs]
     route_ids = [row.get("route_id") for row in timing]
     return (
-        len(set(leg_ids)) == 2
-        and set(leg_ids) == _EXPECTED_MARKET_IDS
+        len(set(leg_ids)) == len(expected_market_ids)
+        and set(leg_ids) == set(expected_market_ids)
         and all(row.get("status") == "observed" for row in legs)
-        and len(set(route_ids)) == 2
+        and len(set(route_ids)) == len(expected_route_ids)
         and set(route_ids) == set(expected_route_ids)
         and all(row.get("timing_status") == "within_sla" for row in timing)
     )
@@ -308,10 +313,26 @@ def collect_and_publish_live_cex_research(
             or universe.get("candidate_source_generation") != generation
         ):
             raise ValueError("fixed generation differs")
+        selected_legs = universe.get("selected_legs")
         routes = universe.get("routes")
-        if not isinstance(routes, list) or len(routes) != 2:
+        notionals = universe.get("requested_notionals_usd")
+        if (
+            not isinstance(selected_legs, list)
+            or not isinstance(routes, list)
+            or not isinstance(notionals, list)
+        ):
             raise ValueError("fixed route inventory differs")
-        expected_route_ids = [route["route_id"] for route in routes]
+        expected_market_ids = [leg.get("market_id") for leg in selected_legs]
+        expected_route_ids = [route.get("route_id") for route in routes]
+        if (
+            not all(isinstance(market_id, str) for market_id in expected_market_ids)
+            or not all(isinstance(route_id, str) for route_id in expected_route_ids)
+            or len(set(expected_market_ids)) != len(expected_market_ids)
+            or len(set(expected_route_ids)) != len(expected_route_ids)
+            or not notionals
+        ):
+            raise ValueError("fixed route inventory differs")
+        expected_opportunity_count = len(expected_route_ids) * len(notionals)
         cohort = collect_route_cohort(
             universe,
             cex_collector=collect_cex_market_observation,
@@ -327,6 +348,7 @@ def collect_and_publish_live_cex_research(
             not isinstance(cohort, Mapping)
             or not _collection_is_publishable(
                 cohort,
+                expected_market_ids=expected_market_ids,
                 expected_route_ids=expected_route_ids,
             )
         ):
@@ -339,6 +361,7 @@ def collect_and_publish_live_cex_research(
             not isinstance(cohort, Mapping)
             or not _collection_is_publishable(
                 cohort,
+                expected_market_ids=expected_market_ids,
                 expected_route_ids=expected_route_ids,
             )
         ):
@@ -384,7 +407,7 @@ def collect_and_publish_live_cex_research(
                 if (
                     loaded.get("pointer") != committed_pointer
                     or not isinstance(opportunities, list)
-                    or len(opportunities) != 10
+                    or len(opportunities) != expected_opportunity_count
                     or any(
                         not isinstance(row, Mapping)
                         or row.get("strict_eligible") is not False
@@ -427,13 +450,15 @@ def collect_and_publish_live_cex_research(
         ) from error
 
     return {
-        "schema": "live_cex_opportunity_refresh/v1",
+        "schema": "live_cex_opportunity_refresh/v2",
         "status": "published",
-        "token_pair": LIVE_CEX_TOKEN_PAIR,
+        "token_pairs": [pair for _token, pair in LIVE_CEX_RESEARCH_PAIRS],
         "venues": list(LIVE_CEX_VENUES),
+        "market_count": len(expected_market_ids),
+        "route_count": len(expected_route_ids),
         "route_cohort_id": pointer["route_cohort_id"],
         "manifest_sha256": pointer["manifest_sha256"],
-        "opportunity_count": 10,
+        "opportunity_count": expected_opportunity_count,
         "strict_eligible_count": 0,
         "served": False,
     }

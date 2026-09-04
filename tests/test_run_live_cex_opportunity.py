@@ -23,6 +23,10 @@ ROUTE_IDS = (
     "prepositioned_inventory",
     "route:UNI:cex:bybit:UNI/USDT->cex:binance:UNI/USDT:"
     "prepositioned_inventory",
+    "route:CAKE:cex:binance:CAKE/USDT->cex:bybit:CAKE/USDT:"
+    "prepositioned_inventory",
+    "route:CAKE:cex:bybit:CAKE/USDT->cex:binance:CAKE/USDT:"
+    "prepositioned_inventory",
 )
 
 
@@ -38,6 +42,14 @@ def _cohort(*, second_status="observed", second_timing="within_sla"):
                 "market_id": "cex:bybit:UNI/USDT",
                 "status": second_status,
             },
+            {
+                "market_id": "cex:binance:CAKE/USDT",
+                "status": "observed",
+            },
+            {
+                "market_id": "cex:bybit:CAKE/USDT",
+                "status": "observed",
+            },
         ],
         "route_rows": [
             {
@@ -47,6 +59,14 @@ def _cohort(*, second_status="observed", second_timing="within_sla"):
             {
                 "route_id": ROUTE_IDS[1],
                 "timing_status": second_timing,
+            },
+            {
+                "route_id": ROUTE_IDS[2],
+                "timing_status": "within_sla",
+            },
+            {
+                "route_id": ROUTE_IDS[3],
+                "timing_status": "within_sla",
             },
         ],
     }
@@ -59,7 +79,7 @@ def _complete_pointer():
     }
 
 
-def _loaded_bundle(*, pointer=None, count=10, strict=False):
+def _loaded_bundle(*, pointer=None, count=20, strict=False):
     return {
         "pointer": dict(pointer or _complete_pointer()),
         "bundle": {
@@ -258,13 +278,15 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
             "load_latest_complete_route_bundle",
         ])
         self.assertEqual(receipt, {
-            "schema": "live_cex_opportunity_refresh/v1",
+            "schema": "live_cex_opportunity_refresh/v2",
             "status": "published",
-            "token_pair": "UNI/USDT",
+            "token_pairs": ["UNI/USDT", "CAKE/USDT"],
             "venues": ["binance", "bybit"],
+            "market_count": 4,
+            "route_count": 4,
             "route_cohort_id": COHORT_ID,
             "manifest_sha256": COMPLETE_MANIFEST_SHA256,
-            "opportunity_count": 10,
+            "opportunity_count": 20,
             "strict_eligible_count": 0,
             "served": False,
         })
@@ -436,7 +458,7 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
                 "route_cohort_id": COHORT_ID,
                 "manifest_sha256": "d" * 64,
             }),
-            _loaded_bundle(count=9),
+            _loaded_bundle(count=19),
             _loaded_bundle(strict=True),
         )
         for loaded in bad_loaded:
@@ -519,13 +541,15 @@ class LiveCexOpportunityMainTests(unittest.TestCase):
 
     def test_main_creates_data_dir_and_prints_compact_receipt(self):
         receipt = {
-            "schema": "live_cex_opportunity_refresh/v1",
+            "schema": "live_cex_opportunity_refresh/v2",
             "status": "published",
-            "token_pair": "UNI/USDT",
+            "token_pairs": ["UNI/USDT", "CAKE/USDT"],
             "venues": ["binance", "bybit"],
+            "market_count": 4,
+            "route_count": 4,
             "route_cohort_id": COHORT_ID,
             "manifest_sha256": COMPLETE_MANIFEST_SHA256,
-            "opportunity_count": 10,
+            "opportunity_count": 20,
             "strict_eligible_count": 0,
             "served": False,
         }
@@ -550,13 +574,15 @@ class LiveCexOpportunityMainTests(unittest.TestCase):
 
     def test_main_prints_before_loopback_server_and_serves_only_after_success(self):
         receipt = {
-            "schema": "live_cex_opportunity_refresh/v1",
+            "schema": "live_cex_opportunity_refresh/v2",
             "status": "published",
-            "token_pair": "UNI/USDT",
+            "token_pairs": ["UNI/USDT", "CAKE/USDT"],
             "venues": ["binance", "bybit"],
+            "market_count": 4,
+            "route_count": 4,
             "route_cohort_id": COHORT_ID,
             "manifest_sha256": COMPLETE_MANIFEST_SHA256,
-            "opportunity_count": 10,
+            "opportunity_count": 20,
             "strict_eligible_count": 0,
             "served": False,
         }
@@ -694,13 +720,15 @@ class LiveCexOpportunityMainTests(unittest.TestCase):
 
     def test_serve_failure_uses_stable_code_without_payload(self):
         receipt = {
-            "schema": "live_cex_opportunity_refresh/v1",
+            "schema": "live_cex_opportunity_refresh/v2",
             "status": "published",
-            "token_pair": "UNI/USDT",
+            "token_pairs": ["UNI/USDT", "CAKE/USDT"],
             "venues": ["binance", "bybit"],
+            "market_count": 4,
+            "route_count": 4,
             "route_cohort_id": COHORT_ID,
             "manifest_sha256": COMPLETE_MANIFEST_SHA256,
-            "opportunity_count": 10,
+            "opportunity_count": 20,
             "strict_eligible_count": 0,
             "served": False,
         }
