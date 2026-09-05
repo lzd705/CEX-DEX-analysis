@@ -398,6 +398,65 @@ with _isolated_dashboard_environment(data_dir, runtime_root):
             "write_surfaces": "disabled",
         })
 
+    def test_manual_refresh_is_only_installed_for_explicit_callback(self):
+        from scripts import run_current_opportunity_dashboard as runner
+        import inspect
+        self.assertIn("refresh_callback", inspect.signature(runner.serve_current_dashboard).parameters)
+
+        calls, installed = [], []
+
+        class BaseHandler:
+            def do_POST(self):
+                self.send_json({"error": "not_found"}, 404)
+
+        class HttpServer:
+            def __init__(self, address, handler):
+                self.server_address = address
+                installed.append(handler)
+
+            def serve_forever(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        dashboard = SimpleNamespace(
+            MarketMonitorHandler=BaseHandler,
+            ThreadingHTTPServer=HttpServer,
+            write_surface_enabled=lambda: False,
+            clear_runtime_caches=lambda: None,
+        )
+        callback = lambda: calls.append(1) or {"status": "published"}
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            runner, "_load_dashboard_server", return_value=dashboard,
+        ):
+            for enabled in (False, True):
+                output = io.StringIO()
+                options = {"refresh_callback": callback} if enabled else {}
+                runner.serve_current_dashboard(
+                    data_dir=Path(temporary), port=8765, output=output, **options,
+                )
+                self.assertEqual(calls, [])
+                announcement = json.loads(output.getvalue().splitlines()[0])
+                self.assertEqual(announcement.get("manual_refresh", False), enabled)
+        from email.message import Message
+        for index, kind in enumerate(installed):
+            handler = object.__new__(kind)
+            handler.path = "/api/local/opportunity-refresh"
+            handler.client_address = ("127.0.0.1", 1234)
+            handler.server = SimpleNamespace(server_address=("127.0.0.1", 8765))
+            handler.headers = Message()
+            for key, value in {
+                "Host": "127.0.0.1:8765", "Origin": "http://127.0.0.1:8765",
+                "X-Opportunity-Refresh": "1", "Content-Length": "0",
+            }.items():
+                handler.headers[key] = value
+            responses = []
+            handler.send_json = lambda body, status=200: responses.append(status)
+            handler.do_POST()
+            self.assertEqual(responses, [200 if index else 404])
+        self.assertEqual(calls, [1])
+
     def test_invalid_port_is_rejected_before_dashboard_import(self):
         from scripts import run_current_opportunity_dashboard as runner
 

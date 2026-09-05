@@ -7,10 +7,14 @@ from datetime import datetime, timezone
 import io
 import json
 from pathlib import Path
+import signal
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts import run_live_cex_opportunity as runner
 from scripts.route_shadow_inputs import TYPED_SOURCE_ROLE_CONTRACTS
@@ -60,6 +64,22 @@ ROUTES = (
         "route_mode": "prepositioned_inventory",
     },
 )
+
+
+def _refresh_receipt():
+    return {
+        "schema": "live_cex_opportunity_refresh/v2",
+        "status": "published",
+        "token_pairs": ["UNI/USDT", "CAKE/USDT"],
+        "venues": ["binance", "bybit"],
+        "market_count": 4,
+        "route_count": 4,
+        "route_cohort_id": COHORT_ID,
+        "manifest_sha256": COMPLETE_MANIFEST_SHA256,
+        "opportunity_count": 20,
+        "strict_eligible_count": 0,
+        "served": False,
+    }
 
 
 def _cohort(*, second_status="observed", second_timing="within_sla"):
@@ -200,12 +220,14 @@ class LiveCexOpportunityParserTests(unittest.TestCase):
             "public_fee_schedule",
             "deadline_seconds",
             "serve",
+            "enable_live_refresh",
             "port",
         })
         self.assertEqual(parsed.data_dir, Path("/tmp/live-cex-data"))
         self.assertEqual(parsed.public_fee_schedule, Path("/tmp/fees.csv"))
         self.assertEqual(parsed.deadline_seconds, 10)
         self.assertTrue(parsed.serve)
+        self.assertFalse(parsed.enable_live_refresh)
         self.assertEqual(parsed.port, 65535)
 
         defaults = runner.parse_args([
@@ -218,6 +240,7 @@ class LiveCexOpportunityParserTests(unittest.TestCase):
         )
         self.assertEqual(defaults.deadline_seconds, 60)
         self.assertFalse(defaults.serve)
+        self.assertFalse(defaults.enable_live_refresh)
         self.assertEqual(defaults.port, 8765)
 
     def test_parser_rejects_relative_data_deadline_and_port_bounds(self):
@@ -719,6 +742,85 @@ class LiveCexOpportunityOrchestrationTests(unittest.TestCase):
         collect.assert_not_called()
 
 
+class LiveCexOpportunitySubprocessTests(unittest.TestCase):
+    def setUp(self):
+        self.arguments = {
+            "data_dir": Path("/private/tmp/live-refresh-data"),
+            "public_fee_schedule_path": Path("/private/tmp/live-refresh-fees.csv"),
+            "deadline_seconds": 30,
+        }
+
+    def test_subprocess_uses_exact_fixed_command_and_returns_published_receipt(self):
+        receipt = _refresh_receipt()
+        process = Mock(returncode=0)
+        process.communicate.return_value = (json.dumps(receipt), None)
+        with patch("subprocess.Popen", return_value=process) as spawn:
+            result = runner._collect_live_cex_in_subprocess(**self.arguments)
+
+        self.assertEqual(result, receipt)
+        spawn.assert_called_once_with([
+            sys.executable,
+            str(Path(runner.__file__).resolve()),
+            "--data-dir", "/private/tmp/live-refresh-data",
+            "--public-fee-schedule", "/private/tmp/live-refresh-fees.csv",
+            "--deadline-seconds", "30",
+        ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+            start_new_session=True, shell=False)
+        process.communicate.assert_called_once_with(timeout=60)
+
+    def test_subprocess_rejects_nonzero_malformed_and_unpublished_output(self):
+        cases = (
+            (1, json.dumps(_refresh_receipt())),
+            (0, "private exception text"),
+            (0, "[]"),
+            (0, '{"status":"failed","error":"private failure"}'),
+            (0, "{}"),
+        )
+        for returncode, stdout in cases:
+            with self.subTest(returncode=returncode, stdout=stdout):
+                process = Mock(returncode=returncode)
+                process.communicate.return_value = (stdout, None)
+                with patch("subprocess.Popen", return_value=process):
+                    with self.assertRaises(runner.LiveCexOpportunityRefreshError) as failure:
+                        runner._collect_live_cex_in_subprocess(**self.arguments)
+                self.assertEqual(str(failure.exception), "collection_failed")
+
+    def test_subprocess_communication_failure_kills_its_group_and_reaps_child(self):
+        failures = (
+            subprocess.TimeoutExpired("private command", timeout=60),
+            OSError("private communication error"),
+        )
+        for error in failures:
+            with self.subTest(error=type(error).__name__):
+                events = []
+                process = Mock(pid=43210)
+                process.communicate.side_effect = error
+                process.wait.side_effect = lambda: events.append("reaped")
+
+                def kill_group(pid, action):
+                    self.assertEqual(pid, 43210)
+                    self.assertEqual(action, signal.SIGKILL)
+                    events.append("killed exact group")
+
+                with patch("subprocess.Popen", return_value=process), \
+                        patch("os.killpg", side_effect=kill_group):
+                    with self.assertRaises(runner.LiveCexOpportunityRefreshError) as failure:
+                        runner._collect_live_cex_in_subprocess(**self.arguments)
+
+                self.assertEqual(str(failure.exception), "collection_failed")
+                self.assertEqual(events, ["killed exact group", "reaped"])
+                process.stdout.close.assert_called_once_with()
+
+    def test_subprocess_spawn_failure_is_redacted_without_killing_any_group(self):
+        with patch("subprocess.Popen", side_effect=OSError("private spawn error")), \
+                patch("os.killpg") as kill_group:
+            with self.assertRaises(runner.LiveCexOpportunityRefreshError) as failure:
+                runner._collect_live_cex_in_subprocess(**self.arguments)
+        self.assertEqual(str(failure.exception), "collection_failed")
+        kill_group.assert_not_called()
+
+
 class LiveCexOpportunityMainTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -798,6 +900,164 @@ class LiveCexOpportunityMainTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         server.assert_called_once()
+
+    def test_live_refresh_without_serve_fails_before_preparation_or_collection(self):
+        output = io.StringIO()
+        errors = io.StringIO()
+        with patch.object(
+            runner, "collect_and_publish_live_cex_research"
+        ) as collect, patch.object(
+            runner, "serve_current_dashboard"
+        ) as server, redirect_stdout(output), redirect_stderr(errors):
+            result = runner.main(self.arguments + ["--enable-live-refresh"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "preflight_failed\n")
+        self.assertFalse(self.data_dir.exists())
+        collect.assert_not_called()
+        server.assert_not_called()
+
+    def test_enabled_refresh_reuses_prepared_fixed_arguments_on_two_clicks(self):
+        receipts = [
+            {
+                "schema": "live_cex_opportunity_refresh/v2",
+                "status": "published",
+                "token_pairs": ["UNI/USDT", "CAKE/USDT"],
+                "venues": ["binance", "bybit"],
+                "market_count": 4,
+                "route_count": 4,
+                "route_cohort_id": "cohort:" + marker * 64,
+                "manifest_sha256": COMPLETE_MANIFEST_SHA256,
+                "opportunity_count": 20,
+                "strict_eligible_count": 0,
+                "served": False,
+            }
+            for marker in ("c", "d", "e")
+        ]
+        output = io.StringIO()
+        errors = io.StringIO()
+        events = []
+        collected = []
+        wall_clock = lambda: NOW
+        expected_schedule = (
+            Path(runner.__file__).resolve().parents[1]
+            / "config/cex_public_fee_schedules.csv"
+        )
+
+        def collect(**kwargs):
+            events.append("collect")
+            collected.append(kwargs)
+            self.assertTrue(self.data_dir.is_dir())
+            return receipts[0]
+
+        def subprocess_collect(**kwargs):
+            events.append("subprocess collect")
+            collected.append(kwargs)
+            return receipts[len(collected) - 1]
+
+        def serve(**kwargs):
+            events.append("serve")
+            self.assertEqual(len(collected), 1)
+            self.assertEqual(json.loads(output.getvalue()), {
+                **receipts[0], "served": True,
+            })
+            callback = kwargs.pop("refresh_callback")
+            self.assertEqual(kwargs, {"data_dir": self.data_dir, "port": 9876})
+            with self.assertRaises(TypeError):
+                callback("/tmp/other-data")
+            self.assertIs(callback(), receipts[1])
+            self.assertIs(callback(), receipts[2])
+
+        with patch.object(
+            runner, "_utc_now", new=wall_clock,
+        ), patch.object(
+            runner, "collect_and_publish_live_cex_research", side_effect=collect,
+        ), patch.object(
+            runner, "_collect_live_cex_in_subprocess", side_effect=subprocess_collect,
+        ), patch.object(
+            runner, "serve_current_dashboard", side_effect=serve,
+        ), redirect_stdout(output), redirect_stderr(errors):
+            result = runner.main([
+                "--data-dir", str(self.parent / "unused" / ".." / "new-data"),
+                "--public-fee-schedule", "config/cex_public_fee_schedules.csv",
+                "--deadline-seconds", "30",
+                "--serve", "--enable-live-refresh", "--port", "9876",
+            ])
+
+        self.assertEqual(result, 0, errors.getvalue())
+        self.assertEqual(events, ["collect", "serve", "subprocess collect", "subprocess collect"])
+        self.assertEqual(len(collected), 3)
+        for index, collected_arguments in enumerate(collected):
+            expected_arguments = {
+                "data_dir": self.data_dir,
+                "public_fee_schedule_path": expected_schedule,
+                "deadline_seconds": 30,
+            }
+            if index == 0:
+                expected_arguments["wall_clock"] = wall_clock
+            self.assertEqual(collected_arguments, expected_arguments)
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_enabled_refresh_runs_fork_collector_in_fresh_child_from_http_thread(self):
+        from scripts.collect_route_cohort import _ForkProcessExecutor
+
+        receipt = _refresh_receipt()
+        real_popen = subprocess.Popen
+        spawned = []
+        refreshed = []
+        failures = []
+        output = io.StringIO()
+        errors = io.StringIO()
+        child_code = (
+            "import json, sys\n"
+            "sys.path.insert(0, " + repr(str(Path(runner.__file__).resolve().parents[1])) + ")\n"
+            "from scripts.collect_route_cohort import _ForkProcessExecutor\n"
+            "executor = _ForkProcessExecutor(max_workers=1)\n"
+            "try:\n"
+            "    future = executor.submit(lambda: " + repr(receipt) + ")\n"
+            "    executor.wait_for_any([future], timeout=5)\n"
+            "    print(json.dumps(future.result(timeout=5)))\n"
+            "finally:\n"
+            "    executor.shutdown(wait=False)\n"
+        )
+
+        def collect_initial(**kwargs):
+            # The real fork boundary rejects this call if refresh stays in-thread.
+            executor = _ForkProcessExecutor(max_workers=1)
+            executor.shutdown(wait=False)
+            return receipt
+
+        def spawn_local_child(command, **kwargs):
+            spawned.append(command)
+            return real_popen([sys.executable, "-c", child_code], **kwargs)
+
+        def serve(**kwargs):
+            callback = kwargs["refresh_callback"]
+
+            def request_worker():
+                try:
+                    refreshed.append(callback())
+                except BaseException as error:
+                    failures.append(str(error))
+
+            worker = threading.Thread(target=request_worker)
+            worker.start()
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive(), "manual refresh did not complete")
+
+        with patch.object(
+            runner, "collect_and_publish_live_cex_research", side_effect=collect_initial,
+        ), patch.object(
+            runner, "serve_current_dashboard", side_effect=serve,
+        ), patch("subprocess.Popen", side_effect=spawn_local_child), \
+                redirect_stdout(output), redirect_stderr(errors):
+            result = runner.main(self.arguments + ["--serve", "--enable-live-refresh"])
+
+        self.assertEqual(result, 0, errors.getvalue())
+        self.assertEqual(failures, [])
+        self.assertEqual(refreshed, [receipt])
+        self.assertEqual(len(spawned), 1)
 
     def test_reload_failure_never_serves_and_does_not_leak_exception(self):
         output = io.StringIO()

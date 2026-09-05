@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-from typing import Iterator, Optional, Sequence, TextIO
+from typing import Callable, Iterator, Optional, Sequence, TextIO
 from urllib.parse import urlparse
 
 
@@ -205,6 +205,7 @@ def serve_current_dashboard(
     data_dir: Path,
     port: int,
     output: TextIO = sys.stdout,
+    refresh_callback: Optional[Callable[[], dict]] = None,
 ) -> None:
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("port must be an integer between 1 and 65535")
@@ -228,6 +229,14 @@ def serve_current_dashboard(
             try:
                 dashboard_server.clear_runtime_caches()
                 handler = _current_opportunity_handler(dashboard_server)
+                if refresh_callback is not None:
+                    from scripts.local_opportunity_refresh import (
+                        LocalOpportunityRefresh, local_refresh_handler,
+                    )
+                    handler = local_refresh_handler(
+                        handler, dashboard_server,
+                        LocalOpportunityRefresh(refresh_callback),
+                    )
                 http_server = dashboard_server.ThreadingHTTPServer(
                     (CURRENT_DASHBOARD_HOST, port),
                     handler,
@@ -245,6 +254,7 @@ def serve_current_dashboard(
                                 CURRENT_OPPORTUNITY_PATH,
                             ),
                             "write_surfaces": "disabled",
+                            **({"manual_refresh": True} if refresh_callback is not None else {}),
                         },
                         separators=(",", ":"),
                         sort_keys=True,
@@ -253,8 +263,13 @@ def serve_current_dashboard(
                     flush=True,
                 )
                 print(
-                    "Press Ctrl-C to stop; the published Opportunity data "
-                    "will remain unchanged.",
+                    (
+                        "Press Ctrl-C to stop. Manual refresh is enabled; "
+                        "there is no automatic collection schedule."
+                        if refresh_callback is not None else
+                        "Press Ctrl-C to stop; the published Opportunity data "
+                        "will remain unchanged."
+                    ),
                     file=output,
                     flush=True,
                 )

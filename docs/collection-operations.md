@@ -488,6 +488,54 @@ amount and rate, so CAKE economics remain unavailable. Operators must not copy
 UNI rates, add a wildcard, or enter zero as a substitute; exact CAKE rows require
 a separate evidence review.
 
+#### Local manual refresh button
+
+Enable the manual refresh button explicitly when starting the local server:
+
+```bash
+python3 scripts/run_live_cex_opportunity.py \
+  --data-dir /absolute/local/path \
+  --deadline-seconds 60 \
+  --serve \
+  --enable-live-refresh \
+  --port 8765
+```
+
+Replace `/absolute/local/path` with the absolute local market-data directory.
+The initial collection, publication, and cold reload still finish before the
+server starts. `--enable-live-refresh` requires `--serve`; using it alone fails
+before data-directory preparation or collection. Without the opt-in, `--serve`
+keeps the existing read-only dashboard behavior.
+
+Each button click requests one new collection of the same four fixed markets:
+Binance `UNI/USDT`, Bybit `UNI/USDT`, Binance `CAKE/USDT`, and Bybit `CAKE/USDT`.
+It reuses the startup data directory, public fee schedule, and bounded
+collection deadline. Each click launches the exact one-shot runner in a fresh
+process, preserving the collector's single-threaded fork/deadline isolation.
+The local request waits at most the collection deadline plus 30 seconds;
+a communication timeout terminates and reaps that child process group.
+Public collection uses only GET requests to
+`data-api.binance.vision`, `api.binance.com`, and `api.bybit.com`; the browser
+cannot choose another token, venue, URL, or credential. This remains a
+research-only workflow with no account access or order submission.
+
+The button is disabled while collection runs and for a 30-second cooldown
+after each attempt. A successful refresh reloads the Current Opportunity
+results with the current filters. A collection or publication failure displays
+the failed refresh state and retains the prior published data; those results
+keep their actual age and can still become stale. This option installs no
+scheduler and never starts an automatic collection from a page load or timer.
+An auditable terminal result such as `route_deadline_exceeded` can still be
+published successfully; this replaces the displayed batch with explicit N/A
+reasons, not usable prices. Publication success does not mean usable market
+data or a profitable route. After a lost response or another tab's refresh,
+status checks reconcile a newly confirmed batch once without changing filters.
+
+Refreshing does not fill the CAKE fee-evidence gap: until separately reviewed
+exact `CAKE/USDT` public fee rows are available, its fee amounts and net
+economics remain unavailable. UNI public-reference scenarios remain
+non-strict research estimates.
+
 ### Sealed local Current Opportunity workflow demo
 
 For a repeatable presentation of the DEX research workflow without collecting

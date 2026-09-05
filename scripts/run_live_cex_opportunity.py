@@ -11,7 +11,9 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import stat
+import subprocess
 import sys
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
@@ -202,12 +204,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="serve the verified result through the loopback-only dashboard",
     )
     parser.add_argument(
+        "--enable-live-refresh",
+        action="store_true",
+        help=(
+            "enable manual fixed-market collection in the local dashboard; "
+            "requires --serve"
+        ),
+    )
+    parser.add_argument(
         "--port",
         type=_port,
         default=DEFAULT_PORT,
         help="loopback dashboard port",
     )
-    return parser.parse_args(argv)
+    arguments = parser.parse_args(argv)
+    if arguments.enable_live_refresh and not arguments.serve:
+        parser.error("--enable-live-refresh requires --serve")
+    return arguments
 
 
 def _canonical_system_alias(path: Path) -> Path:
@@ -566,6 +579,59 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _collect_live_cex_in_subprocess(
+    *,
+    data_dir: Path,
+    public_fee_schedule_path: Path,
+    deadline_seconds: int,
+) -> Dict[str, Any]:
+    """Run the fixed collector in a fresh, single-threaded Python process."""
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--data-dir", str(data_dir),
+                "--public-fee-schedule", str(public_fee_schedule_path),
+                "--deadline-seconds", str(deadline_seconds),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            start_new_session=True,
+            shell=False,
+        )
+        try:
+            output, _unused_stderr = process.communicate(
+                timeout=deadline_seconds + 30,
+            )
+        except BaseException:
+            try:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            finally:
+                try:
+                    process.wait()
+                finally:
+                    if process.stdout is not None:
+                        process.stdout.close()
+            raise
+        if process.returncode != 0:
+            raise ValueError("collector process did not succeed")
+        receipt = json.loads(output)
+        if not isinstance(receipt, dict) or receipt.get("status") != "published":
+            raise ValueError("collector process did not publish")
+        return receipt
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        raise LiveCexOpportunityRefreshError("collection_failed") from None
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         with redirect_stderr(io.StringIO()):
@@ -593,11 +659,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("preflight_failed", file=sys.stderr, flush=True)
         return 1
 
+    deadline_seconds = arguments.deadline_seconds
     try:
         receipt = collect_and_publish_live_cex_research(
             data_dir=data_dir,
             public_fee_schedule_path=schedule_path,
-            deadline_seconds=arguments.deadline_seconds,
+            deadline_seconds=deadline_seconds,
             wall_clock=_utc_now,
         )
     except KeyboardInterrupt:
@@ -625,7 +692,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not arguments.serve:
         return 0
     try:
-        serve_current_dashboard(data_dir=data_dir, port=arguments.port)
+        if arguments.enable_live_refresh:
+            def refresh_live_cex_research() -> Dict[str, Any]:
+                return _collect_live_cex_in_subprocess(
+                    data_dir=data_dir,
+                    public_fee_schedule_path=schedule_path,
+                    deadline_seconds=deadline_seconds,
+                )
+
+            serve_current_dashboard(
+                data_dir=data_dir,
+                port=arguments.port,
+                refresh_callback=refresh_live_cex_research,
+            )
+        else:
+            serve_current_dashboard(data_dir=data_dir, port=arguments.port)
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr, flush=True)
         return 130
