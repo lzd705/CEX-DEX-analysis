@@ -412,6 +412,73 @@ class OpportunityBundleReaderTests(unittest.TestCase):
         self.assertEqual(health["status"], "stale")
         self.assertEqual(health["reason"], "cost_component_stale")
 
+    def test_publication_health_does_not_treat_missing_fees_as_expired(self):
+        missing = _row(
+            "route:missing-fee", "opportunity:missing-fee",
+            opportunity_class="unavailable",
+            strict_eligible=False,
+            strict_ready=False,
+            strict_net_edge_usd=None,
+            strict_net_edge_bps=None,
+            research_net_edge_usd=None,
+            research_net_edge_bps=None,
+            primary_reason="cost_components_incomplete",
+            reason_codes=["cost_components_incomplete"],
+            token_symbol="CAKE",
+            buy_market_id="cex:binance:CAKE/USDT",
+            sell_market_id="cex:bybit:CAKE/USDT",
+        )
+        missing["cost_completeness"] = "incomplete"
+        missing["scenario_cost_completeness"] = "incomplete"
+        missing_costs = _route_costs(missing)
+        for component in missing_costs:
+            if component["component_type"] == "venue_taker_fee":
+                component.update({
+                    "value_status": "unavailable",
+                    "strict_eligible": False,
+                    "amount_usd": None,
+                    "rate_bps": None,
+                    "observed_at": None,
+                    "valid_until": None,
+                    "reason_code": "cex_fee_public_bound_unavailable",
+                })
+        current = _row("route:current", "opportunity:current")
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed):
+                rows = [missing, current] if mixed else [missing]
+                costs = missing_costs + (_route_costs(current) if mixed else [])
+                manifest = _manifest(rows)
+                loaded = {
+                    "manifest": manifest,
+                    "manifest_sha256": "a" * 64,
+                    "opportunities": rows,
+                    "cost_components": costs,
+                }
+                with patch.object(
+                    opportunity_facts, "load_latest_opportunities",
+                    return_value=loaded,
+                ):
+                    fresh = opportunity_publication_health(now=NOW)
+                    stale = opportunity_publication_health(now=datetime(
+                        2026, 8, 1, 12, 3, 1, tzinfo=timezone.utc,
+                    ))
+                self.assertEqual((fresh["status"], fresh["reason"]), ("current", None))
+                self.assertEqual(
+                    (stale["status"], stale["reason"]),
+                    ("stale", "cohort_stale"),
+                )
+                payload = build_opportunity_payload(
+                    rows, manifest=manifest, cost_components=costs, now=NOW,
+                )
+                cake = next(row for row in payload["routes"] if row["token_symbol"] == "CAKE")
+                self.assertEqual(cake["availability"], {
+                    "status": "unavailable", "reason": "cost_components_incomplete",
+                })
+                self.assertIsNone(cake["net_edge_usd"])
+                if mixed:
+                    usable = next(row for row in payload["routes"] if row["token_symbol"] != "CAKE")
+                    self.assertEqual(usable["availability"]["status"], "available")
+
     def test_publication_health_fails_closed_on_any_invalid_route_timestamp(self):
         current_row = _row("route:current", "opportunity:current")
         future_row = _row("route:future", "opportunity:future")

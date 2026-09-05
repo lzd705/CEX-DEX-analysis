@@ -2323,6 +2323,7 @@ def opportunity_publication_health(
                 raise OpportunityBundleInvalid()
             if (
                 evaluation.get("status") == "current"
+                and row.get("opportunity_class") != "unavailable"
                 and not _cost_components_are_current(
                     component_rows[str(row["opportunity_id"])],
                     current,
