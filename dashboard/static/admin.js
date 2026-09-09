@@ -7,6 +7,7 @@ const admin = {
   tokenReviews: [],
   reviewLoadGeneration: 0,
   reviewActions: new Set(),
+  reviewElements: new Map(),
   focusedReviewHash: null,
 };
 
@@ -189,6 +190,16 @@ function focusLinkedReview() {
 
 function renderTokenReviews() {
   const target = byId("token-reviews-body");
+  const scroller = byId("token-reviews-scroll");
+  const scrollPosition = [scroller.scrollTop, scroller.scrollLeft];
+  const previousUi = new Map();
+  admin.reviewElements.forEach((nodes, requestId) => {
+    previousUi.set(requestId, new Map([...nodes].map(([key, node]) => [key, {
+      open: node.open, scrollTop: node.scrollTop, scrollLeft: node.scrollLeft,
+      focused: document.activeElement === node,
+    }])));
+  });
+  admin.reviewElements = new Map();
   target.replaceChildren();
   byId("token-review-count").textContent = `${admin.tokenReviews.length} recent requests`;
   byId("token-review-access").textContent = canReviewTokens()
@@ -201,7 +212,9 @@ function renderTokenReviews() {
   }
   admin.tokenReviews.forEach((review) => {
     const row = document.createElement("tr");
+    const nodes = new Map([["row", row]]);
     if (validReviewIdentity(review)) {
+      admin.reviewElements.set(review.request_id, nodes);
       row.id = `token-review-${review.request_id}`;
       row.tabIndex = -1;
       if (window.location.hash === `#token-review=${review.request_id}`) row.className = "token-review-highlight";
@@ -228,11 +241,17 @@ function renderTokenReviews() {
     details.append(reviewText("summary", "Candidate and digest"),
       reviewText("p", review.candidate_sha256),
       reviewText("pre", JSON.stringify(review.candidate, null, 2)));
+    nodes.set("candidate", details);
+    nodes.set("candidate-summary", details.children[0]);
+    nodes.set("candidate-text", details.children[2]);
     evidence.append(details);
     const audit = document.createElement("td");
     const auditDetails = document.createElement("details");
     auditDetails.append(reviewText("summary", "Audit history"),
       reviewText("pre", JSON.stringify((review.audit || []).slice(0, 50), null, 2)));
+    nodes.set("audit", auditDetails);
+    nodes.set("audit-summary", auditDetails.children[0]);
+    nodes.set("audit-text", auditDetails.children[1]);
     audit.append(auditDetails);
     const controls = document.createElement("td");
     const buttons = document.createElement("div");
@@ -243,6 +262,7 @@ function renderTokenReviews() {
       button.disabled = admin.reviewActions.has(review.request_id);
       // This closure owns the revision displayed in this row, not a later poll's value.
       button.addEventListener("click", () => actOnTokenReview(review, action));
+      nodes.set(action, button);
       buttons.append(button);
     };
     if (canReviewTokens() && validReviewIdentity(review)) {
@@ -260,6 +280,27 @@ function renderTokenReviews() {
     row.append(identity, state, mail, evidence, audit, controls);
     target.append(row);
   });
+  // Recreate action closures with current revisions, but retain the reader's place.
+  admin.reviewElements.forEach((nodes, requestId) => {
+    const saved = previousUi.get(requestId);
+    if (!saved) return;
+    let focusKey;
+    saved.forEach((state, key) => {
+      if (state.focused) focusKey = key;
+      const node = nodes.get(key);
+      if (!node) return;
+      if (typeof state.open === "boolean") node.open = state.open;
+      node.scrollTop = state.scrollTop;
+      node.scrollLeft = state.scrollLeft;
+    });
+    if (focusKey) {
+      const control = nodes.get(focusKey);
+      const focusTarget = control && !control.disabled ? control : nodes.get("row");
+      focusTarget.focus({preventScroll: true});
+    }
+  });
+  scroller.scrollTop = scrollPosition[0];
+  scroller.scrollLeft = scrollPosition[1];
   focusLinkedReview();
 }
 

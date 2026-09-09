@@ -16,6 +16,7 @@ class Element {
   constructor(tag = 'div') {
     this.tagName = tag; this.children = []; this.listeners = {}; this.dataset = {};
     this.disabled = false; this.hidden = false; this.value = ''; this._text = '';
+    this.open = false; this.scrollTop = 0; this.scrollLeft = 0;
     this.classList = {add: () => {}, remove: () => {}, toggle: () => {}};
   }
   set textContent(value) { this._text = String(value); this.children = []; }
@@ -28,11 +29,17 @@ class Element {
   get id() { return this._id; }
   append(...children) { this.children.push(...children); }
   appendChild(child) { this.append(child); return child; }
-  replaceChildren(...children) { this.children = children; this._text = ''; }
+  replaceChildren(...children) {
+    if (this.children.some(child => descendants(child).includes(document.activeElement))) document.activeElement = null;
+    this.children = children; this._text = '';
+  }
   addEventListener(name, callback) { this.listeners[name] = callback; }
   setAttribute(name, value) { this[name] = String(value); }
   querySelector() { return this.children[0] || (this.children[0] = new Element('span')); }
-  focus() { this.focused = true; }
+  focus(options) {
+    if (this.disabled) return;
+    this.focused = true; this.focusOptions = options; document.activeElement = this;
+  }
   scrollIntoView() {}
   async click() { if (!this.disabled) await this.listeners.click?.({target:this}); }
 }
@@ -331,6 +338,48 @@ await submit('token-resolve-form');
 assert.equal(element('add-token-button').disabled, true);
 await element('add-token-button').click();
 assert.ok(requests.every(item => item.path !== '/api/admin/tokens'));
+""")
+
+    def test_review_poll_preserves_open_evidence_focus_and_scroll(self):
+        self.run_behavior("admin.js", r"""
+await showWorkspace(session);
+function details() { return descendants(element('token-reviews-body')).filter(node => node.tagName === 'details'); }
+details()[0].open = true; details()[1].open = true;
+details()[0].scrollTop = 19; details()[1].scrollLeft = 7;
+details()[0].children[2].scrollTop = 143;
+details()[1].children[1].scrollTop = 81;
+details()[0].children[0].focus();
+element('token-review-' + review.request_id).scrollTop = 12;
+element('token-reviews-scroll').scrollLeft = 250;
+for (const revision of [4, 5]) {
+ listedReviews = [{...review, revision}];
+ await loadTokenReviews();
+ assert.equal(details()[0].open, true); assert.equal(details()[1].open, true);
+ assert.equal(details()[0].scrollTop, 19); assert.equal(details()[1].scrollLeft, 7);
+ assert.equal(details()[0].children[2].scrollTop, 143);
+ assert.equal(details()[1].children[1].scrollTop, 81);
+ assert.equal(element('token-review-' + review.request_id).scrollTop, 12);
+ assert.equal(element('token-reviews-scroll').scrollLeft, 250);
+ assert.equal(document.activeElement, details()[0].children[0]);
+ assert.equal(document.activeElement.focusOptions.preventScroll, true);
+}
+assert.equal(requests.filter(item => item.method === 'POST').length, 0);
+""")
+
+    def test_review_poll_restores_action_focus_with_current_revision_only(self):
+        self.run_behavior("admin.js", r"""
+await showWorkspace(session);
+button('Approve').focus();
+listedReviews=[{...review, revision:6}]; await loadTokenReviews();
+assert.equal(document.activeElement, button('Approve'));
+postResult={...review, revision:7, status:'approved'}; listedReviews=[postResult];
+await document.activeElement.click();
+const mutation=requests.find(item => item.method === 'POST');
+assert.deepEqual(JSON.parse(mutation.body), {expected_revision:6, decision:'approve'});
+assert.ok(!button('Approve')); assert.ok(button('Start onboarding'));
+assert.equal(document.activeElement, element('token-review-' + review.request_id));
+const other=element('outside-review'); other.focus(); await loadTokenReviews();
+assert.equal(document.activeElement, other);
 """)
 
 
