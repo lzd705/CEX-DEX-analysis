@@ -173,6 +173,17 @@
 .admin-table-wrap { margin-top: 14px; overflow-x: auto; }
 .jobs-table { min-width: 1050px; }
 .manual-review-table { min-width: 1050px; }
+.token-reviews-table { min-width: 1120px; }
+.token-reviews-table th { position: static; }
+.token-reviews-table td,
+.token-reviews-table th { text-align: left; vertical-align: top; }
+.token-reviews-table td { max-width: 300px; white-space: normal; overflow-wrap: anywhere; }
+.token-reviews-table p { margin: 0 0 7px; }
+.token-reviews-table pre { max-width: 360px; max-height: 280px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
+.token-reviews-table summary { cursor: pointer; }
+.token-review-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.token-review-actions button { min-height: 36px; }
+.token-review-highlight { outline: 2px solid var(--accent); outline-offset: -2px; }
 .jobs-table th { position: static; }
 .manual-review-table th { position: static; }
 .jobs-table td:first-child,

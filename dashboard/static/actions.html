@@ -27,7 +27,7 @@
     <main class="data-actions-main">
       <section class="actions-heading" aria-labelledby="actions-title">
         <div>
-          <span class="eyebrow">Collection control</span>
+          <span class="eyebrow">Review and recovery</span>
           <h2 id="actions-title">Data Actions</h2>
           <div class="module-context" aria-label="Public action scope">
             <span class="module-chip">Contract-qualified</span>
@@ -39,7 +39,7 @@
               </summary>
               <div class="context-tooltip" role="tooltip">
                 <strong>Server-controlled scope</strong>
-                <p>Add Token always collects a fixed 30-day DEX history. Recovery can run only an exact retry window published by the latest quality audit; dates and markets cannot be entered manually.</p>
+                <p>Token submissions require 1/1 authenticated administrator approval and a separate explicit Start before the fixed 30-day DEX collection. Submission adds no catalog entry and starts no collection. Recovery uses only exact windows published by the latest quality audit.</p>
               </div>
             </details>
           </div>
@@ -57,7 +57,7 @@
           <div class="action-panel-heading">
             <div>
               <span class="eyebrow">Catalog expansion</span>
-              <h2 id="add-token-title">Add Token</h2>
+              <h2 id="add-token-title">Submit Token for review</h2>
             </div>
             <span class="module-chip">30D DEX</span>
           </div>
@@ -111,7 +111,7 @@
             </div>
             <button id="public-token-add" class="action-primary" type="button">
               <i data-lucide="database-zap"></i>
-              Add &amp; collect 30D
+              Submit for review
             </button>
           </div>
           <div id="public-token-status" class="action-status" role="status" aria-live="polite" hidden></div>

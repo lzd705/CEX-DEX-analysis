@@ -93,8 +93,8 @@
         <section class="refresh-section">
           <div class="admin-section-header">
             <div>
-              <h2>Add Token by contract</h2>
-              <p>Resolve the on-chain identity first, review discovered pools, then collect DEX facts. CEX mapping remains manual.</p>
+              <h2>Submit Token for review</h2>
+              <p>Validate the contract, then submit for 1/1 authenticated review. Approval and explicit Start are separate actions. Submission adds no catalog entry and starts no collection. CEX mapping remains manual.</p>
             </div>
             <span class="read-only-tag">DEX first</span>
           </div>
@@ -148,10 +148,35 @@
             </label>
             <button id="add-token-button" class="admin-primary" type="button">
               <i data-lucide="database-zap"></i>
-              <span>Add &amp; collect</span>
+              <span>Submit for review</span>
             </button>
           </div>
           <div id="token-onboarding-status" class="admin-inline-status" role="status" aria-live="polite" hidden></div>
+        </section>
+
+        <section class="refresh-section" aria-labelledby="token-reviews-title">
+          <div class="admin-section-header">
+            <div>
+              <h2 id="token-reviews-title">Token review requests</h2>
+              <p>1/1 authenticated approval. Review the stored identity and evidence, then approve or reject. Start onboarding is a separate action; email delivery never grants approval.</p>
+            </div>
+            <span id="token-review-count" class="read-only-tag">Checking</span>
+          </div>
+          <p id="token-review-access" class="admin-method-note"></p>
+          <div id="token-review-status" class="admin-inline-status" role="status" aria-live="polite" hidden></div>
+          <div class="admin-table-wrap">
+            <table class="token-reviews-table">
+              <thead><tr>
+                <th scope="col">Request and identity</th>
+                <th scope="col">Review and onboarding</th>
+                <th scope="col">Email notification</th>
+                <th scope="col">Stored evidence</th>
+                <th scope="col">Audit</th>
+                <th scope="col">Actions</th>
+              </tr></thead>
+              <tbody id="token-reviews-body"><tr><td colspan="6" class="empty-jobs">Loading Token reviews</td></tr></tbody>
+            </table>
+          </div>
         </section>
 
         <section class="refresh-section">

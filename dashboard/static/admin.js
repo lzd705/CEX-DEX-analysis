@@ -4,6 +4,10 @@ const admin = {
   tokenCandidate: null,
   retryWindows: [],
   manualReviewItems: [],
+  tokenReviews: [],
+  reviewLoadGeneration: 0,
+  reviewActions: new Set(),
+  focusedReviewHash: null,
 };
 
 const byId = (id) => document.getElementById(id);
@@ -34,9 +38,13 @@ async function request(path, options = {}) {
   const response = await fetch(path, { ...options, headers });
   const payload = await response.json();
   if (!response.ok) {
-    const error = new Error(payload.error || "Administrator request failed");
-    error.code = payload.error_code || "";
+    const startFailed = payload.onboarding_error_code === "onboarding_start_failed";
+    const error = new Error(startFailed
+      ? "Onboarding start failed. The request remains approved; review it before trying Start again."
+      : payload.error || "Administrator request failed");
+    error.code = startFailed ? payload.onboarding_error_code : payload.error_code || "";
     error.retryable = payload.retryable === true;
+    if (startFailed) error.review = payload;
     throw error;
   }
   return payload;
@@ -145,6 +153,164 @@ async function loadJobs() {
   renderJobs(payload.jobs);
 }
 
+function canReviewTokens() {
+  return admin.session?.authenticated === true
+    && admin.session.login_required === true && Boolean(admin.session.csrf_token);
+}
+
+function validReviewIdentity(review) {
+  return typeof review?.request_id === "string" && /^[0-9a-f]{32}$/.test(review.request_id)
+    && Number.isSafeInteger(review.revision) && review.revision > 0;
+}
+
+function reviewText(tag, value, className = "") {
+  const node = document.createElement(tag);
+  node.textContent = String(value ?? "—").slice(0, 100000);
+  if (className) node.className = className;
+  return node;
+}
+
+function showReviewStatus(message) {
+  const target = byId("token-review-status");
+  target.textContent = message;
+  target.hidden = false;
+}
+
+function focusLinkedReview() {
+  const hash = window.location.hash;
+  const match = /^#token-review=([0-9a-f]{32})$/.exec(hash);
+  if (!match || admin.focusedReviewHash === hash) return;
+  const row = byId(`token-review-${match[1]}`);
+  if (!row) return;
+  row.classList.add("token-review-highlight");
+  row.focus();
+  admin.focusedReviewHash = hash;
+}
+
+function renderTokenReviews() {
+  const target = byId("token-reviews-body");
+  target.replaceChildren();
+  byId("token-review-count").textContent = `${admin.tokenReviews.length} recent requests`;
+  byId("token-review-access").textContent = canReviewTokens()
+    ? "Actions use the displayed revision. A changed request must be reviewed again."
+    : "Read only. Sign in as the configured administrator to submit, decide, retry email, or start onboarding.";
+  if (!admin.tokenReviews.length) {
+    const row = document.createElement("tr");
+    const cell = reviewText("td", "No Token review requests", "empty-jobs");
+    cell.colSpan = 6; row.append(cell); target.append(row);
+  }
+  admin.tokenReviews.forEach((review) => {
+    const row = document.createElement("tr");
+    if (validReviewIdentity(review)) {
+      row.id = `token-review-${review.request_id}`;
+      row.tabIndex = -1;
+      if (window.location.hash === `#token-review=${review.request_id}`) row.className = "token-review-highlight";
+    }
+    const identity = document.createElement("td");
+    identity.append(reviewText("strong", review.token_symbol),
+      reviewText("p", `${review.chain}:${review.contract_address}`),
+      reviewText("p", `Request ${review.request_id} · revision ${review.revision}`),
+      reviewText("p", `Created ${review.created_at} · ${review.requested_history_days} days`));
+    const state = document.createElement("td");
+    state.append(reviewText("strong", review.status),
+      reviewText("p", review.reviewer ? `Decision: ${review.reviewer} · ${review.reviewed_at}` : "Awaiting reviewer decision"),
+      reviewText("p", review.onboarding_job_id ? `Job ${review.onboarding_job_id}` : "No onboarding job queued"));
+    if (review.onboarding_error_code) state.append(reviewText("p", review.onboarding_error_code));
+    const notification = review.notification || {};
+    const mail = document.createElement("td");
+    mail.append(reviewText("strong", notification.status),
+      reviewText("p", `${notification.attempts ?? 0}/3 delivery attempts`));
+    if (notification.error_code) mail.append(reviewText("p", notification.error_code));
+    if (notification.retry_at) mail.append(reviewText("p", `Retry after ${notification.retry_at}`));
+    if (notification.sent_at) mail.append(reviewText("p", `Sent ${notification.sent_at}`));
+    const evidence = document.createElement("td");
+    const details = document.createElement("details");
+    details.append(reviewText("summary", "Candidate and digest"),
+      reviewText("p", review.candidate_sha256),
+      reviewText("pre", JSON.stringify(review.candidate, null, 2)));
+    evidence.append(details);
+    const audit = document.createElement("td");
+    const auditDetails = document.createElement("details");
+    auditDetails.append(reviewText("summary", "Audit history"),
+      reviewText("pre", JSON.stringify((review.audit || []).slice(0, 50), null, 2)));
+    audit.append(auditDetails);
+    const controls = document.createElement("td");
+    const buttons = document.createElement("div");
+    buttons.className = "token-review-actions";
+    const addAction = (label, action) => {
+      const button = reviewText("button", label, "admin-secondary");
+      button.type = "button";
+      button.disabled = admin.reviewActions.has(review.request_id);
+      // This closure owns the revision displayed in this row, not a later poll's value.
+      button.addEventListener("click", () => actOnTokenReview(review, action));
+      buttons.append(button);
+    };
+    if (canReviewTokens() && validReviewIdentity(review)) {
+      if (review.status === "pending_review") {
+        addAction("Approve", "approve"); addAction("Reject", "reject");
+      }
+      if (review.status === "approved") addAction("Start onboarding", "start");
+      if (["failed", "disabled", "unconfigured"].includes(notification.status)
+          && Number.isInteger(notification.attempts) && notification.attempts < 3
+          && (!notification.retry_at || Date.parse(notification.retry_at) <= Date.now())) {
+        addAction("Retry email", "retry");
+      }
+    }
+    controls.append(buttons);
+    row.append(identity, state, mail, evidence, audit, controls);
+    target.append(row);
+  });
+  focusLinkedReview();
+}
+
+async function loadTokenReviews() {
+  const generation = ++admin.reviewLoadGeneration;
+  const payload = await request("/api/admin/token-reviews");
+  if (generation !== admin.reviewLoadGeneration) return;
+  if (!Array.isArray(payload.reviews)) throw new Error("Token review list is unavailable");
+  const current = new Map(admin.tokenReviews.map(review => [review.request_id, review]));
+  admin.tokenReviews = payload.reviews.slice(0, 50).map(review => {
+    const previous = current.get(review.request_id);
+    return previous && previous.revision > review.revision ? previous : review;
+  });
+  renderTokenReviews();
+}
+
+async function actOnTokenReview(review, action) {
+  const suffixes = {approve:"decision", reject:"decision", retry:"notification/retry", start:"start"};
+  if (!canReviewTokens() || !validReviewIdentity(review)
+      || !Object.hasOwn(suffixes, action) || admin.reviewActions.has(review.request_id)) return;
+  if ((["approve", "reject"].includes(action) && review.status !== "pending_review")
+      || (action === "start" && review.status !== "approved")) return;
+  admin.reviewActions.add(review.request_id);
+  ++admin.reviewLoadGeneration;
+  renderTokenReviews();
+  const payload = {expected_revision: review.revision};
+  if (["approve", "reject"].includes(action)) payload.decision = action;
+  let updated;
+  try {
+    updated = await request(`/api/admin/token-reviews/${review.request_id}/${suffixes[action]}`, {
+      method:"POST", body:JSON.stringify(payload),
+    });
+    showReviewStatus(`Request ${updated.request_id} · review ${updated.status}. Email notification: ${updated.notification?.status || "unknown"}.`
+      + (action === "approve" ? " Approval does not start collection. Use Start onboarding separately." : ""));
+  } catch (error) {
+    updated = error.review;
+    showReviewStatus(error.code === "stale_revision"
+      ? "This request changed. Reloading; review the updated request again before choosing an action."
+      : error.message);
+  } finally {
+    if (validReviewIdentity(updated) && updated.request_id === review.request_id) {
+      admin.tokenReviews = admin.tokenReviews.map(item => item.request_id === updated.request_id
+        && item.revision <= updated.revision ? updated : item);
+    }
+    admin.reviewActions.delete(review.request_id);
+    renderTokenReviews();
+    await loadTokenReviews().catch(showAdminError);
+    if (action === "start") await loadJobs().catch(showAdminError);
+  }
+}
+
 function startPolling() {
   if (admin.pollTimer) window.clearInterval(admin.pollTimer);
   admin.pollTimer = window.setInterval(
@@ -152,6 +318,7 @@ function startPolling() {
       loadJobs(),
       loadRetryWindows(),
       loadManualReviews(),
+      loadTokenReviews(),
     ]).catch(showAdminError),
     5000,
   );
@@ -163,12 +330,14 @@ async function showWorkspace(session) {
   byId("admin-view").hidden = false;
   byId("session-user").textContent = session.login_required === false ? "Open access" : session.username;
   byId("logout-button").hidden = session.login_required === false;
+  byId("add-token-button").disabled = true;
   setDefaultDates();
   await Promise.all([
     loadTokens(),
     loadJobs(),
     loadRetryWindows(),
     loadManualReviews(),
+    loadTokenReviews(),
   ]);
   startPolling();
 }
@@ -233,6 +402,7 @@ byId("token-resolve-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   clearAdminError();
   admin.tokenCandidate = null;
+  byId("add-token-button").disabled = true;
   byId("token-preview").hidden = true;
   byId("token-onboarding-status").hidden = true;
   byId("resolve-token-button").disabled = true;
@@ -254,13 +424,13 @@ byId("token-resolve-form").addEventListener("submit", async (event) => {
       ? `${pools[0].dex} · ${pools[0].pool_name}`
       : "No usable pool";
     byId("token-preview").hidden = false;
-    byId("add-token-button").disabled = false;
+    byId("add-token-button").disabled = candidate.already_configured === true || !canReviewTokens();
     byId("add-token-button").querySelector("span").textContent = candidate.already_configured
-      ? "Confirm existing Token"
-      : "Add & collect";
+      ? "Already active"
+      : "Submit for review";
     byId("token-onboarding-status").textContent = candidate.already_configured
-      ? `Already configured (${candidate.registration.origin}, ${candidate.registration.status}). Confirmation is idempotent.`
-      : "Identity and pool membership validated. No CEX pair has been inferred.";
+      ? "This contract is already active and cannot be submitted for review."
+      : "Identity and pool membership validated. Submission does not add a catalog entry or start collection.";
     byId("token-onboarding-status").hidden = false;
   } catch (error) {
     showAdminError(error);
@@ -270,12 +440,13 @@ byId("token-resolve-form").addEventListener("submit", async (event) => {
 });
 
 byId("add-token-button").addEventListener("click", async () => {
-  if (!admin.tokenCandidate) return;
+  const candidate = admin.tokenCandidate;
+  if (!candidate || candidate.already_configured || !canReviewTokens() || byId("add-token-button").disabled) return;
   clearAdminError();
   byId("add-token-button").disabled = true;
   try {
-    const identity = admin.tokenCandidate.identity;
-    const job = await request("/api/admin/tokens", {
+    const identity = candidate.identity;
+    const review = await request("/api/admin/tokens", {
       method: "POST",
       body: JSON.stringify({
         chain: identity.chain,
@@ -284,14 +455,16 @@ byId("add-token-button").addEventListener("click", async () => {
         history_days: Number(byId("token-history-days").value),
       }),
     });
-    byId("token-onboarding-status").textContent = job.status === "succeeded"
-      ? `${identity.token_symbol} was already active; no duplicate registry entry was created.`
-      : `${identity.token_symbol} onboarding queued as job ${job.job_id}.`;
+    if (admin.tokenCandidate !== candidate) return;
+    byId("token-onboarding-status").textContent = `Request ${review.request_id} · ${review.token_symbol} · ${review.chain}:${review.contract_address}. `
+      + `Review: ${review.status}. Email notification: ${review.notification?.status || "unknown"}. `
+      + `${review.deduplicated ? "Existing request; duplicate submission." : "New request."} `
+      + "This submission adds no catalog entry and starts no collection. Review the current state below; approval and Start are separate actions.";
     byId("token-onboarding-status").hidden = false;
-    await Promise.all([loadTokens(), loadJobs()]);
+    await loadTokenReviews().catch(showAdminError);
   } catch (error) {
+    if (admin.tokenCandidate !== candidate) return;
     showAdminError(error);
-  } finally {
     byId("add-token-button").disabled = false;
   }
 });
@@ -333,6 +506,10 @@ byId("logout-button").addEventListener("click", async () => {
 });
 
 byId("reload-jobs").addEventListener("click", () => loadJobs().catch(showAdminError));
+window.addEventListener("hashchange", () => {
+  admin.focusedReviewHash = null;
+  focusLinkedReview();
+});
 
 initializeAdmin().catch(showAdminError);
 if (window.lucide) window.lucide.createIcons();

@@ -100,7 +100,7 @@ function renderTokenCandidate(candidate) {
     "public-token-status",
     candidate.already_configured
       ? "This contract is already configured."
-      : "Identity verified. Review it, then start the fixed 30-day collection.",
+      : "Identity verified. Submit for 1/1 authenticated review. Approval and explicit Start are separate; no collection starts on submission.",
     candidate.already_configured ? "warning" : "success",
   );
 }
@@ -204,9 +204,6 @@ function storeJobIds() {
 }
 
 function jobScope(job) {
-  if (job.job_type === "token_onboarding") {
-    return `${job.chain || "chain"} · ${job.contract_address || job.token_symbol || "Token"}`;
-  }
   return `${job.token_symbol || "Token"} · ${job.start_date || "?"} → ${job.end_date || "?"}`;
 }
 
@@ -223,7 +220,7 @@ function renderJobs() {
 
     const identity = document.createElement("div");
     const type = document.createElement("strong");
-    type.textContent = job.job_type === "token_onboarding" ? "Add Token" : "Fact recovery";
+    type.textContent = "Fact recovery";
     const id = document.createElement("small");
     id.textContent = job.job_id;
     identity.append(type, id);
@@ -248,7 +245,7 @@ function renderJobs() {
 }
 
 function rememberJob(job) {
-  if (!job?.job_id) return;
+  if (!job?.job_id || !["retry_failed", "snapshot_refresh"].includes(job.job_type)) return;
   publicActions.jobs.set(job.job_id, job);
   storeJobIds();
   renderJobs();
@@ -268,6 +265,11 @@ async function refreshJobs() {
     const previous = publicActions.jobs.get(jobId) || { job_id: jobId };
     try {
       const job = await request(`/api/actions/jobs/${encodeURIComponent(jobId)}`);
+      if (!["retry_failed", "snapshot_refresh"].includes(job.job_type)) {
+        publicActions.jobs.delete(jobId);
+        storeJobIds();
+        return;
+      }
       publicActions.jobs.set(jobId, job);
       if (
         !TERMINAL_JOB_STATUSES.has(previous.status)
@@ -308,6 +310,7 @@ byId("public-token-resolve-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   clearGlobalError();
   publicActions.candidate = null;
+  byId("public-token-add").disabled = true;
   byId("public-token-preview").hidden = true;
   const button = byId("public-token-resolve");
   button.disabled = true;
@@ -328,13 +331,14 @@ byId("public-token-resolve-form").addEventListener("submit", async (event) => {
 });
 
 byId("public-token-add").addEventListener("click", async () => {
-  const identity = publicActions.candidate?.identity;
-  if (!identity) return;
+  const candidate = publicActions.candidate;
+  const identity = candidate?.identity;
+  if (!identity || candidate.already_configured || byId("public-token-add").disabled) return;
   clearGlobalError();
   const button = byId("public-token-add");
   button.disabled = true;
   try {
-    const job = await request("/api/actions/tokens", {
+    const review = await request("/api/actions/tokens", {
       method: "POST",
       body: JSON.stringify({
         chain: identity.chain,
@@ -342,15 +346,20 @@ byId("public-token-add").addEventListener("click", async () => {
         expected_token_symbol: identity.token_symbol,
       }),
     });
-    rememberJob(job);
+    if (publicActions.candidate !== candidate) return;
+    const existing = review.deduplicated ? "Existing request (duplicate submission)." : "New review request.";
+    const collection = ["onboarding_starting", "onboarding_queued"].includes(review.status)
+      ? "This submission adds no catalog entry and starts no collection. The existing request has already reached onboarding; its status above is authoritative."
+      : "No catalog entry was added by this submission; collection has not started for this review. Approval and explicit Start are separate actions.";
     showStatus(
       "public-token-status",
-      job.status === "succeeded"
-        ? "Token collection completed."
-        : "Token collection accepted. Progress appears below.",
-      job.status === "succeeded" ? "success" : "",
+      `Request ${review.request_id} · ${review.token_symbol} · ${review.chain}:${review.contract_address}. `
+        + `Review: ${review.status}. Email notification: ${review.notification?.status || "unknown"}. `
+        + `${existing} ${collection}`,
+      "",
     );
   } catch (error) {
+    if (publicActions.candidate !== candidate) return;
     showStatus("public-token-status", error.message, "error");
     button.disabled = false;
   }
