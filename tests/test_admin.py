@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from dashboard import server
+from dashboard.token_reviews import TokenReviewError, TokenReviewStore
+from dashboard.token_review_email import TokenReviewEmailSettings
 from dashboard.admin import (
     AdminService,
     MAX_QUALITY_REPORT_BYTES,
@@ -60,6 +62,274 @@ def write_retry_database(path, import_run_id, *, cex_rows=()):
 
 
 class AdminServiceTest(unittest.TestCase):
+    @staticmethod
+    def review_candidate():
+        return {
+            "identity": {
+                "chain": "base", "contract_address": "0x" + "12" * 20,
+                "token_symbol": "XYZ", "token_name": "XYZ Token", "decimals": 18,
+                "coingecko_id": None, "source": "geckoterminal",
+                "source_token_id": "base_0x" + "12" * 20,
+            },
+            "discovery": {"usable_pool_count": 1, "top_pools": []},
+            "capabilities": {"dex_daily": "available"},
+            "registration": {"origin": None, "status": None,
+                             "cex_mapping_status": "requires_manual_review"},
+            "already_configured": False,
+        }
+
+    @staticmethod
+    def review_payload():
+        return {"chain": "base", "contract_address": "0x" + "12" * 20,
+                "expected_token_symbol": "XYZ", "history_days": 30}
+
+    def review_service(self, root, **kwargs):
+        options = dict(
+            username="reviewer", password_hash="hash", enabled=True,
+            login_required=True, data_dir=root, job_dir=root / "jobs",
+            registry_path=root / "registry.json", review_store_path=root / "reviews.sqlite3",
+            review_email_settings=TokenReviewEmailSettings(enabled=False),
+            review_clock=lambda: datetime(2026, 9, 9, 1, 2, 3, tzinfo=timezone.utc),
+        )
+        options.update(kwargs)
+        return AdminService(**options)
+
+    def test_review_database_is_lazy_and_honors_environment_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.dict(os.environ, {"TOKEN_REVIEW_DB_PATH": str(root / "env.sqlite3")}, clear=True):
+                service = AdminService(data_dir=root)
+                self.assertFalse((root / "env.sqlite3").exists())
+                self.assertFalse((root / "admin/token_reviews.sqlite3").exists())
+                self.assertEqual(service.list_token_reviews(), [])
+                self.assertTrue((root / "env.sqlite3").exists())
+
+    def test_review_submission_commits_before_mail_and_deduplicates_without_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deliveries = []
+            def send(review):
+                persisted = TokenReviewStore(root / "reviews.sqlite3").get(review["request_id"])
+                self.assertEqual(persisted["notification"]["status"], "sending")
+                self.assertEqual(persisted["notification"]["attempts"], 1)
+                deliveries.append(persisted)
+            service = self.review_service(root, review_mailer=SimpleNamespace(send=send),
+                                         review_email_settings=TokenReviewEmailSettings(enabled=True))
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()) as resolve, patch("dashboard.admin.threading.Thread") as thread:
+                first = service.submit_token_review(self.review_payload(), "public:add_token")
+                second = service.submit_token_review({**self.review_payload(), "history_days": 90}, "reviewer")
+            self.assertEqual(resolve.call_count, 2)
+            self.assertEqual(first["status"], "pending_review")
+            self.assertEqual(first["notification"]["status"], "sent")
+            self.assertFalse(first["deduplicated"])
+            self.assertTrue(second["deduplicated"])
+            self.assertEqual(first["request_id"], second["request_id"])
+            self.assertEqual(second["requested_history_days"], 30)
+            self.assertEqual(len(deliveries), 1)
+            self.assertEqual(service.count_token_reviews_created_on(date(2026, 9, 9)), 1)
+            self.assertEqual(service.count_token_reviews_created_on(date(2026, 9, 10)), 0)
+            self.assertEqual(service.registry.list_records(), [])
+            self.assertEqual(service.jobs, {})
+            self.assertFalse((root / "jobs").exists())
+            thread.assert_not_called()
+
+    def test_review_submission_rejects_changed_symbol_and_active_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.review_service(root)
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                with self.assertRaises(TokenReviewError) as caught:
+                    service.submit_token_review({**self.review_payload(), "expected_token_symbol": "FORGED"}, "public:add_token")
+                self.assertEqual(caught.exception.code, "identity_changed")
+                service.registry.upsert(self.runtime_record())
+                with self.assertRaises(TokenReviewError) as caught:
+                    service.submit_token_review(self.review_payload(), "public:add_token")
+                self.assertEqual(caught.exception.code, "token_already_active")
+            self.assertFalse((root / "reviews.sqlite3").exists())
+            self.assertEqual(service.jobs, {})
+
+    def test_review_email_disabled_and_invalid_settings_still_persist(self):
+        for environment, expected in [({}, "disabled"), ({"TOKEN_REVIEW_EMAIL_ENABLED": "true"}, "unconfigured")]:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mailer = Mock()
+                with patch.dict(os.environ, environment, clear=True):
+                    service = self.review_service(root, review_email_settings=None, review_mailer=mailer)
+                    with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                        review = service.submit_token_review(self.review_payload(), "public:add_token")
+                self.assertEqual(review["notification"]["status"], expected)
+                self.assertEqual(review["notification"]["attempts"], 0)
+                self.assertEqual(service.list_token_reviews()[0]["request_id"], review["request_id"])
+                mailer.send.assert_not_called()
+
+    def test_review_mail_failure_and_retries_use_persisted_cooldown_and_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = [datetime(2026, 9, 9, 1, 2, 3, tzinfo=timezone.utc)]
+            mailer = Mock()
+            mailer.send.side_effect = RuntimeError("secret-password /private/relay.conf")
+            options = dict(review_mailer=mailer, review_clock=lambda: now[0],
+                           review_email_settings=TokenReviewEmailSettings(enabled=True))
+            service = self.review_service(root, **options)
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+            self.assertEqual(review["notification"]["status"], "failed")
+            self.assertEqual(review["notification"]["error_code"], "notification_send_failed")
+            self.assertNotIn("secret-password", json.dumps(service.list_token_reviews()))
+            self.assertNotIn("/private/relay.conf", json.dumps(service.list_token_reviews()))
+            service = self.review_service(root, **options)
+            with self.assertRaises(TokenReviewError) as caught:
+                service.retry_token_review_notification(review["request_id"], {"expected_revision": review["revision"]}, "reviewer")
+            self.assertEqual(caught.exception.code, "notification_cooldown")
+            for minute in (3, 4):
+                now[0] = datetime(2026, 9, 9, 1, minute, 3, tzinfo=timezone.utc)
+                review = service.retry_token_review_notification(review["request_id"], {"expected_revision": review["revision"]}, "reviewer")
+            now[0] = datetime(2026, 9, 9, 1, 5, 3, tzinfo=timezone.utc)
+            with self.assertRaises(TokenReviewError) as caught:
+                service.retry_token_review_notification(review["request_id"], {"expected_revision": review["revision"]}, "reviewer")
+            self.assertEqual(caught.exception.code, "notification_attempt_limit")
+            self.assertEqual(mailer.send.call_count, 3)
+
+    def test_review_decisions_and_retry_start_require_configured_login_identity(self):
+        for login_required, actor in [(True, "someone_else"), (False, "reviewer")]:
+            with self.subTest(login_required=login_required, actor=actor), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                service = self.review_service(root, login_required=login_required, allow_open_local=True)
+                with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                    review = service.submit_token_review(self.review_payload(), "public:add_token")
+                for method, payload in [
+                    (service.decide_token_review, {"decision": "approve", "expected_revision": review["revision"]}),
+                    (service.decide_token_review, {"decision": "reject", "expected_revision": review["revision"]}),
+                    (service.retry_token_review_notification, {"expected_revision": review["revision"]}),
+                    (service.start_token_review_onboarding, {"expected_revision": review["revision"]}),
+                ]:
+                    with self.assertRaises(TokenReviewError) as caught:
+                        method(review["request_id"], payload, actor)
+                    self.assertEqual(caught.exception.code, "reviewer_required")
+                self.assertEqual(service.list_token_reviews()[0]["status"], "pending_review")
+                self.assertEqual(service.jobs, {})
+
+    def test_review_approval_is_revision_checked_and_has_no_onboarding_side_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.review_service(root)
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()), patch("dashboard.admin.threading.Thread") as thread:
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+                approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+                with self.assertRaises(TokenReviewError) as caught:
+                    service.decide_token_review(review["request_id"], {"decision": "reject", "expected_revision": review["revision"]}, "reviewer")
+                self.assertEqual(caught.exception.code, "stale_revision")
+            self.assertEqual(approved["status"], "approved")
+            self.assertEqual(approved["reviewer"], "reviewer")
+            self.assertEqual(service.registry.list_records(), [])
+            self.assertEqual(service.jobs, {})
+            self.assertFalse((root / "jobs").exists())
+            thread.assert_not_called()
+
+    def test_review_rejection_is_final_and_pending_cannot_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.review_service(Path(directory))
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+                with self.assertRaises(TokenReviewError) as caught:
+                    service.start_token_review_onboarding(review["request_id"], {"expected_revision": review["revision"]}, "reviewer")
+                self.assertEqual(caught.exception.code, "invalid_review_transition")
+                rejected = service.decide_token_review(review["request_id"], {"decision": "reject", "expected_revision": review["revision"]}, "reviewer")
+                duplicate = service.submit_token_review(self.review_payload(), "public:add_token")
+                self.assertEqual(duplicate["status"], "rejected")
+            with self.assertRaises(TokenReviewError) as caught:
+                service.start_token_review_onboarding(review["request_id"], {"expected_revision": rejected["revision"]}, "reviewer")
+            self.assertEqual(caught.exception.code, "invalid_review_transition")
+            self.assertEqual(service.jobs, {})
+
+    def test_review_start_reserves_state_and_uses_stored_identity_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.review_service(root)
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+                approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+                original_create = service.create_onboarding_job
+                def create(payload, username):
+                    self.assertEqual(service.list_token_reviews()[0]["status"], "onboarding_starting")
+                    self.assertEqual(payload, {"chain": "base", "contract_address": "0x" + "12" * 20,
+                                               "expected_token_symbol": "XYZ", "history_days": 30})
+                    return original_create(payload, username)
+                with patch.object(service, "create_onboarding_job", side_effect=create), patch("dashboard.admin.threading.Thread") as thread:
+                    started = service.start_token_review_onboarding(review["request_id"], {"expected_revision": approved["revision"]}, "reviewer")
+                    for revision in (approved["revision"], started["revision"]):
+                        with self.assertRaises(TokenReviewError):
+                            service.start_token_review_onboarding(review["request_id"], {"expected_revision": revision}, "reviewer")
+                    thread.return_value.start.assert_called_once_with()
+            self.assertEqual(started["status"], "onboarding_queued")
+            self.assertEqual(len(service.jobs), 1)
+            self.assertIn(started["onboarding_job_id"], service.jobs)
+            self.assertEqual(service.registry.list_records()[0]["status"], "pending")
+
+    def test_review_start_failure_restores_approved_with_stable_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.review_service(root)
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+                approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+                with patch.object(service, "_save_job", side_effect=OSError("secret /private/jobs.json")):
+                    service.review_clock = lambda: datetime(2026, 9, 9, 2, 0, 0, tzinfo=timezone.utc)
+                    failed = service.start_token_review_onboarding(review["request_id"], {"expected_revision": approved["revision"]}, "reviewer")
+            self.assertEqual(failed["status"], "approved")
+            self.assertEqual(failed["onboarding_error_code"], "onboarding_start_failed")
+            self.assertEqual(failed["reviewed_at"], approved["reviewed_at"])
+            self.assertNotIn("secret", json.dumps(service.list_token_reviews()))
+            self.assertEqual(service.jobs, {})
+            self.assertEqual(service.registry.list_records(), [])
+
+    def test_review_mutations_reject_extra_or_missing_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.review_service(Path(directory))
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+            for method, payload in [
+                (service.decide_token_review, {"decision": "onboarding_queued", "expected_revision": review["revision"]}),
+                (service.decide_token_review, {"decision": "approve", "expected_revision": review["revision"], "chain": "eth"}),
+                (service.start_token_review_onboarding, {"expected_revision": review["revision"], "history_days": 180}),
+                (service.retry_token_review_notification, {}),
+            ]:
+                with self.assertRaises(TokenReviewError) as caught:
+                    method(review["request_id"], payload, "reviewer")
+                self.assertEqual(caught.exception.code, "invalid_review_request")
+
+    def test_review_notification_completion_survives_concurrent_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def send(review):
+                other = self.review_service(root)
+                other.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+            service = self.review_service(root, review_mailer=SimpleNamespace(send=send),
+                                         review_email_settings=TokenReviewEmailSettings(enabled=True))
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+            self.assertEqual(review["status"], "approved")
+            self.assertEqual(review["notification"]["status"], "sent")
+            self.assertEqual(service.jobs, {})
+
+    def test_review_start_completion_survives_concurrent_notification_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.review_service(root)
+            other = self.review_service(root, review_clock=lambda: datetime(2026, 9, 9, 1, 3, 3, tzinfo=timezone.utc))
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+                approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+                original_create = service.create_onboarding_job
+                def create(payload, username):
+                    current = other.list_token_reviews()[0]
+                    other.retry_token_review_notification(current["request_id"], {"expected_revision": current["revision"]}, "reviewer")
+                    return original_create(payload, username)
+                with patch.object(service, "create_onboarding_job", side_effect=create), patch("dashboard.admin.threading.Thread"):
+                    started = service.start_token_review_onboarding(review["request_id"], {"expected_revision": approved["revision"]}, "reviewer")
+            self.assertEqual(started["status"], "onboarding_queued")
+            self.assertEqual(len(service.jobs), 1)
+
     @staticmethod
     def runtime_record(
         *,

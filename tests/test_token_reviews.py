@@ -34,6 +34,37 @@ def candidate(*, chain="ETH", address=ADDRESS.upper().replace("0X", "0x"), symbo
 
 
 class TokenReviewStoreTest(unittest.TestCase):
+    def test_start_rollback_preserves_original_reviewer_and_decision_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenReviewStore(Path(directory) / "reviews.sqlite3")
+            review, _ = store.create_or_get(candidate(), requested_history_days=30, submitter="public")
+            approved = store.transition(review["request_id"], "approved", expected_revision=review["revision"], actor="reviewer", at="2026-09-09T01:00:00+00:00")
+            starting = store.transition(review["request_id"], "onboarding_starting", expected_revision=approved["revision"], actor="reviewer")
+            restored = store.transition(review["request_id"], "approved", expected_revision=starting["revision"], actor="system", onboarding_error_code="onboarding_start_failed", at="2026-09-09T02:00:00+00:00")
+            self.assertEqual(restored["reviewer"], "reviewer")
+            self.assertEqual(restored["reviewed_at"], "2026-09-09T01:00:00+00:00")
+            self.assertEqual(restored["audit"][-1]["at"], "2026-09-09T02:00:00+00:00")
+
+    def test_unavailable_notification_is_durable_without_consuming_smtp_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenReviewStore(Path(directory) / "reviews.sqlite3")
+            review, _ = store.create_or_get(candidate(), requested_history_days=30, submitter="public")
+            unavailable = store.record_notification(
+                review["request_id"], expected_revision=review["revision"],
+                status="disabled", actor="system", at="2026-09-09T01:00:00+00:00",
+                retry_at="2026-09-09T01:01:00+00:00",
+            )
+            self.assertEqual(unavailable["notification"]["attempts"], 0)
+            self.assertEqual(unavailable["notification"]["retry_at"], "2026-09-09T01:01:00+00:00")
+            with self.assertRaises(TokenReviewError) as caught:
+                store.record_notification(review["request_id"], expected_revision=review["revision"], status="unconfigured", actor="system")
+            self.assertEqual(caught.exception.code, "stale_revision")
+            with self.assertRaises(TokenReviewError) as caught:
+                store.record_notification(review["request_id"], expected_revision=unavailable["revision"], status="sent", actor="system")
+            self.assertEqual(caught.exception.code, "invalid_notification_transition")
+            claimed = store.claim_notification_attempt(review["request_id"], expected_revision=unavailable["revision"], actor="reviewer")
+            self.assertEqual(claimed["notification"]["attempts"], 1)
+
     def test_create_persists_canonical_identity_digest_notification_and_audit(self):
         with tempfile.TemporaryDirectory() as directory:
             store = TokenReviewStore(Path(directory) / "reviews.sqlite3")

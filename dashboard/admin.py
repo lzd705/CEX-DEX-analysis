@@ -75,6 +75,10 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
     )
 
 
+from dashboard.token_reviews import MAX_AUDIT_EVENTS, TokenReviewError, TokenReviewStore
+from dashboard.token_review_email import SmtpTokenReviewMailer, TokenReviewEmailSettings
+
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TOKEN_CONFIG_PATH = PROJECT_ROOT / "config/tokens.csv"
 TOKEN_CHAIN_CONFIG_PATH = PROJECT_ROOT / "config/token_chains.csv"
@@ -243,6 +247,10 @@ class AdminService:
         database_path: Path | None = None,
         data_dir: Path | None = None,
         collection_lock_path: Path | None = None,
+        review_store_path: Path | None = None,
+        review_mailer: Any = None,
+        review_email_settings: TokenReviewEmailSettings | None = None,
+        review_clock: Any = None,
     ) -> None:
         self.username = username if username is not None else os.environ.get("ADMIN_USERNAME", "admin")
         self.password_hash = password_hash if password_hash is not None else os.environ.get("ADMIN_PASSWORD_HASH", "")
@@ -302,6 +310,15 @@ class AdminService:
         self.registry_error: str | None = None
         self.state_lock = threading.Lock()
         self.worker_lock = threading.Lock()
+        self.review_store_path = Path(
+            review_store_path or os.environ.get("TOKEN_REVIEW_DB_PATH")
+            or self.data_dir / "admin/token_reviews.sqlite3"
+        ).expanduser()
+        self._review_store: TokenReviewStore | None = None
+        self._review_store_lock = threading.Lock()
+        self.review_mailer = review_mailer
+        self.review_email_settings = review_email_settings
+        self.review_clock = review_clock or utc_now
         self._load_jobs()
 
     @property
@@ -528,6 +545,165 @@ class AdminService:
         if not _valid_quality_report_structure(report):
             raise ValueError("Daily quality report has an invalid contract")
         return report
+
+    def _token_review_store(self) -> TokenReviewStore:
+        with self._review_store_lock:
+            if self._review_store is None:
+                self._review_store = TokenReviewStore(self.review_store_path)
+            return self._review_store
+
+    def list_token_reviews(self, *, limit: Any = 50) -> list[dict[str, Any]]:
+        return self._token_review_store().list_reviews(limit=limit)
+
+    def count_token_reviews_created_on(self, value: date | str) -> int:
+        return self._token_review_store().count_created_on(value)
+
+    def _require_token_reviewer(self, username: str) -> None:
+        # The HTTP boundary supplies the authenticated session identity.
+        # An open-local session never identifies the configured reviewer.
+        if not self.enabled or not self.login_required or not self.username or username != self.username:
+            raise TokenReviewError("reviewer_required", "Configured administrator login is required")
+
+    def submit_token_review(self, payload: dict[str, Any], username: str) -> dict[str, Any]:
+        candidate = self.resolve_token(payload.get("chain"), payload.get("contract_address"))
+        expected_symbol = str(payload.get("expected_token_symbol") or "").strip().upper()
+        if not expected_symbol or expected_symbol != candidate["identity"]["token_symbol"]:
+            raise TokenReviewError("identity_changed", "Resolved Token symbol no longer matches the confirmed preview")
+        if candidate["registration"]["status"] == "active":
+            raise TokenReviewError("token_already_active", "Token is already active")
+        store = self._token_review_store()
+        review, duplicate = store.create_or_get(
+            candidate, requested_history_days=payload.get("history_days", 180),
+            submitter=username, created_at=self.review_clock().isoformat(),
+        )
+        if not duplicate:
+            review = self._notify_token_review(review, username)
+        return {**review, "deduplicated": duplicate}
+
+    def _notify_token_review(self, review: dict[str, Any], username: str) -> dict[str, Any]:
+        store = self._token_review_store()
+        now = self.review_clock()
+        retry_at = (now + timedelta(seconds=60)).isoformat()
+        try:
+            settings = self.review_email_settings
+            if settings is None:
+                settings = TokenReviewEmailSettings.from_environment()
+            unavailable = "disabled" if not settings.enabled else None
+        except TokenReviewError:
+            settings = None
+            unavailable = "unconfigured"
+        if unavailable is not None:
+            return store.record_notification(
+                review["request_id"], expected_revision=review["revision"],
+                status=unavailable, actor=username, retry_at=retry_at, at=now.isoformat(),
+            )
+        claimed = store.claim_notification_attempt(
+            review["request_id"], expected_revision=review["revision"],
+            actor=username, at=now.isoformat(),
+        )
+        try:
+            mailer = self.review_mailer
+            if mailer is None:
+                mailer = SmtpTokenReviewMailer(settings)
+            mailer.send(claimed)
+        except Exception:
+            # Never retain adapter text, credentials, or local paths.
+            status, error_code = "failed", "notification_send_failed"
+        else:
+            status, error_code = "sent", None
+        completed_at = self.review_clock()
+        return self._complete_token_review_effect(
+            claimed, "notification", lambda revision: store.record_notification(
+                review["request_id"], expected_revision=revision,
+                status=status, actor=username, error_code=error_code,
+                retry_at=(completed_at + timedelta(seconds=60)).isoformat() if error_code else None,
+                at=completed_at.isoformat(),
+            ),
+        )
+
+    def _complete_token_review_effect(self, reserved: dict[str, Any], field: str, write: Any) -> dict[str, Any]:
+        """Finish a reserved effect across changes to the independent state field."""
+        current = reserved
+        # Each competing write consumes one of the ledger's bounded audit events.
+        # Retry persistence only: never repeat SMTP or create_onboarding_job here.
+        for _ in range(MAX_AUDIT_EVENTS):
+            try:
+                return write(current["revision"])
+            except TokenReviewError as error:
+                if error.code != "stale_revision":
+                    raise
+                current = self._token_review_store().get(reserved["request_id"])
+                if current[field] != reserved[field]:
+                    raise
+        raise TokenReviewError("stale_revision", "Review has changed; reload it")
+
+    def retry_token_review_notification(
+        self, request_id: str, payload: dict[str, Any], username: str,
+    ) -> dict[str, Any]:
+        self._require_token_reviewer(username)
+        self._validate_token_review_action(payload, {"expected_revision"})
+        review = self._token_review_store().get(request_id)
+        if payload.get("expected_revision") != review["revision"] or isinstance(payload.get("expected_revision"), bool):
+            raise TokenReviewError("stale_revision", "Review has changed; reload it")
+        notification = review["notification"]
+        if notification["status"] not in {"failed", "disabled", "unconfigured"}:
+            raise TokenReviewError("invalid_notification_transition", "Notification cannot be retried")
+        if notification["attempts"] >= 3:
+            raise TokenReviewError("notification_attempt_limit", "Notification attempt limit reached")
+        if notification["retry_at"] and self.review_clock() < datetime.fromisoformat(notification["retry_at"]):
+            raise TokenReviewError("notification_cooldown", "Notification retry cooldown is active", retryable=True)
+        return self._notify_token_review(review, username)
+
+    @staticmethod
+    def _validate_token_review_action(payload: Any, fields: set[str]) -> None:
+        if not isinstance(payload, dict) or set(payload) != fields:
+            raise TokenReviewError("invalid_review_request", "Review action fields are invalid")
+        revision = payload.get("expected_revision")
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+            raise TokenReviewError("invalid_revision", "Review revision is invalid")
+
+    def decide_token_review(
+        self, request_id: str, payload: dict[str, Any], username: str,
+    ) -> dict[str, Any]:
+        self._require_token_reviewer(username)
+        self._validate_token_review_action(payload, {"decision", "expected_revision"})
+        decision = payload["decision"]
+        if decision not in ("approve", "reject"):
+            raise TokenReviewError("invalid_review_request", "Review decision is invalid")
+        return self._token_review_store().transition(
+            request_id, "approved" if decision == "approve" else "rejected",
+            expected_revision=payload["expected_revision"], actor=username,
+            at=self.review_clock().isoformat(),
+        )
+
+    def start_token_review_onboarding(
+        self, request_id: str, payload: dict[str, Any], username: str,
+    ) -> dict[str, Any]:
+        self._require_token_reviewer(username)
+        self._validate_token_review_action(payload, {"expected_revision"})
+        store = self._token_review_store()
+        reserved = store.transition(
+            request_id, "onboarding_starting", expected_revision=payload["expected_revision"],
+            actor=username, at=self.review_clock().isoformat(),
+        )
+        try:
+            job = self.create_onboarding_job({
+                "chain": reserved["chain"],
+                "contract_address": reserved["contract_address"],
+                "expected_token_symbol": reserved["token_symbol"],
+                "history_days": reserved["requested_history_days"],
+            }, username)
+        except (ValueError, OSError, AdminJobBusyError, AdminWorkerStartError):
+            target, job_id, error_code = "approved", None, "onboarding_start_failed"
+        else:
+            target, job_id, error_code = "onboarding_queued", job["job_id"], None
+        return self._complete_token_review_effect(
+            reserved, "status", lambda revision: store.transition(
+                request_id, target, expected_revision=revision, actor=username,
+                onboarding_job_id=job_id, onboarding_error_code=error_code,
+                at=self.review_clock().isoformat(),
+            ),
+        )
 
     def resolve_token(
         self,

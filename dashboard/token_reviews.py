@@ -659,7 +659,7 @@ class TokenReviewStore:
                     raise TokenReviewError("stale_revision", "Review has changed; reload it")
                 if target_status not in TRANSITIONS.get(current["status"], set()):
                     raise TokenReviewError("invalid_review_transition", "Review state transition is invalid")
-                reviewer = actor_text if target_status in {"approved", "rejected"} else None
+                reviewer = actor_text if current["status"] == "pending_review" else None
                 reviewed_at = timestamp if reviewer is not None else None
                 cursor = connection.execute(
                     """UPDATE token_reviews SET
@@ -781,7 +781,9 @@ class TokenReviewStore:
         retry_timestamp = _utc_timestamp(retry_at) if retry_at is not None else None
         if status == "failed" and code is None:
             raise TokenReviewError("invalid_notification_error", "Notification error is invalid")
-        if status != "failed" and (code is not None or retry_timestamp is not None):
+        if status != "failed" and code is not None:
+            raise TokenReviewError("invalid_notification_error", "Notification error is invalid")
+        if status == "sent" and retry_timestamp is not None:
             raise TokenReviewError("invalid_notification_error", "Notification error is invalid")
         try:
             with self._connect() as connection:
@@ -794,7 +796,11 @@ class TokenReviewStore:
                     raise TokenReviewError("review_not_found", "Review request was not found")
                 if int(current["revision"]) != revision:
                     raise TokenReviewError("stale_revision", "Review has changed; reload it")
-                if current["notification_status"] != "sending":
+                unavailable_without_attempt = (
+                    status in {"disabled", "unconfigured"}
+                    and current["notification_status"] in {"pending", "failed", "disabled", "unconfigured"}
+                )
+                if current["notification_status"] != "sending" and not unavailable_without_attempt:
                     raise TokenReviewError(
                         "invalid_notification_transition",
                         "Notification state transition is invalid",
