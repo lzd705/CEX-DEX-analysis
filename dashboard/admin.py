@@ -593,14 +593,25 @@ class AdminService:
             settings = None
             unavailable = "unconfigured"
         if unavailable is not None:
-            return store.record_notification(
-                review["request_id"], expected_revision=review["revision"],
+            write = lambda revision: store.record_notification(
+                review["request_id"], expected_revision=revision,
                 status=unavailable, actor=username, retry_at=retry_at, at=now.isoformat(),
             )
-        claimed = store.claim_notification_attempt(
-            review["request_id"], expected_revision=review["revision"],
-            actor=username, at=now.isoformat(),
+        else:
+            write = lambda revision: store.claim_notification_attempt(
+                review["request_id"], expected_revision=revision,
+                actor=username, at=now.isoformat(),
+            )
+        # Initial delivery owns the pending outbox entry. Approval may change
+        # its review revision before the first claim, without changing that entry.
+        # Explicit retries still require the caller's original revision to match.
+        claimed = (
+            self._complete_token_review_effect(review, "notification", write)
+            if review["notification"]["status"] == "pending"
+            else write(review["revision"])
         )
+        if unavailable is not None:
+            return claimed
         try:
             mailer = self.review_mailer
             if mailer is None:
@@ -670,7 +681,13 @@ class AdminService:
         decision = payload["decision"]
         if decision not in ("approve", "reject"):
             raise TokenReviewError("invalid_review_request", "Review decision is invalid")
-        return self._token_review_store().transition(
+        store = self._token_review_store()
+        review = store.get(request_id)
+        if review["revision"] != payload["expected_revision"]:
+            raise TokenReviewError("stale_revision", "Review has changed; reload it")
+        if review["status"] != "pending_review":
+            raise TokenReviewError("invalid_review_transition", "Only pending reviews can be decided")
+        return store.transition(
             request_id, "approved" if decision == "approve" else "rejected",
             expected_revision=payload["expected_revision"], actor=username,
             at=self.review_clock().isoformat(),

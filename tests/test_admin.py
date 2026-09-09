@@ -330,6 +330,59 @@ class AdminServiceTest(unittest.TestCase):
             self.assertEqual(started["status"], "onboarding_queued")
             self.assertEqual(len(service.jobs), 1)
 
+    def test_review_approval_cannot_undo_in_progress_start_reservation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.review_service(root)
+            other = self.review_service(root)
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+            approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+            entered, release = Event(), Event()
+            calls = []
+            def create(payload, username):
+                calls.append(payload)
+                entered.set()
+                self.assertTrue(release.wait(5))
+                return {"job_id": "one-onboarding-job"}
+            with patch.object(service, "create_onboarding_job", side_effect=create), ThreadPoolExecutor(max_workers=1) as executor:
+                pending_start = executor.submit(service.start_token_review_onboarding, review["request_id"], {"expected_revision": approved["revision"]}, "reviewer")
+                try:
+                    self.assertTrue(entered.wait(5))
+                    reserved = other.list_token_reviews()[0]
+                    self.assertEqual(reserved["status"], "onboarding_starting")
+                    for decision in ("approve", "reject"):
+                        with self.assertRaises(TokenReviewError) as caught:
+                            other.decide_token_review(review["request_id"], {"decision": decision, "expected_revision": reserved["revision"]}, "reviewer")
+                        self.assertEqual(caught.exception.code, "invalid_review_transition")
+                    with self.assertRaises(TokenReviewError):
+                        service.start_token_review_onboarding(review["request_id"], {"expected_revision": reserved["revision"]}, "reviewer")
+                finally:
+                    release.set()
+                started = pending_start.result(timeout=5)
+            self.assertEqual(started["status"], "onboarding_queued")
+            self.assertEqual(len(calls), 1)
+
+    def test_review_initial_notification_reconciles_approval_before_claim(self):
+        for configuration, expected_status in (("enabled", "sent"), ("disabled", "disabled"), ("invalid", "unconfigured")):
+            with self.subTest(configuration=configuration), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mailer = Mock()
+                settings = None if configuration == "invalid" else TokenReviewEmailSettings(enabled=configuration == "enabled")
+                service = self.review_service(root, review_email_settings=settings, review_mailer=mailer)
+                other = self.review_service(root)
+                original_notify = service._notify_token_review
+                def notify(review, username):
+                    other.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+                    return original_notify(review, username)
+                with patch.dict(os.environ, {"TOKEN_REVIEW_EMAIL_ENABLED": "true"}, clear=True), patch.object(service, "_notify_token_review", side_effect=notify), patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                    review = service.submit_token_review(self.review_payload(), "public:add_token")
+                self.assertEqual(review["status"], "approved")
+                self.assertEqual(review["notification"]["status"], expected_status)
+                self.assertEqual(review["notification"]["attempts"], 1 if configuration == "enabled" else 0)
+                self.assertEqual(mailer.send.call_count, 1 if configuration == "enabled" else 0)
+                self.assertEqual(service.jobs, {})
+
     @staticmethod
     def runtime_record(
         *,
