@@ -580,6 +580,26 @@ class TokenReviewStore:
 
     get_review = get
 
+    def has_identity(self, chain: Any, contract_address: Any) -> bool:
+        """Look up a canonical identity without resolution or review mutation."""
+        try:
+            canonical_chain = normalize_chain(chain)
+            canonical_address = normalize_contract_address(canonical_chain, contract_address)
+        except TokenRegistryError as error:
+            raise _error_from_registry(error) from error
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT request_id FROM token_reviews WHERE chain = ? AND contract_address = ?",
+                    (canonical_chain, canonical_address),
+                ).fetchone()
+                if row is None:
+                    return False
+                self._load(connection, row["request_id"])
+                return True
+        except sqlite3.DatabaseError as error:
+            raise TokenReviewError("invalid_review_database", "Token review database is invalid") from error
+
     def list_reviews(self, *, limit: Any = MAX_LIST_RECORDS) -> list[dict[str, Any]]:
         if isinstance(limit, bool):
             raise TokenReviewError("invalid_list_limit", "Review list limit is invalid")

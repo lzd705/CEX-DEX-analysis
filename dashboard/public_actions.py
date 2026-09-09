@@ -212,6 +212,7 @@ class PublicActionPolicy:
         client_address: str,
         *,
         service: Any | None = None,
+        token_identity: tuple[str, str] | None = None,
     ) -> Iterator[None]:
         """Reserve one bounded in-flight request and enforce accepted-job budget."""
         try:
@@ -256,7 +257,14 @@ class PublicActionPolicy:
                 current_time = self._utc_now().astimezone(timezone.utc)
                 current_day = current_time.date()
                 if action == "token_add":
-                    accepted = service.count_token_reviews_created_on(current_day)
+                    # Keep lookup, budget check and concurrency reservation under
+                    # one lock. Existing receipts still consume request limits,
+                    # but cannot create another durable review or notification.
+                    existing = (
+                        token_identity is not None
+                        and service.has_token_review(*token_identity) is True
+                    )
+                    accepted = 0 if existing else service.count_token_reviews_created_on(current_day)
                 else:
                     accepted = service.count_jobs_created_on(
                         requested_by=limit.requested_by,

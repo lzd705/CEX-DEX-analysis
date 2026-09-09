@@ -558,6 +558,9 @@ class AdminService:
     def count_token_reviews_created_on(self, value: date | str) -> int:
         return self._token_review_store().count_created_on(value)
 
+    def has_token_review(self, chain: Any, contract_address: Any) -> bool:
+        return self._token_review_store().has_identity(chain, contract_address)
+
     def _require_token_reviewer(self, username: str) -> None:
         # The HTTP boundary supplies the authenticated session identity.
         # An open-local session never identifies the configured reviewer.

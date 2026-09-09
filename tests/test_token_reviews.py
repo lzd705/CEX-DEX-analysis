@@ -34,6 +34,29 @@ def candidate(*, chain="ETH", address=ADDRESS.upper().replace("0X", "0x"), symbo
 
 
 class TokenReviewStoreTest(unittest.TestCase):
+    def test_identity_lookup_is_canonical_read_only_and_rejects_invalid_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenReviewStore(Path(directory) / "reviews.sqlite3")
+            review, _ = store.create_or_get(candidate(address="0x" + "ab" * 20), requested_history_days=30, submitter="public")
+            self.assertTrue(store.has_identity(" ETH ", "0x" + "AB" * 20))
+            self.assertFalse(store.has_identity("eth", "0x" + "cd" * 20))
+            self.assertEqual(store.get(review["request_id"]), review)
+            self.assertEqual(len(store.list_reviews()), 1)
+            for chain, address in [("unknown", ADDRESS), ("eth", "bad")]:
+                with self.subTest(chain=chain, address=address), self.assertRaises(TokenReviewError):
+                    store.has_identity(chain, address)
+
+    def test_identity_lookup_rejects_corrupt_persisted_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reviews.sqlite3"
+            store = TokenReviewStore(path)
+            store.create_or_get(candidate(), requested_history_days=30, submitter="public")
+            with sqlite3.connect(path) as connection:
+                connection.execute("UPDATE token_reviews SET candidate_sha256 = 'bad'")
+            with self.assertRaises(TokenReviewError) as caught:
+                store.has_identity("eth", ADDRESS)
+            self.assertEqual(caught.exception.code, "invalid_review_database")
+
     def test_start_rollback_preserves_original_reviewer_and_decision_time(self):
         with tempfile.TemporaryDirectory() as directory:
             store = TokenReviewStore(Path(directory) / "reviews.sqlite3")

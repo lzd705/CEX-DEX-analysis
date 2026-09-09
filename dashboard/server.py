@@ -8185,6 +8185,7 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                     "token_add",
                     self.public_client_address(),
                     service=ADMIN_SERVICE,
+                    token_identity=(request["chain"], request["contract_address"]),
                 ):
                     review = ADMIN_SERVICE.submit_token_review(
                         {

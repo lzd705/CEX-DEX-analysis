@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 from dashboard import server
 from dashboard.token_reviews import TokenReviewError
+from dashboard.token_review_email import TokenReviewEmailSettings
 from dashboard.admin import (
     AdminActionError,
     AdminService,
@@ -629,6 +630,66 @@ class PublicActionHandlerTest(unittest.TestCase):
         handler.send_json = Mock()
         handler.read_json = Mock(return_value=payload or {})
         return handler
+
+    def test_review_daily_cap_allows_existing_identity_but_blocks_fourth_new_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = datetime(2026, 9, 9, 12, tzinfo=timezone.utc)
+            mailer = Mock()
+            service = AdminService(
+                data_dir=root, job_dir=root / "jobs", registry_path=root / "registry.json",
+                review_store_path=root / "reviews.sqlite3", review_clock=lambda: now,
+                review_mailer=mailer, review_email_settings=TokenReviewEmailSettings(enabled=True),
+            )
+            policy = PublicActionPolicy(add_token_enabled=True, utc_now=lambda: now)
+            def candidate(chain, address):
+                return {
+                    "identity": {"chain": chain.lower(), "contract_address": address.lower(),
+                                 "token_symbol": "TEST", "token_name": "Test", "decimals": 18},
+                    "registration": {"status": None},
+                    "discovery": {"usable_pool_count": 1, "top_pools": []},
+                }
+            def submit(address, client, chain="eth"):
+                handler = self.handler(PUBLIC_TOKEN_ADD_PATH, {
+                    "chain": chain, "contract_address": address, "expected_token_symbol": "TEST",
+                })
+                handler.client_address = (client, 40000)
+                handler.do_POST()
+                return handler.send_json.call_args.args[:2]
+            with patch.object(server, "PUBLIC_ACTION_POLICY", policy), patch.object(server, "ADMIN_SERVICE", service), patch.object(service, "resolve_token", side_effect=candidate) as resolve, patch.object(service, "create_onboarding_job") as onboarding:
+                addresses = ["0x" + part * 20 for part in ("ab", "cd", "ef")]
+                originals = []
+                for index, address in enumerate(addresses):
+                    response, status = submit(address, f"203.0.113.{index + 1}")
+                    self.assertEqual(status, 202)
+                    originals.append(response)
+                self.assertEqual(service.count_token_reviews_created_on(now.date()), 3)
+                self.assertEqual(mailer.send.call_count, 3)
+                duplicate, status = submit("0x" + "AB" * 20, "203.0.113.10", chain="ETH")
+                self.assertEqual(status, 200)
+                self.assertEqual(duplicate["request_id"], originals[0]["request_id"])
+                self.assertTrue(duplicate["deduplicated"])
+                self.assertEqual(mailer.send.call_count, 3)
+                self.assertEqual(resolve.call_count, 4)
+                response, status = submit("0x" + "12" * 20, "203.0.113.11")
+                self.assertEqual(status, 429)
+                self.assertEqual(response["error_code"], "public_daily_budget_exhausted")
+                self.assertEqual(resolve.call_count, 4)
+                self.assertEqual(service.count_token_reviews_created_on(now.date()), 3)
+                with policy.permit("token_add", "203.0.113.12", service=service,
+                                   token_identity=("eth", addresses[0])):
+                    response, status = submit(addresses[0], "203.0.113.13")
+                    self.assertEqual(status, 409)
+                    self.assertEqual(response["error_code"], "public_action_busy")
+                    self.assertEqual(resolve.call_count, 4)
+                for _ in range(2):
+                    _, status = submit(addresses[0], "203.0.113.10")
+                    self.assertEqual(status, 200)
+                response, status = submit(addresses[0], "203.0.113.10")
+                self.assertEqual(status, 429)
+                self.assertEqual(response["error_code"], "public_rate_limit_exceeded")
+                self.assertEqual(mailer.send.call_count, 3)
+                onboarding.assert_not_called()
 
     def test_disabled_public_action_returns_404_before_reading_body(self):
         handler = self.handler(
