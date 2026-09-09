@@ -125,6 +125,53 @@ class TokenReviewStoreTest(unittest.TestCase):
 
             self.assertEqual(context.exception.code, "invalid_review_database")
 
+    def test_partial_identity_unique_index_is_not_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid_path = root / "valid.sqlite3"
+            TokenReviewStore(valid_path)
+            valid_connection = sqlite3.connect(valid_path)
+            table_sql = valid_connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'token_reviews'"
+            ).fetchone()[0]
+            valid_connection.close()
+            self.assertIn("UNIQUE(chain, contract_address)", table_sql)
+
+            path = root / "partial.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE token_review_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO token_review_meta VALUES ('schema_version', '1')"
+            )
+            partial_table_sql = table_sql.replace(
+                ",\n                UNIQUE(chain, contract_address)", ""
+            )
+            self.assertNotIn("UNIQUE(chain, contract_address)", partial_table_sql)
+            connection.execute(partial_table_sql)
+            connection.execute(
+                """CREATE TABLE token_review_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL REFERENCES token_reviews(request_id),
+                    event TEXT NOT NULL,
+                    at TEXT NOT NULL,
+                    actor TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                """CREATE UNIQUE INDEX pending_identity
+                ON token_reviews(chain, contract_address)
+                WHERE status='pending_review'"""
+            )
+            connection.commit()
+            connection.close()
+
+            with self.assertRaises(TokenReviewError) as context:
+                TokenReviewStore(path)
+
+            self.assertEqual(context.exception.code, "invalid_review_database")
+
     def test_malformed_persisted_row_fails_closed_when_loaded(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "reviews.sqlite3"

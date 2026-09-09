@@ -358,7 +358,7 @@ class TokenReviewStore:
                 invalid()
         unique_identity = False
         for index in connection.execute("PRAGMA index_list(token_reviews)"):
-            if not index["unique"]:
+            if not index["unique"] or index["partial"]:
                 continue
             index_name = str(index["name"])
             index_columns = tuple(
