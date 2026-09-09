@@ -7,8 +7,10 @@ and a Token, then keeps two exact cataloged markets as Market A and Market B
 while moving through `Markets`, `Compare`, `Liquidity & Execution`, `Events`,
 and `Data Quality`. The A/B markets may be CEX/CEX, CEX/DEX, or DEX/DEX. A
 separate authenticated administrator page can refresh configured Tokens,
-retry audit-approved missing windows, and onboard a DEX Token from a validated
-smart-contract address when explicitly enabled; the entire administrator
+retry audit-approved missing windows, and review a DEX Token submitted from a
+validated smart-contract address. One configured reviewer must approve it and
+then explicitly Start onboarding; submission and approval do not collect data
+or write the runtime registry. The entire administrator
 surface is absent by default.
 This release does not include factors, future-return research, an event study,
 or public data-edit controls.
@@ -220,6 +222,27 @@ and requires both `ADMIN_LOGIN_REQUIRED=false` and
 `ADMIN_ALLOW_OPEN_LOCAL=true`; the server rejects that mode on non-loopback
 binds.
 
+Token review setup, notification retries, and SQLite backup/recovery are covered
+in the same [administrator runbook](docs/admin-operations.md#submit-and-review-a-token-contract).
+Public intake requests a fixed 30-day history and returns a review receipt;
+admin intake selects 1–180 days. Every submission must first successfully
+re-resolve and validate the source; only then do canonical duplicates return
+the original request without another email. Start resolves once and compares
+the complete stable identity (chain, address, symbol, name, decimals,
+`coingecko_id`, source and `source_token_id`) with the approved snapshot.
+Identity changes safely return to `approved` for manual investigation, before
+any job or registry effect. Pool, TVL and volume evidence may change; the same
+verified current candidate creates the job without a second resolution.
+Email is notification-only and disabled in both
+environment examples. Set the sole reviewer's mailbox and SMTP credentials only
+in private operator configuration. The server automatically loads the ignored
+repository `.env` without shell execution, preserving existing environment
+values. Production uses a private mode-0600 systemd EnvironmentFile and sets
+`DASHBOARD_SKIP_LOCAL_ENV=true` to refuse the repository fallback.
+Public and protected reviewer processes must share
+the same durable review database. Open-local mode can view reviews but cannot
+submit, decide, retry notifications, or start onboarding.
+
 Production must keep the Python process on loopback and expose the read-only
 dashboard through the Nginx HTTPS example. The systemd service, Nginx template,
 health check, rollback procedure, cache behavior, and CEX-depth raw retention
@@ -229,6 +252,26 @@ are `deploy/systemd/cex-dex-dashboard.service.in`,
 `scripts/retain_cex_depth_raw.py`, and
 `deploy/systemd/cex-dex-cex-depth-retention.service.in` plus
 `deploy/systemd/cex-dex-cex-depth-retention.timer`.
+
+## Local verification
+
+From the repository root, run the full unit-test suite:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Focused review, deployment, and frontend checks:
+
+```bash
+python3 -m unittest tests.test_token_reviews tests.test_admin tests.test_public_actions tests.test_token_onboarding tests.test_token_registry tests.test_public_actions_frontend tests.test_static_delivery tests.test_framework tests.test_release_smoke tests.test_deploy_templates tests.test_proxy_deployment -v
+node --check dashboard/static/actions.js
+node --check dashboard/static/admin.js
+git diff --check
+```
+
+Unit tests use local fixtures and fake effects; passing them does not demonstrate
+live SMTP delivery, real-source collection, deployment health, or publication.
 
 ## Fact semantics
 

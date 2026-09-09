@@ -8624,21 +8624,33 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             session = ADMIN_SERVICE.get_session(self.admin_session_token())
             self.send_json(ADMIN_SERVICE.public_session(session))
             return
-        if parsed.path == "/api/admin/token-reviews":
-            if self.path != "/api/admin/token-reviews":
+        if parsed.path == "/api/admin/token-reviews" or parsed.path.startswith(
+            "/api/admin/token-reviews/"
+        ):
+            item_match = re.fullmatch(
+                r"/api/admin/token-reviews/([0-9a-f]{32})", parsed.path
+            )
+            is_list = parsed.path == "/api/admin/token-reviews"
+            if self.path != parsed.path or (not is_list and item_match is None):
                 self.send_token_review_error(TokenReviewError("invalid_review_request", "Invalid route"))
                 return
             if not self.require_admin():
                 return
             try:
-                reviews = ADMIN_SERVICE.list_token_reviews(limit=50)
+                if item_match is not None:
+                    review = ADMIN_SERVICE.get_token_review(item_match.group(1))
+                else:
+                    reviews = ADMIN_SERVICE.list_token_reviews(limit=50)
             except TokenReviewError as error:
                 self.send_token_review_error(error)
                 return
             except (ValueError, OSError, RuntimeError, TypeError, KeyError) as error:
                 self.send_token_review_error(error)
                 return
-            self.send_json({"reviews": reviews, "count": len(reviews)})
+            if item_match is not None:
+                self.send_json(review)
+            else:
+                self.send_json({"reviews": reviews, "count": len(reviews)})
             return
         if parsed.path == "/api/admin/tokens":
             authenticated = self.require_admin()

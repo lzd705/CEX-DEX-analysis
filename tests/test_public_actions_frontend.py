@@ -241,6 +241,97 @@ await loadTokenReviews();
 assert.equal(requests.filter(item => item.method === 'POST').length, 1);
 """)
 
+    def test_hash_link_fetches_and_focuses_review_outside_recent_fifty(self):
+        self.run_behavior("admin.js", r"""
+const linked = {...review, request_id:'f'.repeat(32), token_symbol:'OLD'};
+listedReviews = Array.from({length:50}, (_, index) => ({
+  ...review, request_id:index.toString(16).padStart(32, '0'), token_symbol:'NEW',
+}));
+window.location.hash = '#token-review=' + linked.request_id;
+const original = transport;
+transport = async (path, options) => {
+  if (path === '/api/admin/token-reviews/' + linked.request_id) {
+    return {ok:true, status:200, json:async () => linked};
+  }
+  return original(path, options);
+};
+await showWorkspace(session);
+assert.equal(requests.filter(item => item.path === '/api/admin/token-reviews/' + linked.request_id).length, 1);
+assert.equal(admin.tokenReviews.length, 51);
+assert.equal(admin.tokenReviews.filter(item => item.request_id === linked.request_id).length, 1);
+assert.ok(element('token-review-' + linked.request_id).focused);
+
+await loadTokenReviews();
+assert.equal(admin.tokenReviews.length, 51);
+assert.equal(admin.tokenReviews.filter(item => item.request_id === linked.request_id).length, 1);
+
+listedReviews = [linked, ...listedReviews.slice(0, 49)];
+await loadTokenReviews();
+assert.equal(requests.filter(item => item.path === '/api/admin/token-reviews/' + linked.request_id).length, 2);
+assert.equal(admin.tokenReviews.filter(item => item.request_id === linked.request_id).length, 1);
+
+for (const hash of ['#token-review=' + 'F'.repeat(32), '#token-review=' + linked.request_id + '/start']) {
+  window.location.hash = hash;
+  listedReviews = listedReviews.slice(1);
+  await loadTokenReviews();
+}
+assert.equal(requests.filter(item => item.path.startsWith('/api/admin/token-reviews/')).length, 2);
+""")
+
+    def test_missing_linked_review_keeps_recent_list_and_starts_polling(self):
+        self.run_behavior("admin.js", r"""
+const missingId = 'f'.repeat(32);
+listedReviews = [review];
+window.location.hash = '#token-review=' + missingId;
+const original = transport;
+transport = async (path, options) => {
+  if (path === '/api/admin/token-reviews/' + missingId) {
+    return {ok:false, status:404, json:async () => ({
+      error:'private@example.test /private/review.sqlite3',
+      error_code:'review_not_found', retryable:false,
+    })};
+  }
+  return original(path, options);
+};
+await showWorkspace(session);
+assert.equal(admin.tokenReviews.length, 1);
+assert.equal(admin.tokenReviews[0].request_id, review.request_id);
+assert.ok(element('token-reviews-body').textContent.includes(review.token_symbol));
+assert.equal(intervals.length, 1);
+assert.match(element('token-review-status').textContent, /linked token review.*unavailable.*recent requests/i);
+assert.ok(!element('token-review-status').textContent.includes('private'));
+""")
+
+    def test_stale_missing_link_response_cannot_replace_newer_review_ui(self):
+        self.run_behavior("admin.js", r"""
+admin.session = session;
+const missingId = 'f'.repeat(32);
+window.location.hash = '#token-review=' + missingId;
+const original = transport;
+let releaseExact;
+transport = async (path, options) => {
+  if (path === '/api/admin/token-reviews/' + missingId) {
+    return new Promise(resolve => { releaseExact = resolve; });
+  }
+  return original(path, options);
+};
+const staleLoad = loadTokenReviews();
+while (!releaseExact) await Promise.resolve();
+
+window.location.hash = '';
+listedReviews = [{...review, revision:6, status:'approved'}];
+transport = original;
+element('token-review-status').textContent = 'newer UI';
+await loadTokenReviews();
+releaseExact({ok:false, status:404, json:async () => ({
+  error:'private stale detail', error_code:'review_not_found', retryable:false,
+})});
+await staleLoad;
+assert.equal(admin.tokenReviews.length, 1);
+assert.equal(admin.tokenReviews[0].revision, 6);
+assert.equal(element('token-review-status').textContent, 'newer UI');
+""")
+
     def test_stale_revision_and_start_failure_reload_without_replay(self):
         self.run_behavior("admin.js", r"""
 await showWorkspace(session);

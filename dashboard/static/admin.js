@@ -177,11 +177,16 @@ function showReviewStatus(message) {
   target.hidden = false;
 }
 
+function linkedReviewId() {
+  const match = /^#token-review=([0-9a-f]{32})$/.exec(window.location.hash);
+  return match ? match[1] : null;
+}
+
 function focusLinkedReview() {
   const hash = window.location.hash;
-  const match = /^#token-review=([0-9a-f]{32})$/.exec(hash);
-  if (!match || admin.focusedReviewHash === hash) return;
-  const row = byId(`token-review-${match[1]}`);
+  const requestId = linkedReviewId();
+  if (!requestId || admin.focusedReviewHash === hash) return;
+  const row = byId(`token-review-${requestId}`);
   if (!row) return;
   row.classList.add("token-review-highlight");
   row.focus();
@@ -309,12 +314,33 @@ async function loadTokenReviews() {
   const payload = await request("/api/admin/token-reviews");
   if (generation !== admin.reviewLoadGeneration) return;
   if (!Array.isArray(payload.reviews)) throw new Error("Token review list is unavailable");
+  const reviews = payload.reviews.slice(0, 50);
+  const linkedId = linkedReviewId();
+  let linkedReviewMissing = false;
+  if (linkedId && !reviews.some(review => review?.request_id === linkedId)) {
+    let linkedReview;
+    try {
+      linkedReview = await request(`/api/admin/token-reviews/${linkedId}`);
+    } catch (error) {
+      if (generation !== admin.reviewLoadGeneration) return;
+      if (error.code !== "review_not_found") throw error;
+      linkedReviewMissing = true;
+    }
+    if (generation !== admin.reviewLoadGeneration) return;
+    if (linkedReview && (!validReviewIdentity(linkedReview) || linkedReview.request_id !== linkedId)) {
+      throw new Error("Linked Token review is unavailable");
+    }
+    if (linkedReview) reviews.push(linkedReview);
+  }
   const current = new Map(admin.tokenReviews.map(review => [review.request_id, review]));
-  admin.tokenReviews = payload.reviews.slice(0, 50).map(review => {
+  admin.tokenReviews = reviews.map(review => {
     const previous = current.get(review.request_id);
     return previous && previous.revision > review.revision ? previous : review;
   });
   renderTokenReviews();
+  if (linkedReviewMissing) {
+    showReviewStatus("Linked Token review is unavailable; showing recent requests.");
+  }
 }
 
 async function actOnTokenReview(review, action) {

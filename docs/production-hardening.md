@@ -20,6 +20,9 @@ Before deployment, choose:
   atomically refreshed daily manifest rather than the tracked seed file;
 - `ADMIN_JOB_DIR`: an absolute directory for administrator job records. It may
   live under `MARKET_DATA_DIR`, but it does not have to;
+- `TOKEN_REVIEW_DB_PATH`: the durable review ledger, normally
+  `MARKET_DATA_DIR/admin/token_reviews.sqlite3`. Public intake and a protected
+  reviewer process must use the same absolute path and compatible ownership;
 - TLS certificates for `@DOMAIN@`, normally issued and renewed by Certbot or the
   host's certificate manager.
 
@@ -80,10 +83,19 @@ unprivileged account, without Linux capabilities, and write logs to journald.
 explicit write allowlists cover:
 
 - `MARKET_DATA_DIR`, including publication files, `admin/token_registry.json`,
-  `collection/collection.lock`, quality evidence, and raw snapshots;
+  `admin/token_reviews.sqlite3`, `collection/collection.lock`, quality evidence,
+  and raw snapshots;
 - the derived collector staging directory beside `MARKET_DATA_DIR`;
 - `ADMIN_JOB_DIR`, even when operator jobs are stored outside the market-data
   tree.
+
+The default review database is already covered by the market-data write grant.
+If `TOKEN_REVIEW_DB_PATH` is moved elsewhere, explicitly grant its private
+parent directory in the dashboard service's `ReadWritePaths`, create that
+directory with service ownership, and verify the effective unit before startup.
+SQLite must be able to create its journal beside the database. Setting an
+environment variable alone does not change systemd's filesystem allowlist;
+do not disable `ProtectSystem=strict` or grant the repository broad write access.
 
 Verify the rendered contract before starting the service:
 
@@ -203,6 +215,62 @@ is later required, create a separate reviewed service and access path:
 `ADMIN_LOGIN_REQUIRED=false` does not enable open mode by itself. Local open
 mode additionally requires `ADMIN_ALLOW_OPEN_LOCAL=true`, and the server will
 refuse a non-loopback bind.
+
+### Token review and notification deployment
+
+Token submission creates a durable review, not an onboarding job. The sole
+configured reviewer must approve (`1/1`) and then separately Start onboarding;
+both actions require an authenticated session, CSRF, and the displayed revision.
+Start resolves exactly once and compares the full stable identity (chain,
+address, symbol, name, decimals, `coingecko_id`, source and `source_token_id`)
+with the approved snapshot. A change fails before registry, job or worker
+creation and restores `approved` for manual investigation. Dynamic pool, TVL
+and volume evidence may change; the same verified candidate goes into job
+creation without another resolution. There is no reset or automatic recovery.
+Every submission, including a duplicate, first needs successful source
+resolution and validation; only afterward does a canonical duplicate return
+the original request without another email. Source failure is not an offline
+duplicate-receipt lookup.
+Open-local mode can list reviews but cannot submit through the admin route,
+decide, retry notification, or Start. Keep the public admin-route blocks intact.
+If public intake and the reviewer use separate processes, they must share
+`TOKEN_REVIEW_DB_PATH`; separate ledgers would hide submitted requests from the
+reviewer and split deduplication/audit history.
+
+Keep `TOKEN_REVIEW_EMAIL_ENABLED=false` until the protected reviewer access
+path, sender, relay and sole recipient are configured privately. Set
+`TOKEN_REVIEWER_EMAIL` in `/etc/cex-dex/dashboard.env` (mode `0600`), never in
+tracked templates. The user service instead reads
+`%h/.config/cex-dex/dashboard.env`, also kept mode `0600`. Neither file should be
+served by the web server or printed in logs. The server otherwise automatically
+loads the repository `.env`, without shell execution and without overriding
+existing environment values. Keep the rendered `DASHBOARD_SKIP_LOCAL_ENV=true`
+so production uses only the intended EnvironmentFile/process settings.
+Restart the relevant processes after environment changes. Standalone email
+settings validation does not invoke the server loader and needs exported values.
+
+`TOKEN_REVIEW_BASE_URL` must be a protected HTTPS admin URL, optionally with a
+path prefix, without userinfo/query/fragment. The email adds
+`/admin.html#token-review=<request_id>`; it cannot approve or Start. The public
+hostname deliberately blocks admin routes, so do not configure it as the review
+URL unless it has a separately reviewed protected access path.
+
+Choose an explicit `TOKEN_REVIEW_SMTP_PORT`; no default port or SMTP_SSL mode is
+provided. `TOKEN_REVIEW_SMTP_STARTTLS=true` verifies the relay certificate and
+hostname before authentication. Credential configuration without STARTTLS is
+rejected before transport opens. An unauthenticated plaintext relay is supported
+only as an explicitly reviewed trusted local option; the message body is still
+plaintext. Do not disable TLS verification or send credentials without TLS to
+work around relay setup failures. Email can stay disabled while review and
+explicit Start remain usable.
+
+Follow the [review runbook](admin-operations.md#token-review-configuration-and-enablement)
+for the full ten-variable contract, enablement order, cooldown and attempt cap.
+Use SQLite-consistent backups of the review ledger. Before restore or recovery
+from ambiguous `sending`/`onboarding_starting`, stop every process sharing it
+and reconcile relay evidence, jobs and registry state. There is no automatic
+resend/reset; restoring an older ledger does not undo already-sent mail or
+collection and must not authorize duplicate work.
 
 ## Application and data rollback
 

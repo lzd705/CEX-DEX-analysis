@@ -16,7 +16,8 @@
 - Reviewer email is injected with `TOKEN_REVIEWER_EMAIL`; no recipient or credential is hardcoded.
 - Persist review state before email, registry, collection, or publication side effects.
 - Email is notification-only; approval and start require authenticated CSRF-protected POST requests.
-- Duplicate submissions do not create duplicate requests or messages.
+- Every submission first successfully re-resolves and validates the source; only afterward does a canonical duplicate return the original request without another message. Source failure does not return an offline duplicate receipt.
+- Start resolves once and compares the full stable identity (chain, address, symbol, name, decimals, coingecko_id, source, source_token_id) to the approved snapshot. Drift fails before effects and restores approved for manual investigation; no reset is added. Pool/TVL/volume may change. Pass that same verified candidate into job creation, without a second resolution.
 - No real email, third-party request, deployment, or production state change occurs in tests.
 
 ---
@@ -103,8 +104,11 @@
 
   Prove only the configured login username can approve/reject; stale revisions
   fail; approval alone creates no job; rejected requests cannot start; start
-  uses only stored chain/address/symbol/history; duplicate starts cannot create a
-  second job; and a start failure returns the review to approved.
+  resolves stored chain/address once and compares every stable identity field
+  with the approved snapshot, allowing dynamic pool/TVL/volume changes; that
+  same candidate and stored history create the job without another resolution;
+  duplicate starts cannot create a second job; and identity drift or another
+  start failure returns the review to approved before effects.
 
 - [ ] **Step 5: Implement decision and explicit start**
 
@@ -249,4 +253,3 @@
   Commit with message `feat(tokens): expose authenticated review workflow`,
   then report branch, commit hashes, exact tests, configuration still required,
   and that no real email or deployment occurred.
-

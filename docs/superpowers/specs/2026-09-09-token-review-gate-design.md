@@ -10,7 +10,7 @@ approves it and then explicitly starts onboarding.
 ## Confirmed product decision
 
 - Approval policy: one approval from the only configured administrator (`1/1`).
-- Reviewer mailbox: supplied by the operator as `clubc@connect.ust.hk`, but loaded
+- Reviewer mailbox: supplied privately by the operator and loaded
   through `TOKEN_REVIEWER_EMAIL`; it is not embedded in application code or
   committed deployment defaults.
 - Email is a notification only. Its link opens the authenticated admin review
@@ -41,9 +41,11 @@ Each request stores:
 - append-only, bounded audit events for creation, notification, decision, and
   onboarding transitions.
 
-The canonical `chain:contract_address` has a unique constraint. Repeated public
-or admin submissions return the existing request and never enqueue another
-email. A rejected request remains rejected; creating a fresh review requires a
+The canonical `chain:contract_address` has a unique constraint. Every public or
+admin submission first successfully re-resolves and validates the source.
+Only then does a canonical duplicate return the existing request without
+another email; source failure does not return an offline duplicate receipt.
+A rejected request remains rejected; creating a fresh review requires a
 future explicit operator workflow rather than public resubmission.
 
 ## Flow
@@ -62,10 +64,14 @@ future explicit operator workflow rather than public resubmission.
 6. Approval changes only the review state. It does not touch the Token registry
    and does not start a worker.
 7. A second authenticated, CSRF-protected Start action reserves
-   `onboarding_starting`, invokes the existing onboarding service with only the
-   server-stored canonical fields, and records the returned job id as
-   `onboarding_queued`. A failure returns the request to `approved` with a stable
-   retryable error.
+   `onboarding_starting` and resolves the stored chain/address exactly once.
+   It compares the complete stable identity (chain, address, symbol, name,
+   decimals, `coingecko_id`, source and `source_token_id`) with the approved
+   candidate's identity. Drift fails before any registry, job or worker effect,
+   returning the request to `approved` with `onboarding_start_failed` for manual
+   investigation. Dynamic pool, TVL and volume evidence may change. The same
+   verified current candidate is passed into job creation without resolving
+   again, and the returned job id is recorded as `onboarding_queued`.
 
 ## Email configuration and retry rules
 
@@ -75,6 +81,10 @@ The environment supplies `TOKEN_REVIEW_EMAIL_ENABLED`, `TOKEN_REVIEWER_EMAIL`,
 `TOKEN_REVIEW_SMTP_FROM`, `TOKEN_REVIEW_SMTP_USERNAME`, and
 `TOKEN_REVIEW_SMTP_PASSWORD`. No request field can select a recipient, relay,
 sender, callback, or review URL.
+
+STARTTLS verifies the relay certificate and hostname with the system trust
+store. SMTP credentials require STARTTLS; an unauthenticated trusted local relay
+may be explicitly configured without it. Implicit TLS is not supported.
 
 The email subject is fixed, headers are built with `EmailMessage`, and the body
 contains only bounded validated fields. The review URL is built from the
@@ -96,6 +106,9 @@ automatically retried after an ambiguous crash.
   administrator-selected history window.
 - `GET /api/admin/token-reviews` lists bounded review projections and audit
   history for the authenticated administrator.
+- `GET /api/admin/token-reviews/<id>` retrieves one exact authenticated review,
+  allowing a strict email hash link to reach a request outside the recent-50
+  list. This read does not approve or start anything.
 - `POST /api/admin/token-reviews/<id>/decision` accepts exactly `decision` and
   `expected_revision`.
 - `POST /api/admin/token-reviews/<id>/notification/retry` accepts exactly
@@ -104,7 +117,7 @@ automatically retried after an ambiguous crash.
   `expected_revision`.
 
 All admin mutations require an authenticated login session and CSRF token.
-Open-local admin mode may view requests but cannot decide, resend, or start
+Open-local admin mode may view requests but cannot submit, decide, resend, or start
 onboarding because it does not identify the configured reviewer.
 
 ## Security and failure semantics
@@ -120,4 +133,3 @@ onboarding because it does not identify the configured reviewer.
   exceptions, audit actor details, and worker output.
 - Tests use a fake mailer only. This change does not send real email, deploy, or
   enable public write surfaces.
-

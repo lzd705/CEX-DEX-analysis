@@ -13,15 +13,34 @@ python3 scripts/admin_password.py
 ```
 
 Copy `.env.example` to `.env`, set the following values, and paste the generated
-value as `ADMIN_PASSWORD_HASH`. `.env` is ignored by Git.
+value as `ADMIN_PASSWORD_HASH`. `.env` is ignored by Git. The server automatically
+loads simple `KEY=VALUE` entries from the repository's `.env` unless
+`DASHBOARD_SKIP_LOCAL_ENV` is enabled. Existing environment values take precedence;
+matching outer single or double quotes are removed, and no shell expressions are
+executed. The password hash's `$` characters are therefore preserved.
 
 ```env
 ADMIN_ENABLED=true
 ADMIN_LOGIN_REQUIRED=true
 ADMIN_ALLOW_OPEN_LOCAL=false
 ADMIN_USERNAME=admin
-ADMIN_PASSWORD_HASH=pbkdf2_sha256$...
+ADMIN_PASSWORD_HASH='pbkdf2_sha256$...'
 ```
+
+The server does not need a shell export for this local setup. Standalone commands
+that import only the email settings module do not run the server's loader. For
+those commands, export the private settings first; if sourcing your own reviewed
+file, single-quote values containing shell metacharacters:
+
+```bash
+set -a
+. ./.env
+set +a
+```
+
+Production uses a private systemd `EnvironmentFile` and explicitly sets
+`DASHBOARD_SKIP_LOCAL_ENV=true` to disable adjacent repository configuration;
+see the Token review configuration below.
 
 Restart a server bound to loopback, then open:
 
@@ -43,6 +62,8 @@ Open mode is rejected when the application is bound to `0.0.0.0`, `::`, a
 public address, or a hostname other than `localhost`. It skips authentication
 but keeps Token/date validation and permits only one queued or running refresh
 job at a time. Do not use it behind a reverse proxy.
+Token reviews are read-only in open mode: admin submission, approval/rejection,
+notification retry, and Start all require the configured login session and CSRF.
 
 ## Refresh contract
 
@@ -417,19 +438,61 @@ one bounded depth refresh; the exact snapshot postcondition above decides the
 result. Record pre/post publication and generation identities plus depth and
 execution status/reason changes. Do not repeat automatically after a failure.
 
-## Add Token by contract
+## Submit and review a Token contract
 
-The Admin page supports DEX-first runtime onboarding:
+The policy is one approval from the sole configured administrator (`1/1`).
+`ADMIN_USERNAME` identifies that authenticated reviewer; `TOKEN_REVIEWER_EMAIL`
+only chooses the notification mailbox. Receiving an email or opening its link
+does not approve a request or authorize collection.
 
 1. choose one allowlisted chain and enter the smart-contract address;
 2. validate the address and resolve Token identity through GeckoTerminal;
 3. review the returned symbol, name, exact address, and strictly validated
    pools;
-4. confirm `Add & collect`;
-5. wait for DEX daily publication, post-publication SQLite verification, TVL,
-   and protocol-dependent DEX depth collection.
+4. submit for review. The server re-resolves and validates the confirmed symbol,
+   then commits a `pending_review` request and audit event before trying email.
+   Submission creates no runtime registry entry, onboarding job, or collection;
+5. the configured administrator logs in, inspects the persisted evidence and
+   chooses Approve or Reject with the displayed `expected_revision` and CSRF;
+6. approval sets `approved` only. The administrator must separately choose
+   Start onboarding to reserve `onboarding_starting` and authorize the existing
+   onboarding job, registry write and worker using only the stored identity and
+   history window;
+7. a successful Start records `onboarding_queued` and its `onboarding_job_id`.
+   Follow that job in the authenticated Jobs view (`GET /api/admin/jobs`) for
+   DEX daily publication, post-publication SQLite verification, TVL, and
+   protocol-dependent DEX depth collection. Queued is not completed.
 
-The runtime identity is stored in:
+Public `POST /api/actions/tokens` accepts exactly `chain`, `contract_address`,
+and `expected_token_symbol` as strings and fixes the history request at 30 days.
+Admin `POST /api/admin/tokens` requires those same fields plus integer
+`history_days` from 1 through 180. New reviews return HTTP 202; canonical
+duplicates return HTTP 200 with the same request id and no second notification.
+Submission re-resolves the source identity before returning an existing request;
+if that resolution fails, the duplicate receipt is not returned.
+A rejected request remains rejected on resubmission; there is no reset or
+fresh-review endpoint. Previews are source-backed and refuse HTTP redirects.
+
+The public receipt contains request id, canonical identity, review status,
+revision, creation time, dedupe flag, and notification status. It is not a job
+and cannot be polled at `/api/actions/jobs/<job_id>`; that route remains for
+public quality/fact jobs. The authenticated review list is
+`GET /api/admin/token-reviews`, bounded to 50 requests with up to 50 audit events
+each. A strict email hash link may additionally retrieve its exact request from
+`GET /api/admin/token-reviews/<request_id>` when it is older than that list; this
+authenticated read does not approve or Start the request. A missing linked item
+leaves the recent list usable and shows a fixed warning. Decision, notification
+retry, and Start use the displayed revision; a 409 means reload and assess the
+current state before deciding again.
+
+Public intake allows three requests per client per hour and three new durable
+reviews per UTC day. The daily count includes durable reviews from either
+submitter surface; admin submissions themselves are uncapped. Existing canonical
+reviews bypass only the daily cap, so duplicates still consume the hourly
+request allowance and obey concurrency limits. Quality/fact daily budgets still
+count their persisted jobs.
+
+After explicit Start, the runtime identity is stored in:
 
 ```text
 data/local/admin/token_registry.json
@@ -453,6 +516,117 @@ CEX mapping = requires_manual_review
 No `SYMBOL/USDT` pair is guessed and no CEX request is made until an operator
 adds a separately reviewed mapping. Duplicate chain/address submissions are
 idempotent; the same symbol on another contract is blocked for manual review.
+
+### Token review configuration and enablement
+
+The local and deployment environment examples contain all settings with email
+disabled and private values blank. Configure these only in a private operator
+file; never commit the real reviewer mailbox, relay credentials, or password.
+
+| Setting | Meaning and validation |
+| --- | --- |
+| `TOKEN_REVIEW_DB_PATH` | Blank/unset uses `<MARKET_DATA_DIR>/admin/token_reviews.sqlite3`. Use an absolute path in production. |
+| `TOKEN_REVIEW_EMAIL_ENABLED` | False by default. Enabling notification does not enable either HTTP submission surface. |
+| `TOKEN_REVIEWER_EMAIL` | The sole reviewer's mailbox, supplied privately by the operator; required when email is enabled. |
+| `TOKEN_REVIEW_BASE_URL` | Protected HTTPS admin origin, optionally with a path prefix; no userinfo, query, or fragment. Required when enabled. |
+| `TOKEN_REVIEW_SMTP_HOST` | Relay hostname, not a URL; required when enabled. |
+| `TOKEN_REVIEW_SMTP_PORT` | Explicit decimal port 1–65535; there is no implicit port default. |
+| `TOKEN_REVIEW_SMTP_STARTTLS` | Unset parses as false; examples explicitly set true. STARTTLS verifies certificate trust and hostname. Required whenever credentials are configured. |
+| `TOKEN_REVIEW_SMTP_FROM` | A single sender mailbox; required when enabled. |
+| `TOKEN_REVIEW_SMTP_USERNAME` | Optional SMTP username. Supply username/password together or leave both blank. |
+| `TOKEN_REVIEW_SMTP_PASSWORD` | Optional private SMTP password; cannot be transmitted without STARTTLS. |
+
+Boolean settings accept true/false, 1/0, yes/no, or on/off. Email configuration
+rejects CR/LF and invalid or incomplete enabled settings. Disabling STARTTLS is
+supported only for an explicitly reviewed trusted local relay without SMTP
+credentials; that connection sends the notification body in plaintext. There is
+no implicit-TLS/SMTP_SSL mode. Do not disable verification to work around a relay
+certificate failure; fix the relay trust/configuration.
+
+Enable in this order:
+
+1. Keep email and public intake disabled while choosing a durable shared review
+   database path. The service account must own its private writable parent.
+   Public and protected admin processes must read and write the same database.
+   A custom path outside the existing systemd write allowlists needs its parent
+   added to `ReadWritePaths`; do not weaken `ProtectSystem=strict`.
+2. Configure the protected admin process with `ADMIN_ENABLED=true`,
+   `ADMIN_LOGIN_REQUIRED=true`, `ADMIN_ALLOW_OPEN_LOCAL=false`, a generated
+   password verifier and `ADMIN_COOKIE_SECURE=true` for HTTPS. Keep the public
+   process's admin surface disabled and retain the public proxy's admin blocks.
+3. Set the notification mailbox, HTTPS admin URL, sender, relay and optional
+   credentials privately. For the system service use
+   `/etc/cex-dex/dashboard.env` with mode `0600`; the user service reads
+   `%h/.config/cex-dex/dashboard.env`, also private. These are systemd
+   EnvironmentFiles, not shell scripts. Keep `DASHBOARD_SKIP_LOCAL_ENV=true` as
+   rendered so the server does not also load an adjacent repository `.env`.
+   Restart processes after changing their environment. The review URL must
+   reach the protected admin page, not a public
+   hostname that returns 404 for admin routes.
+4. Export the private settings for this standalone command (it does not import
+   the server or invoke its `.env` loader), then validate without sending:
+   `TOKEN_REVIEW_EMAIL_ENABLED=true python3 -c 'from dashboard.token_review_email import TokenReviewEmailSettings; s = TokenReviewEmailSettings.from_environment(); print("email_enabled=" + str(s.enabled))'`.
+   This validates the exported settings with email enabled only for this
+   validation process. It does not send, persist enablement, test SMTP delivery,
+   or prove the external service works.
+5. Enable `TOKEN_REVIEW_EMAIL_ENABLED=true` only after the relay and protected
+   review URL are ready. Email may remain disabled while authenticated review
+   and Start work normally. Separately enable `PUBLIC_ADD_TOKEN_ENABLED=true`
+   only when public intake is intended. Existing reviews are never emailed just
+   because a flag changes; use a permitted explicit notification retry.
+
+### Notification and start failures
+
+`disabled` and `unconfigured` notifications mean no message was sent and the
+review remains valid. `failed` records only `notification_send_failed`, not raw
+SMTP text. Notification retry requires an authenticated CSRF request and the
+current revision. Only `failed`, `disabled`, or `unconfigured` can retry, after a
+60-second cooldown and with fewer than three claimed SMTP attempts. Disabled or
+unconfigured checks do not consume an attempt. Duplicate submission never
+retries email. `sent` cannot be resent by this API; it records adapter success,
+not proof that the reviewer read or even received the message.
+
+A known Start failure returns HTTP 503 and restores `approved` with
+`onboarding_error_code=onboarding_start_failed`. Inspect the cause and current
+job/registry state, reload the new revision, then explicitly Start again when
+appropriate. Approval identity and decision time are retained.
+Start resolves once and compares the complete stable identity (chain, address,
+symbol, name, decimals, CoinGecko id, source and source token id) with the
+approved candidate. A difference fails before registry, job, or worker creation.
+Changing pool, TVL, or volume evidence alone does not invalidate the approval;
+the same verified current candidate is used for job creation without re-resolving.
+
+After a process crash, notification `pending`/`sending` or review
+`onboarding_starting` may remain unresolved. There is no automatic resend,
+outbox sweep, state reset, or crash-recovery command. Stop the processes sharing
+the ledger and reconcile mail relay evidence, job records, and runtime registry
+before planning operator recovery. Do not reset attempts, delete the request,
+reapprove it, or restore an old database merely to retry an ambiguous effect;
+SMTP delivery and worker creation might already have occurred.
+
+### Review database backup and restore
+
+Keep the review ledger separate from the market-fact SQLite publication. Back
+it up with SQLite's consistent backup API or `.backup`, never by naively copying
+an active database file. For example, with an existing private backup directory
+and operator-verified absolute paths:
+
+```bash
+sqlite3 -readonly /data/market/published/admin/token_reviews.sqlite3 \
+  ".backup '/secure/backups/token-reviews.sqlite3'"
+sqlite3 -readonly /secure/backups/token-reviews.sqlite3 'PRAGMA integrity_check;'
+```
+
+Protect backups like the live ledger; they contain persisted candidate evidence,
+decision identities and audit history. Before restore, stop every writer sharing
+the ledger, retain a consistent backup of the current database, and reconcile
+jobs and the runtime registry. Restore the chosen verified snapshot using
+SQLite `.restore` or its backup API, preserve service ownership and private
+permissions, and verify SQLite integrity plus the application's schema/row
+validation before enabling mutations. Restoring the review database alone does
+not roll back email, jobs, registry entries or published data. In particular, an
+older approved state must not be treated as authorization to repeat work that
+already started. Never edit ledger rows to suppress validation or revision errors.
 
 For an isolated audit without publishing, run:
 

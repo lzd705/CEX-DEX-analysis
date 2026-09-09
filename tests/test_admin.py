@@ -249,13 +249,13 @@ class AdminServiceTest(unittest.TestCase):
             with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
                 review = service.submit_token_review(self.review_payload(), "public:add_token")
                 approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
-                original_create = service.create_onboarding_job
-                def create(payload, username):
+                original_create = service._create_onboarding_job_from_candidate
+                def create(candidate, history_days, username):
                     self.assertEqual(service.list_token_reviews()[0]["status"], "onboarding_starting")
-                    self.assertEqual(payload, {"chain": "base", "contract_address": "0x" + "12" * 20,
-                                               "expected_token_symbol": "XYZ", "history_days": 30})
-                    return original_create(payload, username)
-                with patch.object(service, "create_onboarding_job", side_effect=create), patch("dashboard.admin.threading.Thread") as thread:
+                    self.assertEqual(candidate["identity"], self.review_candidate()["identity"])
+                    self.assertEqual(history_days, 30)
+                    return original_create(candidate, history_days, username)
+                with patch.object(service, "_create_onboarding_job_from_candidate", side_effect=create), patch("dashboard.admin.threading.Thread") as thread:
                     started = service.start_token_review_onboarding(review["request_id"], {"expected_revision": approved["revision"]}, "reviewer")
                     for revision in (approved["revision"], started["revision"]):
                         with self.assertRaises(TokenReviewError):
@@ -282,6 +282,50 @@ class AdminServiceTest(unittest.TestCase):
             self.assertNotIn("secret", json.dumps(service.list_token_reviews()))
             self.assertEqual(service.jobs, {})
             self.assertEqual(service.registry.list_records(), [])
+
+    def test_review_start_rejects_each_changed_stable_identity_field_before_effects(self):
+        changes = {"chain": "eth", "contract_address": "0x" + "34" * 20,
+                   "token_symbol": "ABC", "token_name": "Changed Token", "decimals": 6,
+                   "coingecko_id": "different-token", "source": "different-source",
+                   "source_token_id": "different-source-token"}
+        for field, value in changes.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                service = self.review_service(root)
+                with patch.object(service, "resolve_token", return_value=self.review_candidate()):
+                    review = service.submit_token_review(self.review_payload(), "public:add_token")
+                approved = service.decide_token_review(review["request_id"],
+                    {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+                current = self.review_candidate()
+                current["identity"][field] = value
+                with patch.object(service, "resolve_token", return_value=current) as resolve, patch.object(service, "_start_job_thread") as start:
+                    failed = service.start_token_review_onboarding(review["request_id"],
+                        {"expected_revision": approved["revision"]}, "reviewer")
+                resolve.assert_called_once_with("base", "0x" + "12" * 20)
+                self.assertEqual(failed["status"], "approved")
+                self.assertEqual(failed["onboarding_error_code"], "onboarding_start_failed")
+                self.assertEqual(failed["reviewed_at"], approved["reviewed_at"])
+                self.assertEqual(service.jobs, {})
+                self.assertEqual(service.registry.list_records(), [])
+                self.assertFalse((root / "jobs").exists())
+                start.assert_not_called()
+
+    def test_review_start_uses_one_current_candidate_and_allows_market_evidence_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.review_service(Path(directory))
+            with patch.object(service, "resolve_token", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+            approved = service.decide_token_review(review["request_id"],
+                {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+            current = self.review_candidate()
+            current["discovery"] = {"usable_pool_count": 2, "top_pools": []}
+            with patch.object(service, "resolve_token", side_effect=[current, AssertionError("second resolution")]) as resolve, patch.object(service, "_start_job_thread") as start:
+                started = service.start_token_review_onboarding(review["request_id"],
+                    {"expected_revision": approved["revision"]}, "reviewer")
+            resolve.assert_called_once_with("base", "0x" + "12" * 20)
+            self.assertEqual(started["status"], "onboarding_queued")
+            self.assertEqual(len(service.jobs), 1)
+            start.assert_called_once_with(started["onboarding_job_id"])
 
     def test_review_mutations_reject_extra_or_missing_fields(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -320,12 +364,12 @@ class AdminServiceTest(unittest.TestCase):
             with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
                 review = service.submit_token_review(self.review_payload(), "public:add_token")
                 approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
-                original_create = service.create_onboarding_job
-                def create(payload, username):
+                original_create = service._create_onboarding_job_from_candidate
+                def create(candidate, history_days, username):
                     current = other.list_token_reviews()[0]
                     other.retry_token_review_notification(current["request_id"], {"expected_revision": current["revision"]}, "reviewer")
-                    return original_create(payload, username)
-                with patch.object(service, "create_onboarding_job", side_effect=create), patch("dashboard.admin.threading.Thread"):
+                    return original_create(candidate, history_days, username)
+                with patch.object(service, "_create_onboarding_job_from_candidate", side_effect=create), patch("dashboard.admin.threading.Thread"):
                     started = service.start_token_review_onboarding(review["request_id"], {"expected_revision": approved["revision"]}, "reviewer")
             self.assertEqual(started["status"], "onboarding_queued")
             self.assertEqual(len(service.jobs), 1)
@@ -340,12 +384,12 @@ class AdminServiceTest(unittest.TestCase):
             approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
             entered, release = Event(), Event()
             calls = []
-            def create(payload, username):
-                calls.append(payload)
+            def create(candidate, history_days, username):
+                calls.append(candidate)
                 entered.set()
                 self.assertTrue(release.wait(5))
                 return {"job_id": "one-onboarding-job"}
-            with patch.object(service, "create_onboarding_job", side_effect=create), ThreadPoolExecutor(max_workers=1) as executor:
+            with patch.object(service, "resolve_token", return_value=self.review_candidate()), patch.object(service, "_create_onboarding_job_from_candidate", side_effect=create), ThreadPoolExecutor(max_workers=1) as executor:
                 pending_start = executor.submit(service.start_token_review_onboarding, review["request_id"], {"expected_revision": approved["revision"]}, "reviewer")
                 try:
                     self.assertTrue(entered.wait(5))
@@ -2461,10 +2505,56 @@ class TokenReviewHandlerTest(unittest.TestCase):
                     self.assertEqual(handler.send_json.call_args.args[0], {"reviews": [], "count": 0})
                     listing.assert_called_with(limit=50)
 
+    def test_exact_review_get_reaches_an_item_outside_the_recent_list(self):
+        review, _ = self.submit()
+        path = f"/api/admin/token-reviews/{review['request_id']}"
+
+        handler = self.handler(path, authenticated=False)
+        handler.do_GET()
+        self.assertEqual(handler.send_json.call_args.args[1], 401)
+
+        with patch.object(self.service, "list_token_reviews", return_value=[]):
+            for open_mode in [False, True]:
+                with self.subTest(open_mode=open_mode), patch.object(
+                    self.service, "login_required", not open_mode
+                ):
+                    handler = self.handler(path)
+                    handler.do_GET()
+                    self.assertEqual(
+                        handler.send_json.call_args.args[0],
+                        {key: value for key, value in review.items() if key != "deduplicated"},
+                    )
+
+    def test_exact_review_get_rejects_noncanonical_routes_and_sanitizes_errors(self):
+        path = f"/api/admin/token-reviews/{self.request_id}"
+        for suffix in ["?x=1", "?", "/"]:
+            with self.subTest(suffix=suffix):
+                handler = self.handler(path + suffix)
+                handler.do_GET()
+                self.assertEqual(handler.send_json.call_args.args[1], 400)
+        for invalid_id in ["A" * 32, "a" * 31, "../" + self.request_id]:
+            with self.subTest(invalid_id=invalid_id):
+                handler = self.handler(f"/api/admin/token-reviews/{invalid_id}")
+                handler.do_GET()
+                self.assertEqual(handler.send_json.call_args.args[1], 400)
+
+        for error, expected_status in [
+            (TokenReviewError("review_not_found", "/private/review.sqlite3"), 404),
+            (OSError("SMTP private@example.test /private/review.sqlite3"), 503),
+        ]:
+            with self.subTest(error=type(error).__name__), patch.object(
+                self.service, "get_token_review", side_effect=error, create=True
+            ):
+                handler = self.handler(path)
+                handler.do_GET()
+                response, status = handler.send_json.call_args.args[:2]
+                self.assertEqual(status, expected_status)
+                self.assertNotIn("private", str(response))
+
     def test_decision_retry_and_explicit_start_use_revisions_and_stored_identity(self):
         review, _ = self.submit()
         prefix = f"/api/admin/token-reviews/{review['request_id']}"
-        with patch.object(self.service, "create_onboarding_job", return_value={"job_id": "job-approved"}) as onboarding:
+        with patch.object(self.service, "resolve_token", return_value=AdminServiceTest.review_candidate()), patch.object(self.service, "_create_onboarding_job_from_candidate", return_value={"job_id": "job-approved"}) as onboarding:
             handler = self.handler(prefix + "/start", {"expected_revision": review["revision"]})
             handler.do_POST()
             self.assertEqual(handler.send_json.call_args.args[1], 409)
@@ -2483,7 +2573,7 @@ class TokenReviewHandlerTest(unittest.TestCase):
             result = handler.send_json.call_args.args[0]
             self.assertEqual(result["status"], "onboarding_queued")
             self.assertEqual(result["onboarding_job_id"], "job-approved")
-            onboarding.assert_called_once_with(AdminServiceTest.review_payload(), "reviewer")
+            onboarding.assert_called_once_with(AdminServiceTest.review_candidate(), 30, "reviewer")
             handler.do_POST()
             self.assertEqual(handler.send_json.call_args.args[1], 409)
             self.assertEqual(onboarding.call_count, 1)
@@ -2510,7 +2600,7 @@ class TokenReviewHandlerTest(unittest.TestCase):
                 self.assertNotIn("secret", str(handler.send_json.call_args.args[0]))
         review, _ = self.submit()
         approved = self.service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
-        with patch.object(self.service, "create_onboarding_job", side_effect=OSError("/private/worker")):
+        with patch.object(self.service, "resolve_token", return_value=AdminServiceTest.review_candidate()), patch.object(self.service, "_create_onboarding_job_from_candidate", side_effect=OSError("/private/worker")):
             handler = self.handler(f"/api/admin/token-reviews/{review['request_id']}/start", {"expected_revision": approved["revision"]})
             handler.do_POST()
             result, status = handler.send_json.call_args.args[:2]

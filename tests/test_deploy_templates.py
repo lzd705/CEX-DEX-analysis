@@ -4,6 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from dashboard.token_review_email import TokenReviewEmailSettings
+from dashboard.token_reviews import TokenReviewError
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RENDERER_PATH = PROJECT_ROOT / "deploy/render_runtime_templates.py"
@@ -14,6 +17,37 @@ SPEC.loader.exec_module(renderer)
 
 
 class DeployTemplateTests(unittest.TestCase):
+    def test_review_environment_examples_are_complete_and_disabled_after_rendering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "data"
+            output = root / "rendered"
+            renderer.render_templates(
+                output_dir=output, project_root=root / "app", service_user="monitor",
+                service_group="monitor", market_data_dir=data, admin_job_dir=root / "jobs",
+            )
+            keys = {"TOKEN_REVIEW_DB_PATH", "TOKEN_REVIEW_EMAIL_ENABLED", "TOKEN_REVIEWER_EMAIL",
+                    "TOKEN_REVIEW_BASE_URL", "TOKEN_REVIEW_SMTP_HOST", "TOKEN_REVIEW_SMTP_PORT",
+                    "TOKEN_REVIEW_SMTP_STARTTLS", "TOKEN_REVIEW_SMTP_FROM",
+                    "TOKEN_REVIEW_SMTP_USERNAME", "TOKEN_REVIEW_SMTP_PASSWORD"}
+            for path in [PROJECT_ROOT / ".env.example", output / "dashboard.env"]:
+                with self.subTest(path=path.name):
+                    values = dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines()
+                                  if line and not line.startswith("#") and "=" in line)
+                    actual_keys = {key for key in values if key.startswith("TOKEN_REVIEW")}
+                    self.assertEqual(actual_keys, keys)
+                    self.assertEqual(values["TOKEN_REVIEW_EMAIL_ENABLED"], "false")
+                    self.assertEqual(values["TOKEN_REVIEW_SMTP_STARTTLS"], "true")
+                    for key in keys - {"TOKEN_REVIEW_DB_PATH", "TOKEN_REVIEW_EMAIL_ENABLED", "TOKEN_REVIEW_SMTP_STARTTLS"}:
+                        self.assertEqual(values[key], "")
+                    self.assertFalse(TokenReviewEmailSettings.from_environment(values).enabled)
+                    with self.assertRaises(TokenReviewError):
+                        TokenReviewEmailSettings.from_environment({**values, "TOKEN_REVIEW_EMAIL_ENABLED": "true"})
+                    expected_path = "" if path.name == ".env.example" else str(data / "admin/token_reviews.sqlite3")
+                    self.assertEqual(values["TOKEN_REVIEW_DB_PATH"], expected_path)
+                    if path.name == "dashboard.env":
+                        self.assertEqual(values.get("DASHBOARD_SKIP_LOCAL_ENV"), "true")
+
     def test_renderer_keeps_environment_and_systemd_write_paths_identical(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -1,9 +1,12 @@
 import sqlite3
+import ssl
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 from dashboard.token_reviews import TokenReviewError, TokenReviewStore
 from dashboard.token_review_email import (
@@ -421,6 +424,14 @@ class TokenReviewEmailTest(unittest.TestCase):
         self.assertIn(ADDRESS, message.get_content())
         self.assertNotIn(ADDRESS, expected_url)
 
+    def test_message_includes_submission_time_and_explicit_no_collection_boundary(self):
+        settings = TokenReviewEmailSettings.from_environment(self.environment())
+        review = self.review()
+        body = build_token_review_message(settings, review).get_content()
+        self.assertIn("Created at: " + review["created_at"], body)
+        self.assertIn("This email does not approve the request.", body)
+        self.assertIn("Approval and a separate Start are required before any runtime registry entry, collection, or publication.", body)
+
     def test_configuration_rejects_crlf_and_address_cannot_form_url(self):
         for name in (
             "TOKEN_REVIEWER_EMAIL",
@@ -477,6 +488,8 @@ class TokenReviewEmailTest(unittest.TestCase):
                 self.timeout = timeout
                 self.source_address = source_address
                 self.starttls_called = False
+                self.tls_context = None
+                self.events = []
                 self.login_values = None
                 self.message = None
 
@@ -486,13 +499,17 @@ class TokenReviewEmailTest(unittest.TestCase):
             def __exit__(self, _type, _value, _traceback):
                 return False
 
-            def starttls(self):
+            def starttls(self, *, context=None):
+                self.events.append("starttls")
                 self.starttls_called = True
+                self.tls_context = context
 
             def login(self, username, password):
+                self.events.append("login")
                 self.login_values = (username, password)
 
             def send_message(self, message):
+                self.events.append("send")
                 self.message = message
 
         settings = TokenReviewEmailSettings.from_environment(
@@ -515,8 +532,39 @@ class TokenReviewEmailTest(unittest.TestCase):
         self.assertIsNone(created[0].local_hostname)
         self.assertEqual(created[0].timeout, 30)
         self.assertTrue(created[0].starttls_called)
+        self.assertIsInstance(created[0].tls_context, ssl.SSLContext)
+        self.assertTrue(created[0].tls_context.check_hostname)
+        self.assertEqual(created[0].tls_context.verify_mode, ssl.CERT_REQUIRED)
         self.assertEqual(created[0].login_values, ("mailer", "secret"))
         self.assertEqual(created[0].message["To"], "reviewer@example.com")
+        self.assertEqual(created[0].events, ["starttls", "login", "send"])
+
+        relay_settings = TokenReviewEmailSettings.from_environment(
+            self.environment(TOKEN_REVIEW_SMTP_STARTTLS="false")
+        )
+        SmtpTokenReviewMailer(relay_settings, smtp_factory=smtp_factory).send(self.review())
+        self.assertFalse(created[1].starttls_called)
+        self.assertIsNone(created[1].login_values)
+        self.assertIsNotNone(created[1].message)
+        self.assertEqual(created[1].events, ["send"])
+
+    def test_credentials_require_starttls_before_any_transport_is_opened(self):
+        environment = self.environment(
+            TOKEN_REVIEW_SMTP_STARTTLS="false",
+            TOKEN_REVIEW_SMTP_USERNAME="mailer",
+            TOKEN_REVIEW_SMTP_PASSWORD="test-only-password",
+        )
+        with self.assertRaises(TokenReviewError) as caught:
+            TokenReviewEmailSettings.from_environment(environment)
+        self.assertEqual(caught.exception.code, "invalid_token_review_email_config")
+
+        valid = TokenReviewEmailSettings.from_environment({**environment, "TOKEN_REVIEW_SMTP_STARTTLS": "true"})
+        factory = Mock()
+        with self.assertRaises(TokenReviewError) as caught:
+            mailer = SmtpTokenReviewMailer(replace(valid, smtp_starttls=False), smtp_factory=factory)
+            mailer.send(self.review())
+        self.assertEqual(caught.exception.code, "invalid_token_review_email_config")
+        factory.assert_not_called()
 
 
 if __name__ == "__main__":

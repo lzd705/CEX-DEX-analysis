@@ -555,6 +555,9 @@ class AdminService:
     def list_token_reviews(self, *, limit: Any = 50) -> list[dict[str, Any]]:
         return self._token_review_store().list_reviews(limit=limit)
 
+    def get_token_review(self, request_id: Any) -> dict[str, Any]:
+        return self._token_review_store().get(request_id)
+
     def count_token_reviews_created_on(self, value: date | str) -> int:
         return self._token_review_store().count_created_on(value)
 
@@ -707,12 +710,12 @@ class AdminService:
             actor=username, at=self.review_clock().isoformat(),
         )
         try:
-            job = self.create_onboarding_job({
-                "chain": reserved["chain"],
-                "contract_address": reserved["contract_address"],
-                "expected_token_symbol": reserved["token_symbol"],
-                "history_days": reserved["requested_history_days"],
-            }, username)
+            candidate = self.resolve_token(reserved["chain"], reserved["contract_address"])
+            if candidate["identity"] != reserved["candidate"]["identity"]:
+                raise TokenOnboardingError("identity_changed", "Approved Token identity has changed")
+            job = self._create_onboarding_job_from_candidate(
+                candidate, reserved["requested_history_days"], username,
+            )
         except (ValueError, OSError, AdminJobBusyError, AdminWorkerStartError):
             target, job_id, error_code = "approved", None, "onboarding_start_failed"
         else:
@@ -1459,6 +1462,13 @@ class AdminService:
                 "identity_changed",
                 "Resolved Token symbol no longer matches the confirmed preview",
             )
+        return self._create_onboarding_job_from_candidate(candidate, history_days, username)
+
+    def _create_onboarding_job_from_candidate(
+        self, candidate: dict[str, Any], history_days: int, username: str,
+    ) -> dict[str, Any]:
+        """Create effects from the single candidate already resolved by the caller."""
+        symbol = candidate["identity"]["token_symbol"]
         job_id = secrets.token_hex(16)
         completed_day = utc_now().date() - timedelta(days=1)
         start_day = completed_day - timedelta(days=history_days - 1)

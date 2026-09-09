@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import smtplib
+import ssl
 from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import parseaddr
@@ -140,6 +141,8 @@ class TokenReviewEmailSettings:
         )
         if (username is None) != (password is None):
             raise _configuration_error()
+        if username is not None and not smtp_starttls:
+            raise _configuration_error()
         return cls(
             enabled=True,
             reviewer_email=reviewer_email,
@@ -213,14 +216,18 @@ def build_token_review_message(
     message["Auto-Submitted"] = "auto-generated"
     message.set_content(
         "A Token contract is awaiting authenticated review.\n\n"
+        "This email does not approve the request.\n"
+        "Approval and a separate Start are required before any runtime registry entry, collection, or publication.\n\n"
         "Request ID: %s\n"
+        "Created at: %s\n"
         "Chain: %s\n"
         "Contract address: %s\n"
         "Symbol: %s\n"
         "Requested history: %s days\n"
         "Candidate digest: %s\n"
         "Review URL: %s\n"
-        % (request_id, chain, address, symbol, days, digest, settings.review_url(request_id)),
+        % (request_id, _plain_setting(review.get("created_at"), maximum=64),
+           chain, address, symbol, days, digest, settings.review_url(request_id)),
         subtype="plain",
         charset="utf-8",
     )
@@ -239,6 +246,10 @@ class SmtpTokenReviewMailer:
     ) -> None:
         if not isinstance(settings, TokenReviewEmailSettings) or not settings.enabled:
             raise _configuration_error()
+        if not settings.smtp_starttls and (
+            settings.smtp_username is not None or settings.smtp_password is not None
+        ):
+            raise _configuration_error()
         if timeout <= 0:
             raise ValueError("SMTP timeout must be positive")
         self.settings = settings
@@ -255,7 +266,7 @@ class SmtpTokenReviewMailer:
             timeout=self.timeout,
         ) as client:
             if self.settings.smtp_starttls:
-                client.starttls()
+                client.starttls(context=ssl.create_default_context())
             if self.settings.smtp_username is not None:
                 client.login(self.settings.smtp_username, self.settings.smtp_password)
             client.send_message(message)
