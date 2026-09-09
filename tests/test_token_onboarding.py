@@ -1,6 +1,10 @@
+import io
 import unittest
 import urllib.error
-from unittest.mock import patch
+import urllib.request
+import urllib.response
+from email.message import Message
+from unittest.mock import Mock, patch
 
 from dashboard.token_onboarding import (
     MAX_SOURCE_RESPONSE_BYTES,
@@ -81,6 +85,25 @@ class FakeSource:
 
 
 class TokenOnboardingTest(unittest.TestCase):
+    def test_request_json_refuses_redirect_without_a_second_transport_request(self):
+        url = "https://api.geckoterminal.com/api/v2/networks/eth/tokens/" + ADDRESS
+        for target in ["https://evil.test/token", "https://api.geckoterminal.com/other",
+                       "http://127.0.0.1/secret", "file:///private/secret"]:
+            calls = []
+            def transport(_handler, request):
+                calls.append(request.full_url)
+                headers = Message()
+                headers["Location"] = target
+                response = urllib.response.addinfourl(io.BytesIO(b'{}'), headers, request.full_url, 302 if len(calls) == 1 else 200)
+                response.msg = "Found" if len(calls) == 1 else "OK"
+                return response
+            with self.subTest(target=target), patch("urllib.request._opener", None), patch.object(urllib.request.HTTPSHandler, "https_open", transport), patch.object(urllib.request.HTTPHandler, "http_open", transport):
+                with self.assertRaises(TokenOnboardingError) as context:
+                    request_json(url)
+                self.assertEqual(context.exception.code, "source_redirect_refused")
+                self.assertEqual(calls, [url])
+                self.assertNotIn(target, str(context.exception))
+
     def test_request_json_rejects_oversized_response_with_bounded_read(self):
         class OversizedResponse:
             requested_size = None
@@ -98,8 +121,8 @@ class TokenOnboardingTest(unittest.TestCase):
         response = OversizedResponse()
         private_url = "https://source.test/api/v2/token?credential=private"
         with patch(
-            "dashboard.token_onboarding.urllib.request.urlopen",
-            return_value=response,
+            "dashboard.token_onboarding.urllib.request.build_opener",
+            return_value=Mock(open=Mock(return_value=response)),
         ), self.assertRaises(TokenOnboardingError) as context:
             request_json(private_url)
 

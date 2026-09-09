@@ -2332,5 +2332,193 @@ class AdminServiceTest(unittest.TestCase):
         self.assertIn("systemctl --user enable --now", runbook)
 
 
+class TokenReviewHandlerTest(unittest.TestCase):
+    request_id = "a" * 32
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.service = AdminServiceTest().review_service(root, password_hash=hash_password("test-password"), allow_open_local=True)
+        self.service.sessions["session"] = {
+            "username": "reviewer", "csrf_token": "csrf",
+            "expires_at": datetime(2099, 1, 1, tzinfo=timezone.utc),
+        }
+        self.patch = patch.object(server, "ADMIN_SERVICE", self.service)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        for method, value in [("resolve_token", AdminServiceTest.review_candidate()),
+                              ("create_onboarding_job", {"status": "queued"})]:
+            boundary = patch.object(self.service, method, return_value=value)
+            boundary.start()
+            self.addCleanup(boundary.stop)
+
+    def handler(self, path, payload=None, *, authenticated=True, csrf=True):
+        handler = object.__new__(server.MarketMonitorHandler)
+        handler.path = path
+        handler.server = SimpleNamespace(server_address=("127.0.0.1", 8765))
+        handler.client_address = ("127.0.0.1", 40000)
+        handler.headers = {"Content-Type": "application/json"}
+        if authenticated:
+            handler.headers["Cookie"] = "admin_session=session"
+        if csrf:
+            handler.headers["X-CSRF-Token"] = "csrf"
+        handler.read_json = Mock(return_value=payload or {})
+        handler.send_json = Mock()
+        handler.send_error = Mock()
+        handler.directory = self.temp.name
+        return handler
+
+    def submit(self):
+        handler = self.handler("/api/admin/tokens", AdminServiceTest.review_payload())
+        with patch.object(self.service, "resolve_token", return_value=AdminServiceTest.review_candidate()), patch.object(self.service, "create_onboarding_job", return_value={"status": "queued"}) as onboarding:
+            handler.do_POST()
+            onboarding.assert_not_called()
+        response, status = handler.send_json.call_args.args[:2]
+        self.assertIn(status, {200, 202})
+        self.assertIn("request_id", response)
+        return response, status
+
+    def test_admin_submit_persists_review_with_selected_history_and_dedupes(self):
+        first, status = self.submit()
+        self.assertEqual(status, 202)
+        self.assertEqual(first["status"], "pending_review")
+        self.assertEqual(first["requested_history_days"], 30)
+        self.assertEqual(first["submitter"], "reviewer")
+        second, status = self.submit()
+        self.assertEqual(status, 200)
+        self.assertEqual(first["request_id"], second["request_id"])
+        self.assertTrue(second["deduplicated"])
+
+    def test_all_review_mutations_require_session_csrf_and_configured_reviewer(self):
+        routes = [("/api/admin/tokens", AdminServiceTest.review_payload())] + [
+            (f"/api/admin/token-reviews/{self.request_id}/{action}", payload)
+            for action, payload in [("decision", {"decision": "approve", "expected_revision": 1}),
+                                    ("notification/retry", {"expected_revision": 1}),
+                                    ("start", {"expected_revision": 1})]
+        ]
+        for path, payload in routes:
+            for authenticated, csrf, status in [(False, True, 401), (True, False, 403)]:
+                with self.subTest(path=path, authenticated=authenticated, csrf=csrf):
+                    handler = self.handler(path, payload, authenticated=authenticated, csrf=csrf)
+                    handler.do_POST()
+                    self.assertEqual(handler.send_json.call_args.args[1], status)
+            with self.subTest(path=path, mode="open"), patch.object(self.service, "login_required", False), patch.object(self.service, "submit_token_review") as submit:
+                handler = self.handler(path, payload)
+                handler.do_POST()
+                self.assertEqual(handler.send_json.call_args.args[1], 403)
+                self.assertEqual(handler.send_json.call_args.args[0]["error_code"], "reviewer_required")
+                submit.assert_not_called()
+            with self.subTest(path=path, mode="wrong_actor"):
+                self.service.sessions["session"]["username"] = "someone_else"
+                handler = self.handler(path, payload)
+                handler.do_POST()
+                self.assertEqual(handler.send_json.call_args.args[1], 403)
+                self.service.sessions["session"]["username"] = "reviewer"
+        self.assertFalse(self.service.review_store_path.exists())
+
+    def test_review_routes_reject_malformed_paths_query_and_exact_payload_before_service(self):
+        prefix = f"/api/admin/token-reviews/{self.request_id}"
+        cases = [(prefix + "/start?x=1", {"expected_revision": 1}),
+                 (prefix + "/start?", {"expected_revision": 1}),
+                 (prefix + "/start/", {"expected_revision": 1}),
+                 (prefix.replace(self.request_id, "A" * 32) + "/start", {"expected_revision": 1}),
+                 (prefix.replace(self.request_id, "abc") + "/start", {"expected_revision": 1}),
+                 (prefix + "/decision", {"decision": "APPROVE", "expected_revision": 1})]
+        for action in ["decision", "notification/retry", "start"]:
+            base = {"decision": "approve"} if action == "decision" else {}
+            for revision in [True, False, 0, -1, 1.5, "1", None]:
+                cases.append((prefix + "/" + action, {**base, "expected_revision": revision}))
+            cases.extend([(prefix + "/" + action, base),
+                          (prefix + "/" + action, {**base, "expected_revision": 1, "username": "reviewer"})])
+        payload = AdminServiceTest.review_payload()
+        for extra in [{"username": "reviewer"}, {"history_days": True}, {"history_days": "30"},
+                      {"history_days": 0}, {"history_days": 181}, {"chain": 1}]:
+            cases.append(("/api/admin/tokens", {**payload, **extra}))
+        cases.extend([("/api/admin/tokens?x=1", payload), ("/api/admin/tokens", {k: v for k, v in payload.items() if k != "history_days"})])
+        with patch.object(self.service, "submit_token_review") as submit, patch.object(self.service, "decide_token_review") as decide, patch.object(self.service, "retry_token_review_notification") as retry, patch.object(self.service, "start_token_review_onboarding") as start:
+            for path, body in cases:
+                with self.subTest(path=path, body=body):
+                    handler = self.handler(path, body)
+                    handler.do_POST()
+                    self.assertEqual(handler.send_json.call_args.args[1], 400)
+            for service_call in [submit, decide, retry, start]:
+                service_call.assert_not_called()
+
+    def test_admin_list_is_bounded_authenticated_and_open_read_only(self):
+        handler = self.handler("/api/admin/token-reviews", authenticated=False)
+        handler.do_GET()
+        self.assertEqual(handler.send_json.call_args.args[1], 401)
+        for suffix in ["?limit=1000", "?"]:
+            handler = self.handler("/api/admin/token-reviews" + suffix)
+            handler.do_GET()
+            self.assertEqual(handler.send_json.call_args.args[1], 400)
+        with patch.object(self.service, "list_token_reviews", return_value=[]) as listing:
+            for open_mode in [False, True]:
+                with patch.object(self.service, "login_required", not open_mode):
+                    handler = self.handler("/api/admin/token-reviews")
+                    handler.do_GET()
+                    self.assertEqual(handler.send_json.call_args.args[0], {"reviews": [], "count": 0})
+                    listing.assert_called_with(limit=50)
+
+    def test_decision_retry_and_explicit_start_use_revisions_and_stored_identity(self):
+        review, _ = self.submit()
+        prefix = f"/api/admin/token-reviews/{review['request_id']}"
+        with patch.object(self.service, "create_onboarding_job", return_value={"job_id": "job-approved"}) as onboarding:
+            handler = self.handler(prefix + "/start", {"expected_revision": review["revision"]})
+            handler.do_POST()
+            self.assertEqual(handler.send_json.call_args.args[1], 409)
+            handler = self.handler(prefix + "/decision", {"decision": "approve", "expected_revision": review["revision"]})
+            handler.do_POST()
+            approved = handler.send_json.call_args.args[0]
+            self.assertEqual(approved["status"], "approved")
+            onboarding.assert_not_called()
+            handler.do_POST()
+            self.assertEqual(handler.send_json.call_args.args[1], 409)
+            handler = self.handler(prefix + "/notification/retry", {"expected_revision": approved["revision"]})
+            handler.do_POST()
+            self.assertEqual(handler.send_json.call_args.args[1], 429)
+            handler = self.handler(prefix + "/start", {"expected_revision": approved["revision"]})
+            handler.do_POST()
+            result = handler.send_json.call_args.args[0]
+            self.assertEqual(result["status"], "onboarding_queued")
+            self.assertEqual(result["onboarding_job_id"], "job-approved")
+            onboarding.assert_called_once_with(AdminServiceTest.review_payload(), "reviewer")
+            handler.do_POST()
+            self.assertEqual(handler.send_json.call_args.args[1], 409)
+            self.assertEqual(onboarding.call_count, 1)
+
+    def test_review_error_mapping_and_failed_start_are_sanitized(self):
+        path = f"/api/admin/token-reviews/{self.request_id}/start"
+        cases = [("invalid_revision", 400), ("reviewer_required", 403), ("review_not_found", 404),
+                 ("stale_revision", 409), ("invalid_review_transition", 409),
+                 ("invalid_notification_transition", 409), ("notification_attempt_limit", 429),
+                 ("notification_cooldown", 429), ("invalid_review_database", 503), ("unknown", 503)]
+        for code, status in cases:
+            with self.subTest(code=code), patch.object(self.service, "start_token_review_onboarding", side_effect=TokenReviewError(code, "SMTP private@example.test /private/db")):
+                handler = self.handler(path, {"expected_revision": 1})
+                handler.do_POST()
+                response, actual = handler.send_json.call_args.args[:2]
+                self.assertEqual(actual, status)
+                self.assertNotIn("private", str(response))
+                self.assertEqual(response["retryable"], status in {429, 503})
+        for error in [OSError("/private/db"), ValueError("SMTP secret"), RuntimeError("SMTP secret")]:
+            with patch.object(self.service, "start_token_review_onboarding", side_effect=error):
+                handler = self.handler(path, {"expected_revision": 1})
+                handler.do_POST()
+                self.assertEqual(handler.send_json.call_args.args[1], 503)
+                self.assertNotIn("secret", str(handler.send_json.call_args.args[0]))
+        review, _ = self.submit()
+        approved = self.service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+        with patch.object(self.service, "create_onboarding_job", side_effect=OSError("/private/worker")):
+            handler = self.handler(f"/api/admin/token-reviews/{review['request_id']}/start", {"expected_revision": approved["revision"]})
+            handler.do_POST()
+            result, status = handler.send_json.call_args.args[:2]
+            self.assertEqual(status, 503)
+            self.assertEqual(result["status"], "approved")
+            self.assertEqual(result["onboarding_error_code"], "onboarding_start_failed")
+            self.assertNotIn("/private", str(result))
+
+
 if __name__ == "__main__":
     unittest.main()

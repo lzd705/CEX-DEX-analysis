@@ -39,6 +39,7 @@ try:
         AdminWorkerStartError,
         environment_flag,
     )
+    from dashboard.token_reviews import MAX_HISTORY_DAYS, TokenReviewError, public_token_review
     from dashboard.freshness import (
         build_source_freshness,
         route_opportunity_freshness,
@@ -112,6 +113,7 @@ except ModuleNotFoundError:
         AdminWorkerStartError,
         environment_flag,
     )
+    from token_reviews import MAX_HISTORY_DAYS, TokenReviewError, public_token_review
     from freshness import (  # type: ignore[no-redef]
         build_source_freshness,
         route_opportunity_freshness,
@@ -7799,6 +7801,105 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         }
         self.send_json(response, status)
 
+    def send_token_review_error(self, error: BaseException) -> None:
+        """Use server-owned messages and a closed code/status map on both surfaces."""
+        code = getattr(error, "code", "token_review_unavailable")
+        groups = {
+            HTTPStatus.BAD_REQUEST: {
+                "invalid_review_request", "invalid_request_id", "invalid_revision",
+                "invalid_history_days", "invalid_chain", "invalid_contract_address",
+                "invalid_token_symbol", "invalid_token_request",
+            },
+            HTTPStatus.FORBIDDEN: {"reviewer_required"},
+            HTTPStatus.NOT_FOUND: {"review_not_found", "token_not_found"},
+            HTTPStatus.CONFLICT: {
+                "stale_revision", "invalid_review_transition", "invalid_notification_transition",
+                "identity_changed", "identity_conflict", "symbol_collision", "token_already_active",
+                "identity_mismatch", "pool_token_mismatch", "no_usable_pool", "audit_limit",
+            },
+            HTTPStatus.TOO_MANY_REQUESTS: {"notification_cooldown", "notification_attempt_limit"},
+            HTTPStatus.SERVICE_UNAVAILABLE: {
+                "invalid_review_database", "token_review_unavailable", "onboarding_start_failed",
+                "source_unavailable", "source_rate_limited", "source_invalid_response",
+                "source_redirect_refused", "invalid_candidate",
+            },
+        }
+        status = next((status for status, codes in groups.items() if code in codes), None)
+        if status is None:
+            code, status = "token_review_unavailable", HTTPStatus.SERVICE_UNAVAILABLE
+        messages = {
+            HTTPStatus.BAD_REQUEST: "Token review request is invalid",
+            HTTPStatus.FORBIDDEN: "Configured administrator login is required",
+            HTTPStatus.NOT_FOUND: "Token review or requested Token was not found",
+            HTTPStatus.CONFLICT: "Token review conflicts with the current state; reload it",
+            HTTPStatus.TOO_MANY_REQUESTS: "Token review notification retry limit is active",
+            HTTPStatus.SERVICE_UNAVAILABLE: "Token review is temporarily unavailable",
+        }
+        self.send_json({"error": messages[status], "error_code": code,
+                        "retryable": status in {HTTPStatus.TOO_MANY_REQUESTS, HTTPStatus.SERVICE_UNAVAILABLE}}, status)
+
+    def handle_admin_token_review_post(self) -> None:
+        """Authenticate review mutations and validate their complete wire contract."""
+        match = re.fullmatch(r"/api/admin/token-reviews/([0-9a-f]{32})/(decision|notification/retry|start)", self.path)
+        submission = self.path == "/api/admin/tokens"
+        if not submission and not match:
+            self.send_token_review_error(TokenReviewError("invalid_review_request", "Invalid route"))
+            return
+        if ADMIN_SERVICE.open_mode:
+            self.send_token_review_error(TokenReviewError("reviewer_required", "Login required"))
+            return
+        authenticated = self.require_admin(csrf=True)
+        if not authenticated:
+            return
+        _, session = authenticated
+        if session["username"] != ADMIN_SERVICE.username:
+            self.send_token_review_error(TokenReviewError("reviewer_required", "Login required"))
+            return
+        try:
+            payload = self.read_json()
+        except (ValueError, TypeError):
+            self.send_token_review_error(TokenReviewError("invalid_review_request", "Invalid JSON"))
+            return
+        try:
+            if submission:
+                if set(payload) != {"chain", "contract_address", "expected_token_symbol", "history_days"}:
+                    raise TokenReviewError("invalid_review_request", "Invalid fields")
+                history = payload["history_days"]
+                if type(history) is not int or not 1 <= history <= MAX_HISTORY_DAYS:
+                    raise TokenReviewError("invalid_history_days", "Invalid history")
+                request = require_exact_string_fields(
+                    {key: value for key, value in payload.items() if key != "history_days"},
+                    {"chain": 32, "contract_address": 128, "expected_token_symbol": 32},
+                )
+                review = ADMIN_SERVICE.submit_token_review({**request, "history_days": history}, session["username"])
+                status = HTTPStatus.OK if review.get("deduplicated") else HTTPStatus.ACCEPTED
+            else:
+                request_id, action = match.groups()
+                fields = {"expected_revision", "decision"} if action == "decision" else {"expected_revision"}
+                if set(payload) != fields:
+                    raise TokenReviewError("invalid_review_request", "Invalid fields")
+                if type(payload["expected_revision"]) is not int or payload["expected_revision"] < 1:
+                    raise TokenReviewError("invalid_revision", "Invalid revision")
+                if action == "decision" and payload["decision"] not in ("approve", "reject"):
+                    raise TokenReviewError("invalid_review_request", "Invalid decision")
+                method = {"decision": ADMIN_SERVICE.decide_token_review,
+                          "notification/retry": ADMIN_SERVICE.retry_token_review_notification,
+                          "start": ADMIN_SERVICE.start_token_review_onboarding}[action]
+                review = method(request_id, payload, session["username"])
+                status = (HTTPStatus.SERVICE_UNAVAILABLE if action == "start"
+                          and review.get("onboarding_error_code") == "onboarding_start_failed"
+                          else HTTPStatus.OK)
+        except TokenReviewError as error:
+            self.send_token_review_error(error)
+            return
+        except PublicActionError:
+            self.send_token_review_error(TokenReviewError("invalid_review_request", "Invalid fields"))
+            return
+        except (ValueError, OSError, RuntimeError, TypeError, KeyError) as error:
+            self.send_token_review_error(error)
+            return
+        self.send_json(review, status)
+
     @staticmethod
     def validate_public_retry_request(
         payload: dict[str, Any],
@@ -8085,65 +8186,35 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                     self.public_client_address(),
                     service=ADMIN_SERVICE,
                 ):
-                    job = ADMIN_SERVICE.create_onboarding_job(
+                    review = ADMIN_SERVICE.submit_token_review(
                         {
                             **request,
                             "history_days": PUBLIC_TOKEN_HISTORY_DAYS,
                         },
                         PUBLIC_ADD_TOKEN_ACTOR,
                     )
+                try:
+                    response = public_token_review(
+                        review, deduplicated=review.get("deduplicated", False),
+                    )
+                except (ValueError, TypeError, KeyError) as error:
+                    raise TokenReviewError(
+                        "invalid_review_database", "Persisted review is invalid",
+                    ) from error
             except PublicActionError as error:
                 self.send_public_action_error(error)
                 return
-            except AdminJobBusyError:
-                self.send_public_action_error(
-                    PublicActionError(
-                        "refresh_job_busy",
-                        "Another collection job is already queued or running",
-                        status=HTTPStatus.CONFLICT,
-                        retryable=True,
-                        retry_after_seconds=30,
-                    )
-                )
+            except TokenReviewError as error:
+                self.send_token_review_error(error)
                 return
-            except AdminWorkerStartError:
-                self.send_public_action_error(
-                    PublicActionError(
-                        "public_worker_start_failed",
-                        "The Token onboarding worker could not be started",
-                        status=HTTPStatus.SERVICE_UNAVAILABLE,
-                        retryable=True,
-                    )
-                )
-                return
-            except RuntimeError:
-                self.send_public_action_error(
-                    PublicActionError(
-                        "token_onboarding_unavailable",
-                        "Token onboarding is temporarily unavailable",
-                        status=HTTPStatus.SERVICE_UNAVAILABLE,
-                        retryable=True,
-                    )
-                )
-                return
-            except ValueError as error:
-                self.send_public_token_error(error)
-                return
-            except (KeyError, OSError, TypeError):
-                self.send_public_action_error(
-                    PublicActionError(
-                        "token_onboarding_unavailable",
-                        "Token onboarding is temporarily unavailable",
-                        status=HTTPStatus.SERVICE_UNAVAILABLE,
-                        retryable=True,
-                    )
-                )
+            except (ValueError, RuntimeError, KeyError, OSError, TypeError) as error:
+                self.send_token_review_error(error)
                 return
             self.send_json(
-                public_job(job),
+                response,
                 (
                     HTTPStatus.OK
-                    if job.get("status") == "succeeded"
+                    if response["deduplicated"]
                     else HTTPStatus.ACCEPTED
                 ),
             )
@@ -8552,6 +8623,22 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
             session = ADMIN_SERVICE.get_session(self.admin_session_token())
             self.send_json(ADMIN_SERVICE.public_session(session))
             return
+        if parsed.path == "/api/admin/token-reviews":
+            if self.path != "/api/admin/token-reviews":
+                self.send_token_review_error(TokenReviewError("invalid_review_request", "Invalid route"))
+                return
+            if not self.require_admin():
+                return
+            try:
+                reviews = ADMIN_SERVICE.list_token_reviews(limit=50)
+            except TokenReviewError as error:
+                self.send_token_review_error(error)
+                return
+            except (ValueError, OSError, RuntimeError, TypeError, KeyError) as error:
+                self.send_token_review_error(error)
+                return
+            self.send_json({"reviews": reviews, "count": len(reviews)})
+            return
         if parsed.path == "/api/admin/tokens":
             authenticated = self.require_admin()
             if authenticated:
@@ -8654,6 +8741,9 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
         path = parsed.path
         if is_admin_surface_path(path) and not self.admin_surface_available():
             self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+            return
+        if path == "/api/admin/tokens" or path.startswith("/api/admin/token-reviews"):
+            self.handle_admin_token_review_post()
             return
         if path in PUBLIC_ACTION_PATHS:
             if not PUBLIC_ACTION_POLICY.enabled_for_path(path):
@@ -8808,62 +8898,6 @@ class MarketMonitorHandler(SimpleHTTPRequestHandler):
                 self.send_json(response, status)
                 return
             self.send_json(candidate)
-            return
-
-        if path == "/api/admin/tokens":
-            authenticated = self.require_admin(csrf=True)
-            if not authenticated:
-                return
-            _, session = authenticated
-            try:
-                job = ADMIN_SERVICE.create_onboarding_job(
-                    payload,
-                    session["username"],
-                )
-            except RuntimeError as error:
-                self.send_json({"error": str(error)}, HTTPStatus.CONFLICT)
-                return
-            except (ValueError, OSError) as error:
-                error_code = getattr(error, "code", "invalid_token_request")
-                response = {
-                    "error": str(error),
-                    "error_code": error_code,
-                    "retryable": bool(getattr(error, "retryable", False)),
-                }
-                details = getattr(error, "details", None)
-                if details:
-                    response["details"] = details
-                status = (
-                    HTTPStatus.CONFLICT
-                    if error_code in {
-                        "symbol_collision",
-                        "identity_conflict",
-                    }
-                    else HTTPStatus.SERVICE_UNAVAILABLE
-                    if error_code in {
-                        "source_rate_limited",
-                        "source_unavailable",
-                        "source_invalid_response",
-                    }
-                    else HTTPStatus.UNPROCESSABLE_ENTITY
-                    if error_code in {
-                        "no_usable_pool",
-                        "pool_token_mismatch",
-                        "identity_mismatch",
-                        "identity_changed",
-                    }
-                    else HTTPStatus.BAD_REQUEST
-                )
-                self.send_json(response, status)
-                return
-            self.send_json(
-                job,
-                (
-                    HTTPStatus.OK
-                    if job.get("status") == "succeeded"
-                    else HTTPStatus.ACCEPTED
-                ),
-            )
             return
 
         self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)

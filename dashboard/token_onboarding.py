@@ -116,6 +116,15 @@ def _source_error(error: BaseException) -> TokenOnboardingError:
     )
 
 
+class _RefuseSourceRedirects(urllib.request.HTTPRedirectHandler):
+    # Refuse before urllib validates the target scheme, including file: URLs.
+    def http_error_302(self, request, response, code, message, headers):
+        response.close()
+        raise TokenOnboardingError("source_redirect_refused", "GeckoTerminal redirect was refused")
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
 def request_json(url: str) -> Dict[str, Any]:
     """Fetch one bounded GeckoTerminal JSON document over verified TLS."""
     request = urllib.request.Request(
@@ -126,11 +135,10 @@ def request_json(url: str) -> Dict[str, Any]:
         },
     )
     try:
-        with urllib.request.urlopen(
-            request,
-            timeout=30,
-            context=TLS_CONTEXT,
-        ) as response:
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=TLS_CONTEXT), _RefuseSourceRedirects(),
+        )
+        with opener.open(request, timeout=30) as response:
             raw = response.read(MAX_SOURCE_RESPONSE_BYTES + 1)
             if len(raw) > MAX_SOURCE_RESPONSE_BYTES:
                 raise TokenOnboardingError(

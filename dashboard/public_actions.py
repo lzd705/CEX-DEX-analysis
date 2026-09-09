@@ -3,12 +3,12 @@
 This module deliberately does not expose the administrator surface.  It only
 coordinates the two user-facing mutations approved for public use:
 
-* onboarding one contract-qualified Token; and
+* submitting one contract-qualified Token for review; and
 * retrying one exact window from the current daily quality report.
 
 Request payload validation and the final trusted-window check remain in the
 HTTP/service layers.  The policy here provides process-local rate limits and
-concurrency gates, plus persisted daily accepted-job budgets.
+concurrency gates, plus persisted daily accepted-review/job budgets.
 """
 
 from __future__ import annotations
@@ -255,11 +255,14 @@ class PublicActionPolicy:
                     raise RuntimeError("Job-backed public action requires a service")
                 current_time = self._utc_now().astimezone(timezone.utc)
                 current_day = current_time.date()
-                accepted = service.count_jobs_created_on(
-                    requested_by=limit.requested_by,
-                    job_type=limit.job_type,
-                    created_on=current_day,
-                )
+                if action == "token_add":
+                    accepted = service.count_token_reviews_created_on(current_day)
+                else:
+                    accepted = service.count_jobs_created_on(
+                        requested_by=limit.requested_by,
+                        job_type=limit.job_type,
+                        created_on=current_day,
+                    )
                 if accepted >= limit.daily_job_budget:
                     next_day = datetime.combine(
                         current_day + timedelta(days=1),
@@ -268,7 +271,7 @@ class PublicActionPolicy:
                     )
                     raise PublicActionError(
                         "public_daily_budget_exhausted",
-                        "The daily accepted-job budget for this action is exhausted",
+                        "The daily accepted-request budget for this action is exhausted",
                         status=HTTPStatus.TOO_MANY_REQUESTS,
                         retryable=True,
                         retry_after_seconds=max(

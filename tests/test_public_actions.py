@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from dashboard import server
+from dashboard.token_reviews import TokenReviewError
 from dashboard.admin import (
     AdminActionError,
     AdminService,
@@ -116,6 +117,7 @@ class PublicActionPolicyTest(unittest.TestCase):
     def test_public_mutations_share_one_concurrency_gate(self):
         service = Mock()
         service.count_jobs_created_on.return_value = 0
+        service.count_token_reviews_created_on.return_value = 0
         policy = PublicActionPolicy(
             add_token_enabled=True,
             quality_retry_enabled=True,
@@ -144,9 +146,10 @@ class PublicActionPolicyTest(unittest.TestCase):
         ):
             pass
 
-    def test_daily_budget_counts_persisted_accepted_jobs(self):
+    def test_daily_budget_counts_persisted_accepted_reviews(self):
         service = Mock()
-        service.count_jobs_created_on.return_value = 3
+        service.count_jobs_created_on.return_value = 0
+        service.count_token_reviews_created_on.return_value = 3
         now = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
         policy = PublicActionPolicy(
             add_token_enabled=True,
@@ -169,11 +172,8 @@ class PublicActionPolicyTest(unittest.TestCase):
             context.exception.retry_after_seconds,
             12 * 60 * 60,
         )
-        service.count_jobs_created_on.assert_called_once_with(
-            requested_by=PUBLIC_ADD_TOKEN_ACTOR,
-            job_type="token_onboarding",
-            created_on=date(2026, 7, 30),
-        )
+        service.count_token_reviews_created_on.assert_called_once_with(date(2026, 7, 30))
+        service.count_jobs_created_on.assert_not_called()
 
     def test_rate_limit_accounting_has_a_hard_memory_bound(self):
         policy = PublicActionPolicy(add_token_enabled=True)
@@ -821,18 +821,22 @@ class PublicActionHandlerTest(unittest.TestCase):
         self.assertNotIn("internal_path", response["identity"])
         self.assertNotIn("registration", response)
 
-    def test_public_add_token_injects_fixed_budget_and_sanitizes_job(self):
+    def test_public_add_token_injects_fixed_history_and_returns_review_only(self):
         service = Mock()
+        service.create_onboarding_job.return_value = {"status": "queued"}
         service.count_jobs_created_on.return_value = 0
-        service.create_onboarding_job.return_value = {
-            "job_id": "job-add",
-            "job_type": "token_onboarding",
+        service.count_token_reviews_created_on.return_value = 0
+        service.submit_token_review.return_value = {
+            "request_id": "a" * 32,
+            "revision": 2,
             "token_symbol": "TEST",
             "chain": "eth",
             "contract_address": "0x" + "12" * 20,
             "start_date": "2026-07-01",
             "end_date": "2026-07-30",
-            "status": "queued",
+            "status": "pending_review",
+            "notification": {"status": "disabled", "error_code": "private"},
+            "deduplicated": False,
             "stage": "resolve_identity",
             "created_at": "2026-07-30T12:00:00+00:00",
             "requested_by": PUBLIC_ADD_TOKEN_ACTOR,
@@ -855,7 +859,9 @@ class PublicActionHandlerTest(unittest.TestCase):
         ):
             handler.do_POST()
 
-        request, actor = service.create_onboarding_job.call_args.args
+        service.submit_token_review.assert_called_once()
+        service.create_onboarding_job.assert_not_called()
+        request, actor = service.submit_token_review.call_args.args
         self.assertEqual(actor, PUBLIC_ADD_TOKEN_ACTOR)
         self.assertEqual(
             request,
@@ -868,8 +874,63 @@ class PublicActionHandlerTest(unittest.TestCase):
         )
         response, status = handler.send_json.call_args.args[:2]
         self.assertEqual(status, server.HTTPStatus.ACCEPTED)
-        self.assertNotIn("requested_by", response)
-        self.assertNotIn("quality_import_run_id", response)
+        self.assertEqual(response, {
+            "request_id": "a" * 32, "revision": 2, "token_symbol": "TEST",
+            "chain": "eth", "contract_address": "0x" + "12" * 20,
+            "created_at": "2026-07-30T12:00:00+00:00",
+            "status": "pending_review", "notification": {"status": "disabled"},
+            "deduplicated": False,
+        })
+        service.submit_token_review.return_value["deduplicated"] = True
+        with patch.object(server, "PUBLIC_ACTION_POLICY", policy), patch.object(server, "ADMIN_SERVICE", service):
+            handler.do_POST()
+        self.assertEqual(handler.send_json.call_args.args[1], server.HTTPStatus.OK)
+        self.assertTrue(handler.send_json.call_args.args[0]["deduplicated"])
+
+    def test_public_review_errors_are_sanitized_and_keep_domain_status(self):
+        for code, status in [("invalid_review_database", 503), ("stale_revision", 409),
+                             ("identity_changed", 409), ("reviewer_required", 403),
+                             ("review_not_found", 404), ("invalid_history_days", 400),
+                             ("notification_cooldown", 429), ("notification_attempt_limit", 429)]:
+            with self.subTest(code=code):
+                service = Mock()
+                service.create_onboarding_job.return_value = {"status": "queued"}
+                service.count_token_reviews_created_on.return_value = 0
+                service.count_jobs_created_on.return_value = 0
+                service.submit_token_review.side_effect = TokenReviewError(code, "SMTP private@example.test /private/secret")
+                handler = self.handler(PUBLIC_TOKEN_ADD_PATH, {
+                    "chain": "eth", "contract_address": "0x" + "12" * 20,
+                    "expected_token_symbol": "TEST",
+                })
+                with patch.object(server, "PUBLIC_ACTION_POLICY", PublicActionPolicy(add_token_enabled=True)), patch.object(server, "ADMIN_SERVICE", service):
+                    handler.do_POST()
+                response, actual = handler.send_json.call_args.args[:2]
+                self.assertEqual(actual, status)
+                self.assertEqual(response["error_code"], code)
+                self.assertNotIn("private", str(response))
+                self.assertEqual(response["retryable"], status in {429, 503})
+
+    def test_public_malformed_persisted_receipt_is_a_server_failure(self):
+        for corrupted in [{"request_id": "bad"}, {"created_at": "bad"}]:
+            with self.subTest(corrupted=corrupted):
+                service = Mock()
+                service.count_token_reviews_created_on.return_value = 0
+                service.submit_token_review.return_value = {
+                    "request_id": "a" * 32, "revision": 1, "chain": "eth",
+                    "contract_address": "0x" + "12" * 20, "token_symbol": "TEST",
+                    "created_at": "2026-07-30T12:00:00+00:00",
+                    "status": "pending_review", "notification": {"status": "disabled"},
+                    **corrupted,
+                }
+                handler = self.handler(PUBLIC_TOKEN_ADD_PATH, {
+                    "chain": "eth", "contract_address": "0x" + "12" * 20,
+                    "expected_token_symbol": "TEST",
+                })
+                with patch.object(server, "PUBLIC_ACTION_POLICY", PublicActionPolicy(add_token_enabled=True)), patch.object(server, "ADMIN_SERVICE", service):
+                    handler.do_POST()
+                response, status = handler.send_json.call_args.args[:2]
+                self.assertEqual(status, 503)
+                self.assertEqual(response["error_code"], "invalid_review_database")
 
     def test_public_retry_injects_job_type_and_requires_exact_contract(self):
         service = Mock()
