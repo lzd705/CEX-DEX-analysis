@@ -94,6 +94,37 @@ class TokenReviewStoreTest(unittest.TestCase):
 
             self.assertEqual(context.exception.code, "invalid_review_database")
 
+    def test_existing_schema_without_integrity_constraints_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reviews.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TABLE token_review_meta (key TEXT, value TEXT);
+                INSERT INTO token_review_meta VALUES ('schema_version', '1');
+                CREATE TABLE token_reviews (
+                    request_id TEXT, revision INTEGER, chain TEXT,
+                    contract_address TEXT, token_symbol TEXT,
+                    requested_history_days INTEGER, submitter TEXT,
+                    created_at TEXT, status TEXT, candidate_json TEXT,
+                    candidate_sha256 TEXT, notification_status TEXT,
+                    notification_attempts INTEGER, notification_error_code TEXT,
+                    notification_retry_at TEXT, notification_sent_at TEXT,
+                    reviewer TEXT, reviewed_at TEXT, onboarding_job_id TEXT,
+                    onboarding_error_code TEXT
+                );
+                CREATE TABLE token_review_audit (
+                    id INTEGER, request_id TEXT, event TEXT, at TEXT, actor TEXT
+                );
+                """
+            )
+            connection.close()
+
+            with self.assertRaises(TokenReviewError) as context:
+                TokenReviewStore(path)
+
+            self.assertEqual(context.exception.code, "invalid_review_database")
+
     def test_malformed_persisted_row_fails_closed_when_loaded(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "reviews.sqlite3"
@@ -113,6 +144,34 @@ class TokenReviewStoreTest(unittest.TestCase):
                 store.get(review["request_id"])
 
             self.assertEqual(context.exception.code, "invalid_review_database")
+
+    def test_forged_approved_row_cannot_load_or_transition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reviews.sqlite3"
+            store = TokenReviewStore(path)
+            review, _duplicate = store.create_or_get(
+                candidate(), requested_history_days=30, submitter="public:add_token"
+            )
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "UPDATE token_reviews SET status = 'approved' WHERE request_id = ?",
+                (review["request_id"],),
+            )
+            connection.commit()
+            connection.close()
+
+            with self.assertRaises(TokenReviewError) as load_context:
+                store.get(review["request_id"])
+            self.assertEqual(load_context.exception.code, "invalid_review_database")
+
+            with self.assertRaises(TokenReviewError) as transition_context:
+                store.transition(
+                    review["request_id"],
+                    "onboarding_starting",
+                    expected_revision=1,
+                    actor="research-admin",
+                )
+            self.assertEqual(transition_context.exception.code, "invalid_review_database")
 
     def test_stale_revision_cannot_mutate_review(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -282,12 +341,40 @@ class TokenReviewEmailTest(unittest.TestCase):
         self.assertEqual(len(urls), 1)
         self.assertNotIn(review["contract_address"], urls[0])
 
+    def test_base_url_rejects_invalid_parse_port_and_hostname(self):
+        for value in (
+            "https://admin.example:bogus",
+            "https://bad host",
+            "https://[broken",
+        ):
+            with self.subTest(value=value):
+                try:
+                    TokenReviewEmailSettings.from_environment(
+                        self.environment(TOKEN_REVIEW_BASE_URL=value)
+                    )
+                except Exception as error:
+                    self.assertIsInstance(error, TokenReviewError)
+                    self.assertEqual(
+                        error.code, "invalid_token_review_email_config"
+                    )
+                else:
+                    self.fail("invalid base URL was accepted")
+
     def test_mailer_uses_optional_starttls_and_optional_credentials(self):
         class FakeSmtp:
-            def __init__(self, host, port, timeout):
+            def __init__(
+                self,
+                host="",
+                port=0,
+                local_hostname=None,
+                timeout=None,
+                source_address=None,
+            ):
                 self.host = host
                 self.port = port
+                self.local_hostname = local_hostname
                 self.timeout = timeout
+                self.source_address = source_address
                 self.starttls_called = False
                 self.login_values = None
                 self.message = None
@@ -315,8 +402,8 @@ class TokenReviewEmailTest(unittest.TestCase):
         )
         created = []
 
-        def smtp_factory(*args):
-            instance = FakeSmtp(*args)
+        def smtp_factory(*args, **kwargs):
+            instance = FakeSmtp(*args, **kwargs)
             created.append(instance)
             return instance
 
@@ -324,6 +411,8 @@ class TokenReviewEmailTest(unittest.TestCase):
         mailer.send(self.review())
 
         self.assertEqual(len(created), 1)
+        self.assertIsNone(created[0].local_hostname)
+        self.assertEqual(created[0].timeout, 30)
         self.assertTrue(created[0].starttls_called)
         self.assertEqual(created[0].login_values, ("mailer", "secret"))
         self.assertEqual(created[0].message["To"], "reviewer@example.com")

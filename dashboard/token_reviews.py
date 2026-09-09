@@ -288,6 +288,17 @@ class TokenReviewStore:
 
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
+        def invalid() -> None:
+            raise TokenReviewError(
+                "invalid_review_database", "Token review database is invalid"
+            )
+
+        def columns_for(table: str) -> dict[str, sqlite3.Row]:
+            return {
+                str(row["name"]): row
+                for row in connection.execute("PRAGMA table_info(%s)" % table)
+            }
+
         expected = {
             "token_review_meta",
             "token_reviews",
@@ -298,16 +309,12 @@ class TokenReviewStore:
         ).fetchall()
         tables = {str(row["name"]) for row in rows}
         if not expected.issubset(tables):
-            raise TokenReviewError(
-                "invalid_review_database", "Token review database is invalid"
-            )
+            invalid()
         version = connection.execute(
             "SELECT value FROM token_review_meta WHERE key = ?", ("schema_version",)
         ).fetchone()
         if version is None or version["value"] != SCHEMA_VERSION:
-            raise TokenReviewError(
-                "invalid_review_database", "Token review database is invalid"
-            )
+            invalid()
         required_columns = {
             "token_reviews": {
                 "request_id", "revision", "chain", "contract_address", "token_symbol",
@@ -319,15 +326,58 @@ class TokenReviewStore:
             },
             "token_review_audit": {"id", "request_id", "event", "at", "actor"},
         }
+        table_columns: dict[str, dict[str, sqlite3.Row]] = {}
         for table, columns in required_columns.items():
-            present = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(%s)" % table)
-            }
+            present = columns_for(table)
+            table_columns[table] = present
             if not columns.issubset(present):
-                raise TokenReviewError(
-                    "invalid_review_database", "Token review database is invalid"
-                )
+                invalid()
+
+        meta_columns = columns_for("token_review_meta")
+        if (
+            "key" not in meta_columns
+            or "value" not in meta_columns
+            or meta_columns["key"]["pk"] != 1
+            or not meta_columns["value"]["notnull"]
+        ):
+            invalid()
+        if table_columns["token_reviews"]["request_id"]["pk"] != 1:
+            invalid()
+        if table_columns["token_review_audit"]["id"]["pk"] != 1:
+            invalid()
+        for column in {
+            "revision", "chain", "contract_address", "token_symbol",
+            "requested_history_days", "submitter", "created_at", "status",
+            "candidate_json", "candidate_sha256", "notification_status",
+            "notification_attempts",
+        }:
+            if not table_columns["token_reviews"][column]["notnull"]:
+                invalid()
+        for column in {"request_id", "event", "at", "actor"}:
+            if not table_columns["token_review_audit"][column]["notnull"]:
+                invalid()
+        unique_identity = False
+        for index in connection.execute("PRAGMA index_list(token_reviews)"):
+            if not index["unique"]:
+                continue
+            index_name = str(index["name"])
+            index_columns = tuple(
+                str(item["name"])
+                for item in connection.execute("PRAGMA index_info(%s)" % index_name)
+            )
+            if index_columns == ("chain", "contract_address"):
+                unique_identity = True
+                break
+        if not unique_identity:
+            invalid()
+        foreign_keys = connection.execute("PRAGMA foreign_key_list(token_review_audit)").fetchall()
+        if not any(
+            row["table"] == "token_reviews"
+            and row["from"] == "request_id"
+            and row["to"] == "request_id"
+            for row in foreign_keys
+        ):
+            invalid()
 
     @staticmethod
     def _append_audit(
@@ -391,6 +441,44 @@ class TokenReviewStore:
                     _utc_timestamp(audit_row["at"]),
                     _text(audit_row["actor"], field="audit actor", maximum=128),
                 ))
+            reviewer = (
+                _text(row["reviewer"], field="reviewer", maximum=128)
+                if row["reviewer"] is not None else None
+            )
+            reviewed_at = (
+                _utc_timestamp(row["reviewed_at"])
+                if row["reviewed_at"] is not None else None
+            )
+            onboarding_job_id = (
+                _text(row["onboarding_job_id"], field="onboarding job", maximum=128)
+                if row["onboarding_job_id"] is not None else None
+            )
+            audit_events = {event["event"] for event in audit}
+            status = row["status"]
+            if status == "pending_review" and (reviewer is not None or reviewed_at is not None):
+                raise ValueError("pending decision")
+            if status in {"approved", "rejected"} and (
+                reviewer is None
+                or reviewed_at is None
+                or "state_%s" % status not in audit_events
+            ):
+                raise ValueError("decision evidence")
+            if status == "onboarding_starting" and (
+                reviewer is None
+                or reviewed_at is None
+                or "state_approved" not in audit_events
+                or "state_onboarding_starting" not in audit_events
+            ):
+                raise ValueError("onboarding start evidence")
+            if status == "onboarding_queued" and (
+                reviewer is None
+                or reviewed_at is None
+                or onboarding_job_id is None
+                or "state_approved" not in audit_events
+                or "state_onboarding_starting" not in audit_events
+                or "state_onboarding_queued" not in audit_events
+            ):
+                raise ValueError("onboarding queue evidence")
             return {
                 "request_id": request_id,
                 "revision": revision,
@@ -400,7 +488,7 @@ class TokenReviewStore:
                 "requested_history_days": days,
                 "submitter": submitter,
                 "created_at": created_at,
-                "status": row["status"],
+                "status": status,
                 "candidate": snapshot["candidate"],
                 "candidate_sha256": snapshot["candidate_sha256"],
                 "notification": {
@@ -416,18 +504,9 @@ class TokenReviewStore:
                         if row["notification_sent_at"] is not None else None
                     ),
                 },
-                "reviewer": (
-                    _text(row["reviewer"], field="reviewer", maximum=128)
-                    if row["reviewer"] is not None else None
-                ),
-                "reviewed_at": (
-                    _utc_timestamp(row["reviewed_at"])
-                    if row["reviewed_at"] is not None else None
-                ),
-                "onboarding_job_id": (
-                    _text(row["onboarding_job_id"], field="onboarding job", maximum=128)
-                    if row["onboarding_job_id"] is not None else None
-                ),
+                "reviewer": reviewer,
+                "reviewed_at": reviewed_at,
+                "onboarding_job_id": onboarding_job_id,
                 "onboarding_error_code": _safe_code(
                     row["onboarding_error_code"], field="onboarding error"
                 ),
@@ -575,6 +654,7 @@ class TokenReviewStore:
                 ).fetchone()
                 if current is None:
                     raise TokenReviewError("review_not_found", "Review request was not found")
+                self._load(connection, identity)
                 if int(current["revision"]) != revision:
                     raise TokenReviewError("stale_revision", "Review has changed; reload it")
                 if target_status not in TRANSITIONS.get(current["status"], set()):

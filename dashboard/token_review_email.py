@@ -72,10 +72,19 @@ def _enabled_flag(value: Any) -> bool:
 def _base_url(value: Any) -> str:
     text = _plain_setting(value)
     assert text is not None
-    parsed = urlsplit(text)
+    try:
+        parsed = urlsplit(text)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        raise _configuration_error() from error
     if (
         parsed.scheme != "https"
         or not parsed.netloc
+        or not hostname
+        or any(character.isspace() for character in hostname)
+        or "\x00" in hostname
+        or (port is not None and not 1 <= port <= 65535)
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -243,7 +252,7 @@ class SmtpTokenReviewMailer:
         with self.smtp_factory(
             self.settings.smtp_host,
             self.settings.smtp_port,
-            self.timeout,
+            timeout=self.timeout,
         ) as client:
             if self.settings.smtp_starttls:
                 client.starttls()
