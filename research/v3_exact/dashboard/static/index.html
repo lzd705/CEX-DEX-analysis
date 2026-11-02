@@ -1,0 +1,1178 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>CEX / DEX Market Monitor</title>
+    <link rel="stylesheet" href="/styles.css?v=__ASSET_VERSION__">
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark">CD</div>
+        <div>
+          <h1>CEX / DEX Market Monitor</h1>
+          <p>Venue-level facts, aligned on daily UTC observations</p>
+        </div>
+      </div>
+      <nav class="primary-navigation" aria-label="Primary navigation">
+        <a href="/screener" data-app-route="screener">Screener</a>
+        <a href="/opportunities" data-app-route="opportunities">Opportunities</a>
+        <a href="/tokens/AAVE/markets" data-app-route="markets">Markets</a>
+        <a href="/tokens/AAVE/compare" data-app-route="research">Token Research</a>
+        <a href="/actions.html">Data Actions</a>
+      </nav>
+      <div
+        id="freshness-cluster"
+        class="status-cluster"
+        data-status="loading"
+        role="status"
+        aria-live="polite"
+      >
+        <span class="status-dot"></span>
+        <span id="freshness">Loading data</span>
+      </div>
+    </header>
+
+    <main>
+      <div id="route-announcer" class="sr-only" role="status" aria-live="polite"></div>
+
+      <section id="time-toolbar" class="time-toolbar" aria-label="Daily fact time window">
+        <div class="time-toolbar-row">
+          <div class="toolbar-title">
+            <i data-lucide="calendar-range"></i>
+            <div>
+              <div class="toolbar-title-line">
+                <strong>Time window</strong>
+                <details class="context-info">
+                  <summary aria-label="Time-window scope details">
+                    <i data-lucide="info"></i>
+                  </summary>
+                  <div class="context-tooltip" role="tooltip">
+                    <strong>Window scope</strong>
+                    <p>Start and end dates apply only to daily price, volume, return, volatility, comparison, and coverage facts. TVL, depth, and execution remain independently timestamped latest snapshots.</p>
+                  </div>
+                </details>
+              </div>
+              <span id="available-range">Checking available dates</span>
+            </div>
+          </div>
+          <div class="applied-window" aria-live="polite">
+            <span>Applied range</span>
+            <strong id="applied-window-summary">Loading selected dates</strong>
+          </div>
+          <div class="time-window-actions">
+            <div id="time-presets" class="preset-group" role="group" aria-label="Time presets">
+              <button type="button" data-days="7" aria-pressed="false">7D</button>
+              <button type="button" data-days="30" class="active" aria-pressed="true">30D</button>
+              <button type="button" data-days="90" aria-pressed="false">90D</button>
+              <button type="button" data-days="all" aria-pressed="false">All</button>
+            </div>
+            <button
+              id="custom-window-toggle"
+              class="custom-window-toggle"
+              type="button"
+              aria-controls="custom-window-editor"
+              aria-expanded="false"
+              aria-pressed="false"
+            >Custom…</button>
+          </div>
+        </div>
+        <div id="custom-window-editor" hidden>
+        <form id="date-window-form" class="custom-window-editor" novalidate>
+          <div class="date-fields">
+            <label>
+              <span>Start</span>
+              <input
+                id="date-start"
+                type="date"
+                required
+                aria-invalid="false"
+                aria-describedby="date-window-error"
+              >
+            </label>
+            <span class="date-arrow" aria-hidden="true">to</span>
+            <label>
+              <span>End</span>
+              <input
+                id="date-end"
+                type="date"
+                required
+                aria-invalid="false"
+                aria-describedby="date-window-error"
+              >
+            </label>
+          </div>
+          <div class="custom-window-commands">
+            <button id="cancel-window" class="secondary-command" type="button">Cancel</button>
+            <button id="apply-window" class="icon-command" type="submit">
+              <i data-lucide="refresh-cw"></i>
+              <span>Apply custom range</span>
+            </button>
+          </div>
+          <div id="date-window-error" class="date-window-error" role="alert" aria-live="assertive" hidden></div>
+        </form>
+        </div>
+      </section>
+
+      <div id="market-loading" class="status-banner" role="status" aria-live="polite" hidden></div>
+      <div id="global-error" class="error-banner global-error" role="alert" aria-live="assertive" hidden></div>
+      <div
+        id="action-status"
+        class="status-banner global-action-status"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        hidden
+      ></div>
+
+      <section
+        id="facts-workbench"
+        class="facts-workbench app-view"
+        data-app-view="workspace"
+        aria-labelledby="facts-title"
+        aria-busy="false"
+        hidden
+      >
+        <div class="facts-heading">
+          <div>
+            <a id="back-to-screener" class="back-link" href="/screener">
+              <i data-lucide="arrow-left"></i>
+              Back to Screener
+            </a>
+            <span id="workspace-eyebrow" class="eyebrow">Single Token market workspace</span>
+            <h2 id="facts-title">Markets</h2>
+            <p id="workspace-description">Select one Token, then move through its markets, daily comparison, liquidity, verified events, and data quality without losing the selected pair.</p>
+          </div>
+          <div class="workspace-heading-meta">
+            <span id="workspace-market-count" class="contract-badge">Loading markets</span>
+            <span id="workspace-as-of" class="contract-badge">Checking timestamps</span>
+            <span id="workspace-quality-status" class="contract-badge">Checking quality</span>
+          </div>
+        </div>
+
+        <nav class="workspace-tabs" aria-label="Token research pages">
+          <a href="/tokens/AAVE/compare" data-workspace-page="compare">Compare</a>
+          <a href="/tokens/AAVE/liquidity" data-workspace-page="liquidity">Liquidity &amp; Execution</a>
+          <a href="/tokens/AAVE/events" data-workspace-page="events">Events</a>
+          <a href="/tokens/AAVE/quality" data-workspace-page="quality">Data Quality</a>
+        </nav>
+
+        <div class="facts-controls">
+          <div class="facts-control">
+            <label for="facts-token">Token</label>
+            <select id="facts-token" aria-label="Comparison token"></select>
+          </div>
+          <div class="facts-control">
+            <label for="facts-market-a">Market A</label>
+            <div class="market-selector-shell">
+              <select
+                id="facts-market-a"
+                aria-label="Market A"
+                aria-describedby="selector-policy facts-market-a-warning-status"
+              ></select>
+              <div id="facts-market-a-warning" class="market-warning-anchor" hidden>
+                <button
+                  id="facts-market-a-warning-trigger"
+                  class="market-warning-trigger"
+                  type="button"
+                  aria-label="Market A quality alert details"
+                  aria-controls="facts-market-a-warning-tooltip"
+                  aria-haspopup="dialog"
+                  aria-expanded="false"
+                  hidden
+                >
+                  <i data-lucide="info"></i>
+                </button>
+                <div
+                  id="facts-market-a-warning-tooltip"
+                  class="market-warning-tooltip"
+                  role="dialog"
+                  aria-label="Market A quality details"
+                  hidden
+                ></div>
+                <span
+                  id="facts-market-a-warning-status"
+                  class="sr-only"
+                  aria-live="polite"
+                ></span>
+              </div>
+            </div>
+          </div>
+          <div class="facts-control">
+            <label for="facts-market-b">Market B</label>
+            <div class="market-selector-shell">
+              <select
+                id="facts-market-b"
+                aria-label="Market B"
+                aria-describedby="selector-policy facts-market-b-warning-status"
+              ></select>
+              <div id="facts-market-b-warning" class="market-warning-anchor" hidden>
+                <button
+                  id="facts-market-b-warning-trigger"
+                  class="market-warning-trigger"
+                  type="button"
+                  aria-label="Market B quality alert details"
+                  aria-controls="facts-market-b-warning-tooltip"
+                  aria-haspopup="dialog"
+                  aria-expanded="false"
+                  hidden
+                >
+                  <i data-lucide="info"></i>
+                </button>
+                <div
+                  id="facts-market-b-warning-tooltip"
+                  class="market-warning-tooltip"
+                  role="dialog"
+                  aria-label="Market B quality details"
+                  hidden
+                ></div>
+                <span
+                  id="facts-market-b-warning-status"
+                  class="sr-only"
+                  aria-live="polite"
+                ></span>
+              </div>
+            </div>
+          </div>
+          <button id="compare-markets" class="compare-command" type="button">
+            Apply pair
+          </button>
+        </div>
+        <div id="selector-policy" class="module-context selector-policy" aria-label="A and B selection policy">
+          <span class="module-chip">Depth-screened defaults</span>
+          <span class="module-chip">Shared A/B identities</span>
+          <details class="context-info">
+            <summary aria-label="A and B market selection policy details">
+              <i data-lucide="info"></i>
+            </summary>
+            <div class="context-tooltip" role="tooltip">
+              <strong>Pair-selection policy</strong>
+              <p>Initial A/B choices prefer markets with integrity-valid measured depth and no depth-relevant quality flags. The daily comparison uses the same selected market IDs, so its defaults can differ from the quality-weighted primary market.</p>
+            </div>
+          </details>
+        </div>
+        <div id="research-pair-context" class="research-pair-context" hidden>
+          <span><strong>Market A</strong> <span id="research-market-a">Not selected</span></span>
+          <span><strong>Market B</strong> <span id="research-market-b">Not selected</span></span>
+          <a id="change-markets" class="route-action" href="/tokens/AAVE/markets">Change markets</a>
+        </div>
+        <div id="workspace-context-notice" class="status-banner" role="status" aria-live="polite" hidden></div>
+
+        <section id="workspace-page-markets" class="workspace-page" data-workspace-view="markets">
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">Market inventory</span>
+              <h3>Token Market Coverage</h3>
+              <div class="module-context" aria-label="Market coverage module scope">
+                <span class="module-chip">Full catalog</span>
+                <span class="module-chip">CEX + DEX</span>
+                <span class="module-chip">A/B selectable</span>
+                <details class="context-info">
+                  <summary aria-label="Token market coverage details">
+                    <i data-lucide="info"></i>
+                  </summary>
+                  <div class="context-tooltip" role="tooltip">
+                    <strong>Market coverage</strong>
+                    <p>Review every cataloged CEX instrument and DEX pool for the selected Token. Set any two distinct markets as A and B before moving to comparison or execution analysis.</p>
+                  </div>
+                </details>
+              </div>
+            </div>
+            <div class="segmented-control" role="group" aria-label="Market type filter">
+              <button type="button" data-workspace-market-type="all" class="active" aria-pressed="true">All</button>
+              <button type="button" data-workspace-market-type="cex" aria-pressed="false">CEX</button>
+              <button type="button" data-workspace-market-type="dex" aria-pressed="false">DEX</button>
+            </div>
+          </div>
+          <div class="table-scroll" role="region" aria-label="Selected Token market inventory" tabindex="0">
+            <table id="workspace-market-table" class="workspace-market-table">
+              <caption>All cataloged markets for the selected Token with current fact availability.</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Market</th>
+                  <th scope="col">Type</th>
+                  <th scope="col">Latest Price</th>
+                  <th scope="col">Window Volume</th>
+                  <th scope="col">TVL</th>
+                  <th scope="col">±100 bps Depth</th>
+                  <th scope="col">Coverage</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Pair Actions</th>
+                </tr>
+              </thead>
+              <tbody id="workspace-market-body">
+                <tr><td colspan="9" class="missing">Loading Token markets</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <div id="comparison-status" class="status-banner" role="status" aria-live="polite">
+          Loading comparison catalog…
+        </div>
+        <div id="comparison-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
+        <section
+          id="workspace-page-liquidity"
+          class="workspace-page liquidity-panel"
+          data-workspace-view="liquidity"
+          aria-labelledby="liquidity-title"
+          hidden
+        >
+          <div class="liquidity-heading">
+            <div>
+              <span class="eyebrow">P1 · point-in-time source-backed depth</span>
+              <h3 id="liquidity-title">Discrete cumulative depth profile</h3>
+              <div class="module-context" aria-label="Liquidity module scope">
+                <span class="module-chip">Point-in-time</span>
+                <span class="module-chip">10 · 25 · 50 · 100 bps</span>
+                <span class="module-chip">No interpolation</span>
+                <details class="context-info">
+                  <summary aria-label="Liquidity measurement details">
+                    <i data-lucide="info"></i>
+                  </summary>
+                  <div class="context-tooltip" role="tooltip">
+                    <strong>Depth measurement</strong>
+                    <p>Compare four measured cumulative USD depth bands. Latest snapshots are independent of the daily date window and are not guaranteed to be synchronized.</p>
+                    <p>Only markers at ±10, ±25, ±50, and ±100 bps are measured; no values are interpolated between them. A dashed outer ring and ≥ value denote an incomplete lower bound.</p>
+                  </div>
+                </details>
+              </div>
+            </div>
+            <div class="liquidity-toggles">
+              <div class="segmented-control" role="group" aria-label="Liquidity curve series">
+                <button type="button" data-liquidity-view="total" class="active" aria-pressed="true">Total</button>
+                <button type="button" data-liquidity-view="directional" aria-pressed="false">Directional</button>
+              </div>
+              <div class="segmented-control" role="group" aria-label="Liquidity curve vertical scale">
+                <button type="button" data-liquidity-scale="linear" aria-pressed="false">Linear</button>
+                <button type="button" data-liquidity-scale="log" class="active" aria-pressed="true">Log</button>
+              </div>
+            </div>
+          </div>
+
+          <div id="liquidity-status" class="liquidity-status" role="status" aria-live="polite">
+            Loading point-in-time depth snapshots…
+          </div>
+
+          <div class="liquidity-summary" aria-label="Selected liquidity comparison summary">
+            <div>
+              <span id="liquidity-a-label">Market A at ±100 bps</span>
+              <strong id="liquidity-a-100">—</strong>
+            </div>
+            <div>
+              <span id="liquidity-b-label">Market B at ±100 bps</span>
+              <strong id="liquidity-b-100">—</strong>
+            </div>
+            <div>
+              <span>Snapshot skew</span>
+              <strong id="liquidity-skew">—</strong>
+            </div>
+            <div>
+              <span>Complete paired bands</span>
+              <strong id="liquidity-paired-bands">—</strong>
+            </div>
+          </div>
+
+          <figure class="liquidity-figure">
+            <div
+              id="liquidity-plot"
+              class="liquidity-plot"
+              role="region"
+              aria-label="Interactive liquidity depth chart"
+              tabindex="0"
+              aria-labelledby="liquidity-title"
+              aria-describedby="liquidity-chart-description liquidity-method-note"
+            >
+              <svg
+                id="liquidity-chart"
+                viewBox="0 0 760 360"
+                preserveAspectRatio="xMidYMid meet"
+                role="group"
+                aria-label="Discrete cumulative liquidity depth profile"
+                focusable="false"
+              ></svg>
+              <div id="liquidity-empty" class="liquidity-empty" hidden>
+                No source-backed depth bands are available for the selected markets.
+              </div>
+              <div id="liquidity-tooltip" class="liquidity-tooltip" role="tooltip" hidden></div>
+            </div>
+            <div id="liquidity-legend" class="liquidity-legend" aria-label="Liquidity curve legend"></div>
+            <figcaption id="liquidity-method-note" class="module-context compact-context">
+              <span class="module-chip">Measured bands only</span>
+              <span class="module-chip" data-tone="limit">≥ = incomplete lower bound</span>
+            </figcaption>
+          </figure>
+
+          <p id="liquidity-chart-description" class="sr-only"></p>
+
+          <div
+            class="liquidity-table-scroll"
+            role="region"
+            aria-label="Exact liquidity depth values"
+            tabindex="0"
+          >
+            <table class="liquidity-table">
+              <caption>Exact cumulative USD depth for the selected two markets at each observed price-distance band.</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Band</th>
+                  <th scope="col" id="liquidity-a-total-heading">A Total</th>
+                  <th scope="col" id="liquidity-a-sell-heading">A Sell execution</th>
+                  <th scope="col" id="liquidity-a-buy-heading">A Buy execution</th>
+                  <th scope="col">A Completeness</th>
+                  <th scope="col" id="liquidity-b-total-heading">B Total</th>
+                  <th scope="col" id="liquidity-b-sell-heading">B Sell execution</th>
+                  <th scope="col" id="liquidity-b-buy-heading">B Buy execution</th>
+                  <th scope="col">B Completeness</th>
+                </tr>
+              </thead>
+              <tbody id="liquidity-table-body">
+                <tr><td data-label="Status" colspan="9" class="missing">Loading depth snapshots</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div id="liquidity-market-a-meta" class="liquidity-market-meta"></div>
+          <div id="liquidity-market-b-meta" class="liquidity-market-meta"></div>
+
+          <section class="execution-panel" aria-labelledby="execution-title">
+            <div class="page-heading">
+              <div>
+                <span class="eyebrow">Fixed-notional source mechanics</span>
+                <h3 id="execution-title">Execution cost</h3>
+                <div class="module-context" aria-label="Execution-cost module scope">
+                  <span class="module-chip">5 USD notionals</span>
+                  <span class="module-chip">Quoted mechanics</span>
+                  <span class="module-chip" data-tone="limit">Not realized cost</span>
+                  <details class="context-info">
+                    <summary aria-label="Execution-cost method and fee-scope details">
+                      <i data-lucide="info"></i>
+                    </summary>
+                    <div class="context-tooltip" role="tooltip">
+                      <strong>Execution and fee scope</strong>
+                      <p>The calculation walks the same source-backed order book or supported pool state at $1k, $5k, $10k, $50k, and $100k. These are quoted mechanics, not realized all-in trading costs.</p>
+                      <p>CEX values include visible-book spread and impact but exclude account-specific taker fees. Supported DEX V2 values include the pool swap fee; gas, router fees, token taxes, latency, and MEV are excluded.</p>
+                    </div>
+                  </details>
+                </div>
+              </div>
+              <div class="execution-controls">
+                <div class="segmented-control" role="group" aria-label="Execution direction">
+                  <button type="button" data-execution-direction="buy_token" class="active" aria-pressed="true">Buy Token</button>
+                  <button type="button" data-execution-direction="sell_token" aria-pressed="false">Sell Token</button>
+                </div>
+                <label>
+                  <span>Notional</span>
+                  <select id="execution-notional" aria-label="Execution notional in USD">
+                    <option value="1000">$1,000</option>
+                    <option value="5000">$5,000</option>
+                    <option value="10000" selected>$10,000</option>
+                    <option value="50000">$50,000</option>
+                    <option value="100000">$100,000</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div id="execution-status" class="status-banner" role="status" aria-live="polite">
+              Loading execution facts…
+            </div>
+            <div id="execution-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
+            <div class="execution-summary" aria-label="Selected execution scenario">
+              <div>
+                <span id="execution-a-label">Market A cost</span>
+                <strong id="execution-a-cost">—</strong>
+                <small id="execution-a-fill">—</small>
+              </div>
+              <div>
+                <span id="execution-b-label">Market B cost</span>
+                <strong id="execution-b-cost">—</strong>
+                <small id="execution-b-fill">—</small>
+              </div>
+              <div>
+                <span>A/B state-time skew</span>
+                <strong id="execution-skew">—</strong>
+                <small>Difference between the two selected market states</small>
+              </div>
+              <div>
+                <span>Fee scope</span>
+                <strong id="execution-fee-scope">—</strong>
+                <small>CEX account fees may be excluded</small>
+              </div>
+              <div id="execution-a-timing-card">
+                <span>Market A source timing</span>
+                <strong id="execution-a-timing-status">—</strong>
+                <small id="execution-a-state-time">State time —</small>
+                <small id="execution-a-price-time">USD price time —</small>
+                <small id="execution-a-price-skew">Price/state skew —</small>
+              </div>
+              <div id="execution-b-timing-card">
+                <span>Market B source timing</span>
+                <strong id="execution-b-timing-status">—</strong>
+                <small id="execution-b-state-time">State time —</small>
+                <small id="execution-b-price-time">USD price time —</small>
+                <small id="execution-b-price-skew">Price/state skew —</small>
+              </div>
+            </div>
+            <div class="liquidity-table-scroll" role="region" aria-label="Fixed-notional execution cost values" tabindex="0">
+              <table class="liquidity-table execution-table">
+                <caption>Execution cost and fill ratio for each collected notional in the selected direction.</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Requested Notional</th>
+                    <th scope="col" id="execution-a-cost-heading">A Cost</th>
+                    <th scope="col">A Fill</th>
+                    <th scope="col">A Status</th>
+                    <th scope="col" id="execution-b-cost-heading">B Cost</th>
+                    <th scope="col">B Fill</th>
+                    <th scope="col">B Status</th>
+                  </tr>
+                </thead>
+                <tbody id="execution-table-body">
+                  <tr><td data-label="Status" colspan="7" class="missing">Loading execution facts</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div id="execution-method-note" class="module-context compact-context method-note" aria-label="Execution-cost boundaries">
+              <span class="module-chip">Visible source state</span>
+              <span class="module-chip" data-tone="limit">Account fees · gas · latency · MEV excluded</span>
+            </div>
+          </section>
+        </section>
+
+        <section
+          id="workspace-page-compare"
+          class="workspace-page"
+          data-workspace-view="compare"
+          hidden
+        >
+        <div class="daily-comparison-heading">
+          <div>
+            <h3>Daily price and volume comparison</h3>
+            <div class="module-context" aria-label="Daily comparison module scope">
+              <span class="module-chip">Daily UTC</span>
+              <span class="module-chip">Same-date comparison</span>
+              <span class="module-chip">No forward fill</span>
+              <details class="context-info">
+                <summary aria-label="Daily comparison method details">
+                  <i data-lucide="info"></i>
+                </summary>
+                <div class="context-tooltip" role="tooltip">
+                  <strong>Comparison method</strong>
+                  <p>Only source observations inside the selected UTC date window are compared. Prices and volumes are never filled. Daily Price Gap exists only when both markets have valid closing prices on the same UTC date.</p>
+                  <p>Straight segments connect consecutive daily observations. Missing or invalid values and calendar gaps break the line; no interpolation or forward fill is applied. Verified event overlays show timing only and do not claim return impact or causality.</p>
+                </div>
+              </details>
+            </div>
+          </div>
+          <span class="contract-badge">Daily UTC · USD quote</span>
+        </div>
+
+        <div class="comparison-summary">
+          <div>
+            <span>Latest comparable date</span>
+            <strong id="compare-date">—</strong>
+          </div>
+          <div>
+            <span>Absolute Daily Price Gap</span>
+            <strong id="compare-absolute">—</strong>
+          </div>
+          <div>
+            <span>Daily Price Gap (midpoint-relative bps)</span>
+            <strong id="compare-bps">—</strong>
+          </div>
+          <div>
+            <span>Comparable days</span>
+            <strong id="compare-days">—</strong>
+          </div>
+          <div>
+            <span>Market A return</span>
+            <strong id="compare-a-return">—</strong>
+          </div>
+          <div>
+            <span>Market B return</span>
+            <strong id="compare-b-return">—</strong>
+          </div>
+          <div>
+            <span>Market A daily volatility</span>
+            <strong id="compare-a-volatility">—</strong>
+          </div>
+          <div>
+            <span>Market B daily volatility</span>
+            <strong id="compare-b-volatility">—</strong>
+          </div>
+        </div>
+
+        <div class="comparison-chart-toolbar">
+          <div>
+            <h4 id="comparison-chart-title">Daily price observations</h4>
+            <span id="comparison-chart-note" class="chart-context-chip">USD source prices · gaps break the line</span>
+          </div>
+          <div class="segmented-control" role="group" aria-label="Comparison chart metric">
+            <button
+              type="button"
+              data-comparison-metric="price"
+              class="active"
+              aria-pressed="true"
+            >Price</button>
+            <button
+              type="button"
+              data-comparison-metric="spread"
+              aria-pressed="false"
+            >Daily Price Gap</button>
+            <button
+              type="button"
+              data-comparison-metric="volume"
+              aria-pressed="false"
+            >Volume</button>
+          </div>
+        </div>
+
+        <figure class="comparison-figure">
+          <div
+            id="comparison-plot"
+            class="comparison-plot"
+            role="group"
+            tabindex="0"
+            aria-label="Interactive daily market comparison chart"
+            aria-labelledby="comparison-chart-title"
+            aria-describedby="comparison-chart-description comparison-chart-method"
+          >
+            <svg
+              id="comparison-chart"
+              viewBox="0 0 900 360"
+              aria-hidden="true"
+              focusable="false"
+              preserveAspectRatio="xMidYMid meet"
+            ></svg>
+            <div id="comparison-chart-empty" class="comparison-chart-empty">
+              Load two markets to draw their daily observations.
+            </div>
+            <div
+              id="comparison-chart-tooltip"
+              class="comparison-chart-tooltip"
+              role="tooltip"
+              aria-live="polite"
+              hidden
+            ></div>
+          </div>
+          <div
+            id="comparison-chart-legend"
+            class="comparison-chart-legend"
+            aria-label="Selected market legend"
+          ></div>
+          <p id="comparison-event-status" class="comparison-event-status">
+            Event overlay loads independently from the daily market series.
+          </p>
+          <figcaption id="comparison-chart-method" class="module-context compact-context">
+            <span class="module-chip">Consecutive dates connect</span>
+            <span class="module-chip" data-tone="limit">Gaps break the line</span>
+            <span class="module-chip">Events = timing only</span>
+          </figcaption>
+        </figure>
+        <p id="comparison-chart-description" class="sr-only">
+          Daily comparison chart. Choose Price, Daily Price Gap, or Volume. Daily Price Gap uses same UTC date closing prices. Exact source observations remain
+          available in the table below.
+        </p>
+
+        <div
+          class="comparison-table-scroll"
+          role="region"
+          aria-label="Daily two-market comparison observations"
+          tabindex="0"
+        >
+          <table class="comparison-table">
+            <caption>Daily observations for the selected two markets; missing values are never filled.</caption>
+            <thead>
+              <tr>
+                <th scope="col">Date (UTC)</th>
+                <th scope="col" id="market-a-price-heading">A Price (USD)</th>
+                <th scope="col" id="market-a-volume-heading">A Volume (USD)</th>
+                <th scope="col" id="market-b-price-heading">B Price (USD)</th>
+                <th scope="col" id="market-b-volume-heading">B Volume (USD)</th>
+                <th scope="col">Absolute Price Difference (USD)</th>
+                <th scope="col">Daily Price Gap (bps)</th>
+                <th scope="col">Missing-value Rule</th>
+              </tr>
+            </thead>
+            <tbody id="comparison-body">
+              <tr><td colspan="8" class="missing">Loading market catalog</td></tr>
+            </tbody>
+          </table>
+        </div>
+        </section>
+
+        <section
+          id="workspace-page-events"
+          class="workspace-page"
+          data-workspace-view="events"
+          hidden
+        >
+          <div class="page-heading events-heading">
+            <div>
+              <span class="eyebrow">Release-wide source-backed event timeline</span>
+              <h3>Verified Event Facts</h3>
+              <div class="module-context" aria-label="Verified Event Fact scope">
+                <span class="module-chip">Official sources</span>
+                <span class="module-chip">Latest verified revision</span>
+                <span class="module-chip" data-tone="limit">Timing ≠ causality</span>
+                <details class="context-info">
+                  <summary aria-label="Verified Event Fact boundaries and lifecycle details">
+                    <i data-lucide="info"></i>
+                  </summary>
+                  <div class="context-tooltip context-tooltip-wide" role="tooltip">
+                    <strong>Event Fact boundary</strong>
+                    <p>The timeline covers officially sourced unlock, airdrop claim-start, and CEX spot-listing facts with explicit date precision, lifecycle, evidence status, and revision lineage.</p>
+                    <p>An event marker shows temporal overlap only. This page does not estimate return, market impact, sentiment, importance, or causality. The daily market window applies only when events are overlaid on Compare.</p>
+                    <p>The latest verified revision is shown here; full revision history remains in the auditable bundle. <strong>Scheduled</strong> means an official source announced an exact time but occurrence is not separately confirmed. A past timestamp is never promoted to occurred merely because time passed.</p>
+                  </div>
+                </details>
+              </div>
+            </div>
+            <div class="events-filter-stack" aria-label="Event timeline filters">
+              <div class="events-filter-row">
+                <span>Time</span>
+                <div class="segmented-control events-clock-control" role="group" aria-label="Event time filter">
+                  <button type="button" data-event-clock-state="all" class="active" aria-pressed="true">All</button>
+                  <button type="button" data-event-clock-state="future" aria-pressed="false">Future</button>
+                  <button type="button" data-event-clock-state="current_window" aria-pressed="false">Current</button>
+                  <button type="button" data-event-clock-state="past" aria-pressed="false">Past</button>
+                </div>
+              </div>
+              <div class="events-filter-row">
+                <span>Evidence status</span>
+                <div class="segmented-control events-lifecycle-control" role="group" aria-label="Event lifecycle filter">
+                  <button type="button" data-event-lifecycle="all" class="active" aria-pressed="true">All</button>
+                  <button type="button" data-event-lifecycle="occurred" aria-pressed="false">Occurred</button>
+                  <button type="button" data-event-lifecycle="scheduled" aria-pressed="false">Scheduled</button>
+                  <button type="button" data-event-lifecycle="postponed" aria-pressed="false">Postponed</button>
+                  <button type="button" data-event-lifecycle="cancelled" aria-pressed="false">Cancelled</button>
+                  <button type="button" data-event-lifecycle="superseded" aria-pressed="false">Superseded</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div id="events-status" class="status-banner" role="status" aria-live="polite">
+            Loading verified Event Facts…
+          </div>
+          <div id="events-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
+
+          <div class="events-summary" aria-label="Event Fact coverage summary">
+            <div>
+              <span>Verified records</span>
+              <strong id="events-count">—</strong>
+            </div>
+            <div>
+              <span>Occurred</span>
+              <strong id="events-occurred">—</strong>
+            </div>
+            <div>
+              <span>Scheduled</span>
+              <strong id="events-scheduled">—</strong>
+            </div>
+            <div>
+              <span>Official sources</span>
+              <strong id="events-source-count">—</strong>
+            </div>
+            <div>
+              <span>Token coverage</span>
+              <strong id="events-token-coverage">—</strong>
+            </div>
+          </div>
+
+          <div class="table-scroll events-table-scroll" role="region" aria-label="Verified Token Event Facts" tabindex="0">
+            <table class="events-table">
+              <caption>Latest published revision of each verified event; blank values remain unavailable rather than zero.</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Effective time</th>
+                  <th scope="col">Type</th>
+                  <th scope="col">Event Fact</th>
+                  <th scope="col">Lifecycle</th>
+                  <th scope="col">Time state</th>
+                  <th scope="col">Size / Market</th>
+                  <th scope="col">Evidence</th>
+                  <th scope="col">Source &amp; Revision</th>
+                </tr>
+              </thead>
+              <tbody id="events-body">
+                <tr><td colspan="8" class="missing">Loading verified Event Facts</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section
+          id="workspace-page-quality"
+          class="workspace-page"
+          data-workspace-view="quality"
+          hidden
+        >
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">Fact × Market audit</span>
+              <h3>Data Quality</h3>
+              <div class="module-context" aria-label="Data Quality module scope">
+                <span class="module-chip">Window-aware daily</span>
+                <span class="module-chip">Latest snapshots</span>
+                <span class="module-chip" data-tone="limit">Read-only audit</span>
+                <details class="context-info">
+                  <summary aria-label="Data Quality states and recovery details">
+                    <i data-lucide="info"></i>
+                  </summary>
+                  <div class="context-tooltip context-tooltip-wide" role="tooltip">
+                    <strong>Quality interpretation</strong>
+                    <p>Observed values, partial lower bounds, unsupported methods, collection failures, and genuinely missing facts remain distinct. Daily quality and coverage use the selected date window. TVL, depth, and execution use independently timestamped latest snapshots.</p>
+                    <p>Hover or focus a daily status to inspect its cause and affected UTC dates. Retryable gaps are routed to a protected operator queue; confirmed no-candle, listing, and source-history outcomes require review rather than an automatic retry.</p>
+                  </div>
+                </details>
+              </div>
+            </div>
+            <div class="segmented-control" role="group" aria-label="Data quality scope">
+              <button type="button" data-quality-scope="all" class="active" aria-pressed="true">All markets</button>
+              <button type="button" data-quality-scope="selected" aria-pressed="false">Selected A &amp; B</button>
+            </div>
+          </div>
+          <div id="quality-status" class="status-banner" role="status" aria-live="polite">
+            Loading Token quality facts…
+          </div>
+          <div id="quality-filter-summary" class="status-banner quality-filter-summary" role="status" hidden></div>
+          <div id="quality-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
+          <div class="table-scroll" role="region" aria-label="Token fact quality matrix" tabindex="0">
+            <table id="quality-table" class="quality-table">
+              <caption>Quality state for daily facts, TVL, depth, and execution by market.</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Market</th>
+                  <th scope="col">Daily Facts</th>
+                  <th scope="col">TVL</th>
+                  <th scope="col">Depth</th>
+                  <th scope="col">Execution</th>
+                  <th scope="col">Current Reasons</th>
+                </tr>
+              </thead>
+              <tbody id="quality-body">
+                <tr><td colspan="6" class="missing">Loading quality facts</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <details class="facts-contract quality-source-details">
+            <summary>Source, contract, and snapshot details</summary>
+            <div id="facts-contract-copy"></div>
+            <div id="facts-source-copy"></div>
+            <div class="quality-source-list">
+              <div id="source-list"></div>
+              <div id="daily-source-status">Daily source freshness loading</div>
+              <div id="tvl-source-status">TVL snapshot status loading</div>
+              <div id="depth-source-status">CEX depth snapshot status loading</div>
+              <div id="dex-depth-source-status">DEX depth snapshot status loading</div>
+              <div id="execution-source-status">Execution snapshot status loading</div>
+            </div>
+          </details>
+        </section>
+      </section>
+
+      <section
+        id="opportunities-view"
+        class="app-view opportunities-view"
+        data-app-view="opportunities"
+        aria-labelledby="opportunities-title"
+        aria-busy="false"
+        hidden
+      >
+        <div class="view-heading opportunities-heading">
+          <div>
+            <span class="eyebrow">Synchronized route research</span>
+            <h2 id="opportunities-title">Route Opportunities</h2>
+            <p>Rank synchronized routes only after route timing, execution, cost, capacity, and evidence gates are applied.</p>
+            <div class="module-context" aria-label="Opportunity classification legend">
+              <span class="module-chip opportunity-class-chip strict">Strict executable candidate</span>
+              <span class="module-chip opportunity-class-chip estimate">Research estimate</span>
+              <span class="module-chip opportunity-class-chip unavailable">Unavailable route</span>
+              <details class="context-info">
+                <summary aria-label="Opportunity classification details">
+                  <i data-lucide="info"></i>
+                </summary>
+                <div class="context-tooltip context-tooltip-wide" role="tooltip">
+                  <strong>Exact boundary</strong>
+                  <p>Strict candidates pass every published timing, evidence, cost, capacity, and route-mode gate. Research estimates retain explicit assumptions. Unavailable routes publish a reason instead of a numeric opportunity.</p>
+                  <p>Daily Price Gap remains a separate same-UTC-date close comparison; it is not an executable route.</p>
+                </div>
+              </details>
+            </div>
+          </div>
+          <div id="opportunity-cohort-status" class="contract-badge">Cohort not loaded</div>
+        </div>
+
+        <form id="opportunity-filter-form" class="opportunity-filter-toolbar" novalidate>
+          <label>
+            <span>Token</span>
+            <input id="opportunity-token" type="search" inputmode="text" autocomplete="off" placeholder="All Tokens" aria-label="Opportunity Token filter" aria-describedby="opportunity-filter-error" aria-invalid="false">
+          </label>
+          <label>
+            <span>Venue</span>
+            <input id="opportunity-venue" type="search" inputmode="text" autocomplete="off" list="opportunity-venue-options" placeholder="All venues" aria-label="Opportunity venue filter" aria-describedby="opportunity-filter-error" aria-invalid="false">
+            <datalist id="opportunity-venue-options"></datalist>
+          </label>
+          <label>
+            <span>Notional</span>
+            <select id="opportunity-notional" aria-label="Opportunity notional">
+              <option value="">All collected notionals</option>
+              <option value="1000">$1,000</option>
+              <option value="5000">$5,000</option>
+              <option value="10000">$10,000</option>
+              <option value="50000">$50,000</option>
+              <option value="100000">$100,000</option>
+            </select>
+          </label>
+          <label>
+            <span>Class</span>
+            <select id="opportunity-class" aria-label="Opportunity class">
+              <option value="all">All classes</option>
+              <option value="strict">Strict only</option>
+              <option value="estimate">Estimates only</option>
+            </select>
+          </label>
+          <label>
+            <span>Route</span>
+            <select id="opportunity-route-type" aria-label="Opportunity route type">
+              <option value="all">All route types</option>
+              <option value="cex_cex">CEX → CEX</option>
+              <option value="cex_dex">CEX ↔ DEX</option>
+              <option value="dex_dex">DEX → DEX</option>
+            </select>
+          </label>
+          <label>
+            <span>Availability</span>
+            <select id="opportunity-availability" aria-label="Opportunity availability">
+              <option value="all">All states</option>
+              <option value="available">Available</option>
+              <option value="unavailable">Unavailable</option>
+            </select>
+          </label>
+          <label>
+            <span>Rank by</span>
+            <select id="opportunity-sort" aria-label="Opportunity ranking metric">
+              <option value="net_edge_usd">Net edge (USD)</option>
+              <option value="net_edge_bps">Net edge (bps)</option>
+              <option value="capacity_quantity">Proved capacity</option>
+              <option value="skew_seconds">Snapshot skew</option>
+              <option value="route_age_seconds">Route age (seconds)</option>
+              <option value="volume">Route volume (USD)</option>
+              <option value="requested_notional_usd">Notional</option>
+              <option value="token_symbol">Token</option>
+              <option value="route_id">Route ID</option>
+            </select>
+          </label>
+          <label>
+            <span>Direction</span>
+            <select id="opportunity-direction" aria-label="Opportunity ranking direction">
+              <option value="desc">Highest first</option>
+              <option value="asc">Lowest first</option>
+            </select>
+          </label>
+          <button id="apply-opportunity-filters" class="icon-command" type="submit">
+            <i data-lucide="list-filter"></i>
+            <span>Apply filters</span>
+          </button>
+          <div id="opportunity-filter-error" class="opportunity-filter-error error-banner" role="alert" aria-live="assertive" hidden></div>
+        </form>
+
+        <div id="opportunity-loading" class="status-banner" role="status" aria-live="polite" hidden>Loading synchronized route opportunities…</div>
+        <div id="opportunity-status" class="status-banner" role="status" aria-live="polite" hidden></div>
+        <div id="opportunity-error" class="error-banner" role="alert" aria-live="assertive" hidden></div>
+        <div id="opportunity-bundle-unavailable" class="status-banner opportunity-unavailable-state" role="status" aria-live="polite" hidden></div>
+
+        <div class="opportunity-inventories">
+          <section id="strict-opportunities" class="opportunity-inventory" aria-labelledby="strict-opportunities-title">
+            <div class="opportunity-section-heading">
+              <div>
+                <h3 id="strict-opportunities-title">Strict executable candidates</h3>
+                <p>Every published execution, timing, cost, capacity, and evidence gate passed.</p>
+              </div>
+              <span id="strict-opportunity-count" class="contract-badge">0 routes</span>
+            </div>
+            <div id="strict-opportunity-empty" class="status-banner opportunity-empty" hidden>No route currently satisfies every strict gate. This does not mean there is no Daily Price Gap or no market.</div>
+            <div class="opportunity-table-scroll" role="region" aria-label="Strict executable route rankings" tabindex="0">
+              <table class="opportunity-table">
+                <caption>Strict executable candidate routes.</caption>
+                <thead><tr><th scope="col">Token</th><th scope="col">Route</th><th scope="col">Notional</th><th scope="col">Route volume</th><th scope="col">Net edge</th><th scope="col">Net bps</th><th scope="col">Capacity</th><th scope="col">Skew</th><th scope="col">Age</th><th scope="col">Costs &amp; evidence</th></tr></thead>
+                <tbody id="strict-opportunity-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="estimate-opportunities" class="opportunity-inventory" aria-labelledby="estimate-opportunities-title">
+            <div class="opportunity-section-heading">
+              <div>
+                <h3 id="estimate-opportunities-title">Research estimates</h3>
+                <p>At least one route input is bounded, assumed, or not strict-publication eligible. Stale routes remain unavailable.</p>
+              </div>
+              <span id="estimate-opportunity-count" class="contract-badge">0 routes</span>
+            </div>
+            <div id="estimate-opportunity-empty" class="status-banner opportunity-empty" hidden>No research estimates match the current filters.</div>
+            <div class="opportunity-table-scroll" role="region" aria-label="Research-estimate route rankings" tabindex="0">
+              <table class="opportunity-table">
+                <caption>Research-estimate routes.</caption>
+                <thead><tr><th scope="col">Token</th><th scope="col">Route</th><th scope="col">Notional</th><th scope="col">Route volume</th><th scope="col">Net edge</th><th scope="col">Net bps</th><th scope="col">Capacity</th><th scope="col">Skew</th><th scope="col">Age</th><th scope="col">Costs &amp; evidence</th></tr></thead>
+                <tbody id="estimate-opportunity-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="unavailable-opportunities" class="opportunity-inventory" aria-labelledby="unavailable-opportunities-title">
+            <div class="opportunity-section-heading">
+              <div>
+                <h3 id="unavailable-opportunities-title">Unavailable routes</h3>
+                <p>Routes retained for coverage, with exact reason codes and no invented numeric edge.</p>
+              </div>
+              <span id="unavailable-opportunity-count" class="contract-badge">0 routes</span>
+            </div>
+            <div id="unavailable-opportunity-empty" class="status-banner opportunity-empty" hidden>No unavailable routes match the current filters.</div>
+            <div class="opportunity-table-scroll" role="region" aria-label="Unavailable route inventory" tabindex="0">
+              <table class="opportunity-table">
+                <caption>Unavailable routes with explicit reasons.</caption>
+                <thead><tr><th scope="col">Token</th><th scope="col">Route</th><th scope="col">Notional</th><th scope="col">Route volume</th><th scope="col">Net edge</th><th scope="col">Net bps</th><th scope="col">Capacity</th><th scope="col">Skew</th><th scope="col">Age</th><th scope="col">Costs &amp; evidence</th></tr></thead>
+                <tbody id="unavailable-opportunity-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section
+        id="screener-view"
+        class="app-view"
+        data-app-view="screener"
+        aria-labelledby="screener-title"
+      >
+      <div class="view-heading">
+        <div>
+          <span class="eyebrow">Cross-Token discovery</span>
+          <h2 id="screener-title">Market Screener</h2>
+          <div class="module-context" aria-label="Market Screener scope">
+            <span class="module-chip">1 row / Token</span>
+            <span class="module-chip">Configurable rank</span>
+            <span class="module-chip">Open full workspace</span>
+            <details class="context-info">
+              <summary aria-label="Market Screener workflow details">
+                <i data-lucide="info"></i>
+              </summary>
+              <div class="context-tooltip" role="tooltip">
+                <strong>Screener workflow</strong>
+                <p>Rank every covered Token in one row using the selected metric, scope, direction, and daily window. Open a Token workspace to inspect its complete market catalog, A/B comparison, liquidity, events, and evidence.</p>
+              </div>
+            </details>
+          </div>
+        </div>
+        <span class="contract-badge">Fact-only · no forecasts</span>
+      </div>
+      <section class="monitor-toolbar">
+        <div class="screener-scope-control">
+          <span class="toolbar-field-label">Scope</span>
+          <div id="sort-scope-buttons" class="segmented-control" role="group" aria-label="Sort market scope">
+            <button type="button" data-scope="combined" class="active" aria-pressed="true">Aggregate</button>
+            <button type="button" data-scope="cex" aria-pressed="false">CEX</button>
+            <button type="button" data-scope="dex" aria-pressed="false">DEX</button>
+          </div>
+          <span id="sort-scope-fixed" class="fixed-scope-chip" hidden></span>
+        </div>
+        <label class="sort-control">
+          <span>Rank by</span>
+          <select id="sort-field">
+            <option value="volume">USD Volume</option>
+            <option value="spread">Latest Daily Price Gap</option>
+            <option value="spread_max">Maximum Daily Price Gap</option>
+            <option value="spread_mean">Average Daily Price Gap</option>
+            <option value="spread_median">Median Daily Price Gap</option>
+            <option value="return">Window Return</option>
+            <option value="volatility">Daily Volatility</option>
+            <option value="depth_100bps">Primary ±100 bps Depth</option>
+            <option value="dex_tvl">Primary DEX TVL</option>
+          </select>
+        </label>
+        <label class="sort-control">
+          <span>Direction</span>
+          <select id="sort-direction">
+            <option value="desc">Highest first</option>
+            <option value="asc">Lowest first</option>
+          </select>
+        </label>
+        <div class="search-control">
+          <input id="token-search" type="search" placeholder="Search token symbol" aria-label="Search token symbol" autocomplete="off">
+          <button id="search-token" type="button" title="Search token" aria-label="Search token">
+            <i data-lucide="search"></i>
+          </button>
+        </div>
+        <button id="export-csv" class="secondary-command" type="button" title="Export visible facts as CSV" disabled>
+          <i data-lucide="download"></i>
+          <span>Export CSV</span>
+        </button>
+        <div id="row-count" class="row-count" role="status" aria-live="polite" aria-atomic="true"></div>
+      </section>
+
+      <div id="market-status" class="status-banner" role="status" aria-live="polite" hidden></div>
+      <div id="error-banner" class="error-banner" role="alert" aria-live="assertive" hidden></div>
+
+      <section id="market-panel" class="market-panel" aria-busy="true">
+        <div
+          class="table-scroll"
+          role="region"
+          aria-label="Token and selected market facts"
+          tabindex="0"
+        >
+          <table id="market-table">
+            <caption>One-row Token screener for the selected daily fact window.</caption>
+            <thead>
+              <tr>
+                <th scope="col" class="sticky-token">Token</th>
+                <th id="rank-value-heading" scope="col">USD Volume · Aggregate</th>
+                <th scope="col">Covered Markets</th>
+                <th scope="col">
+                  Aggregate USD Volume
+                  <span
+                    class="column-info"
+                    tabindex="0"
+                    aria-label="Focus an aggregate value for its CEX and DEX volume split."
+                    data-tooltip="Hover, focus, or tap a value for its CEX / DEX split."
+                  ><i data-lucide="info"></i></span>
+                </th>
+                <th scope="col">DEX Share</th>
+                <th scope="col">
+                  Primary DEX/CEX Basis
+                  <span
+                    class="column-info"
+                    tabindex="0"
+                    aria-label="Primary directional basis equals primary DEX price divided by primary CEX price, minus one. Screener gap ranking uses a separate symmetric midpoint-relative formula consistent with Compare."
+                    data-tooltip="Directional basis: DEX / CEX − 1. Gap ranks: symmetric midpoint-relative."
+                  ><i data-lucide="info"></i></span>
+                </th>
+                <th scope="col">
+                  Primary ±100 bps Depth
+                  <span
+                    class="column-info"
+                    tabindex="0"
+                    aria-label="Depth values are displayed as primary CEX then primary DEX."
+                    data-tooltip="Primary CEX / DEX."
+                  ><i data-lucide="info"></i></span>
+                </th>
+                <th scope="col">Primary DEX TVL</th>
+                <th scope="col">Quality</th>
+                <th scope="col">Research</th>
+              </tr>
+            </thead>
+            <tbody id="market-body"></tbody>
+          </table>
+        </div>
+      </section>
+      </section>
+
+    </main>
+
+    <script src="/vendor/lucide.js?v=__ASSET_VERSION__"></script>
+    <script src="/navigation.js?v=__ASSET_VERSION__"></script>
+    <script src="/app.js?v=__ASSET_VERSION__"></script>
+  </body>
+</html>

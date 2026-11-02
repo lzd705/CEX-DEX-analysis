@@ -1,0 +1,314 @@
+# CEX-DEX Market Monitor 1.0
+
+## Product boundary
+
+The first product is a fact-only Market Monitor. A user selects a time window
+and a Token, then keeps two exact cataloged markets as Market A and Market B
+while moving through `Markets`, `Compare`, `Liquidity & Execution`, `Events`,
+and `Data Quality`. The A/B markets may be CEX/CEX, CEX/DEX, or DEX/DEX. A
+separate authenticated administrator page can refresh configured Tokens,
+retry audit-approved missing windows, and review a DEX Token submitted from a
+validated smart-contract address. One configured reviewer must approve it and
+then explicitly Start onboarding; submission and approval do not collect data
+or write the runtime registry. The entire administrator
+surface is absent by default.
+This release does not include factors, future-return research, an event study,
+or public data-edit controls.
+
+## Current requirements
+
+1. Show explicit CEX exchange/pair and DEX chain/protocol/pool identities.
+2. Put the global start and end date controls at the top of the page.
+3. Display price, selected-window return, daily realized volatility, USD
+   volume, DEX TVL snapshot, CEX and supported-pool DEX 10/25/50/100 bps depth
+   snapshots, CEX-DEX price spread, and fixed-notional quoted execution-cost
+   facts. Display execution price-source timing and withhold values whose
+   required USD-price observation fails the two-hour temporal gate.
+4. Keep spread at Token comparison level, not duplicated as a CEX or DEX
+   property.
+5. Let users rank Tokens by an explicit Fact, valid scope, and ascending or
+   descending direction. Missing, failed, and unsupported values always sort
+   last; the actual rank value is displayed and exported.
+6. Show data coverage, latest date, source file versions, missing values, and
+   metric limitations.
+7. Preserve missing values as null. Never replace unavailable facts with zero.
+8. Keep administrator authentication and refresh APIs separate from the public
+   Market Monitor.
+9. Publish an auditable market catalog and a two-venue daily comparison that
+   exposes raw closes, daily USD volume, absolute price spread, and
+   midpoint-relative bps.
+10. Plot the A/B daily comparison as selectable Price, Spread, and Volume
+    lines. Missing, invalid, and nonconsecutive UTC dates break a line instead
+    of being interpolated. Market A and B remain distinguishable by marker
+    shape and labels as well as color.
+11. Publish manually reviewed Event Facts from official sources with source,
+    timing precision, lifecycle, and revision lineage. Event markers are a
+    temporal overlay on Compare only; they do not claim return impact or
+    causality.
+12. Separate data-health failures, recoverable gaps, structural unsupported
+    methods, measurement limits, and observed market conditions. Publish a
+    daily quality audit before accepting a new snapshot.
+
+## Local workflow
+
+```bash
+# Run the complete incremental cycle, starting with official CEX lifecycle evidence.
+python3 scripts/run_collection_cycle.py --profile full --publish-local
+
+# Daily schedule: official CEX lifecycle, incremental OHLCV, and point-in-time TVL.
+python3 scripts/run_collection_cycle.py --profile daily --publish-local
+
+# Hourly profile: CEX depth/cost, private DEX price refresh, then DEX depth/cost.
+python3 scripts/run_collection_cycle.py --profile depth --publish-local
+
+# Manual recovery profile: retry only the point-in-time TVL snapshot.
+python3 scripts/run_collection_cycle.py --profile tvl --publish-local
+
+# Manually build and publish the reviewed, append-only Event Fact bundle.
+python3 scripts/event_facts.py --publish-local
+
+# Import a reviewed snapshot and atomically publish the indexed runtime database.
+python3 scripts/import_local_snapshot.py data/processed
+
+# Start the local monitor.
+npm --prefix dashboard install
+./scripts/run_dashboard.sh
+```
+
+### Live read-only Current Opportunity research
+
+From the repository root, collect current public `UNI/USDT` and `CAKE/USDT`
+order books and instrument rules from Binance and Bybit. The fixed inventory is
+four markets and four same-token directions; the five USD notionals therefore
+produce twenty scenarios:
+
+```bash
+python3 scripts/run_live_cex_opportunity.py \
+  --data-dir /absolute/local/path
+```
+
+To publish, cold-reload the result, and then serve the normal read-only Current
+Opportunity page on loopback:
+
+```bash
+python3 scripts/run_live_cex_opportunity.py \
+  --data-dir /absolute/local/path \
+  --serve \
+  --port 8765
+```
+
+The second command prints the exact `127.0.0.1` URL after publication succeeds.
+Each run collects a new source-backed cohort and publishes a new immutable
+complete bundle; it does not reuse the sealed demo fixture. Net edge may be
+negative. Current Opportunity rows age out after 120 seconds, so rerun the
+command to create a fresh cohort rather than treating an old row as current.
+Neither command places orders, signs transactions, transfers assets, or reads
+wallets, balances, or account inventory.
+
+A successful refresh prints a `live_cex_opportunity_refresh/v2` receipt with
+both token pairs, both venues, `market_count=4`, `route_count=4`, and
+`opportunity_count=20`. A failed or deadline-exceeded leg remains in the closed
+cohort. Only its dependent token routes become terminal, null-economics rows;
+independent routes can still publish. Missing or duplicate legs/routes,
+inconsistent route timing, corrupt lineage, a collector-wide exception, or a
+cold-reload failure aborts the refresh and preserves the previous complete
+pointer.
+
+The tracked public fee schedule is a non-strict research scenario, not an
+authenticated account-fee source. It was checked at `2026-09-04T10:00:00Z` and
+expires at `2026-09-11T10:00:00Z`. The
+[Binance public regular-user reference](https://www.binance.com/en-IN/fee/trading)
+is recorded as 10 bps. The
+[Bybit public category table](https://www.bybit.com/en/help-center/article/Trading-Fee-Structure)
+publishes 10 bps for standard crypto-to-crypto and 20 bps for Adventure
+Zone/xStocks; the workflow projects 20 bps as the maximum reviewed public
+reference rate for this scenario. That Bybit source does not establish the
+user's region, account tier, or the category of `UNI/USDT`. Both UNI components
+are therefore `bounded_estimate` with `strict_eligible=false`. The tracked
+schedule has no reviewed exact `CAKE/USDT` rows. Usable CAKE books therefore
+remain visible but their economics are unavailable with
+`cex_fee_public_bound_unavailable`; no UNI rate, wildcard, guessed rate, or zero
+substitutes for the missing CAKE evidence. If any exact current reference is
+absent, the fee is `unavailable` and no numeric fee is inferred.
+Before running after the schedule expires, manually re-review the official
+pages and update or remove the expired rows; the command does not fetch fee
+pages or guess a replacement rate. Custom public schedules also fail closed
+unless each source host is the approved official domain for its venue and each
+row expires no more than 30 days after its check time; the tracked research
+schedule uses the stricter seven-day review window above.
+
+No account inventory is observed. The route model uses an explicitly
+non-strict hypothetical pre-positioned-inventory scenario with zero immediate
+transfer cost; this is an assumption for comparing the two public books, not a
+claim that the assets or balances exist. Consequently this workflow publishes
+only `research_estimate` or `unavailable`, never `executable_candidate`.
+
+### Local Historical Opportunity demo
+
+From the repository root, start the self-contained, loopback-only demo with:
+
+```bash
+python3 scripts/run_historical_opportunity_demo.py --port 0
+```
+
+Open the URL printed by the command, apply an Opportunity notional filter, and
+press `Ctrl-C` when finished. The runner builds ten deterministic synthetic
+scenarios, validates their structure in a fresh local Python process, serves
+only the read-only historical demo API and dashboard assets on `127.0.0.1`,
+then removes its temporary fixture on exit. It does not require Foundry,
+`forge-std`, ignored local toolchains, current market data, or an RPC endpoint.
+The page labels all receipt-record, workflow-trace, gas-assumption, and result
+values as fixture evidence; they are not execution, verification, or profit
+claims.
+
+### Local sealed Current Opportunity demo
+
+From the repository root, start the sealed, loopback-only Current Opportunity
+workflow demo with:
+
+```bash
+python3 scripts/run_current_opportunity_demo.py --port 0
+```
+
+Open the URL printed by the command and press `Ctrl-C` when finished. The
+runner replays a synthetic AAA/WETH known-answer test (KAT) covering two
+synthetic Uniswap V2 pools and five USD notionals (`1000`, `5000`, `10000`,
+`50000`, and `100000`). It applies an explicit 25 bps research MEV assumption
+and uses the fixture's fixed clock so the same research workflow remains
+visible during a presentation.
+
+This demo performs no live RPC collection and no trade or order execution. Its
+rows are synthetic research estimates, not current market observations or
+profit claims. Repository-pinned SHA-256 hashes seal the full checked-in fixture.
+The SSH signature authenticates only the submission-policy snapshot inside the
+fixture; it does not sign every transcript or authenticate the synthetic values
+as real market data. The runner serves the read-only demo on `127.0.0.1`, hides
+links to surfaces that its one-API allowlist does not serve, and removes its
+temporary data on exit.
+
+The application code and SQLite schemas are versioned in GitHub. Reviewed
+market CSV inputs and the generated `market_facts.sqlite3` runtime database
+live in the ignored `data/local/` directory, or an external directory selected
+by `MARKET_DATA_DIR`. The website queries SQLite; it does not rescan all market
+CSV rows on each request. Event Facts use a separate immutable bundle under
+`data/local/events/`, selected by an atomically replaced `latest.json` pointer.
+The committed curated file currently contains 44 reviewed facts with at least
+one official-source fact for each of the 30 configured Tokens. This is
+Token-presence coverage, not complete historical event coverage. The website
+reports the count and covered/uncovered inventory from the latest validated
+bundle. See `data/README.md` for the market-data lifecycle and
+`docs/event-facts-contract.md` for the Event Fact lifecycle.
+The public catalog and comparison contract is documented in
+`docs/market-facts-contract.md`.
+The separate point-in-time TVL lifecycle and missing-value rules are documented
+in `docs/tvl-data-contract.md`.
+The CEX order-book bands, quote conversion, truncation rules, and raw-response
+audit trail are documented in `docs/cex-depth-data-contract.md`.
+The supported DEX invariant/tick models, fixed-block rule, unsupported statuses,
+and execution limitations are documented in `docs/dex-depth-data-contract.md`.
+The fixed-notional definition, quoted-cost formulas, fee scope, long-form
+files, statuses, and hard validation gates are documented in
+`docs/execution-cost-data-contract.md`.
+The Event Fact taxonomy, official-source evidence, append-only revisions,
+bundle publication, and null rules are documented in
+`docs/event-facts-contract.md`.
+Collection profiles, locks, manifests, freshness thresholds, systemd timers,
+and recovery behavior are documented in `docs/collection-operations.md`.
+
+Administrator setup is documented in `docs/admin-operations.md`. The page is
+absent unless `ADMIN_ENABLED=true`. Login mode requires a generated password
+verifier. An unauthenticated mode exists only for explicit loopback development
+and requires both `ADMIN_LOGIN_REQUIRED=false` and
+`ADMIN_ALLOW_OPEN_LOCAL=true`; the server rejects that mode on non-loopback
+binds.
+
+Token review setup, notification retries, and SQLite backup/recovery are covered
+in the same [administrator runbook](docs/admin-operations.md#submit-and-review-a-token-contract).
+Public intake requests a fixed 30-day history and returns a review receipt;
+admin intake selects 1–180 days. Every submission must first successfully
+re-resolve and validate the source; only then do canonical duplicates return
+the original request without another email. Start resolves once and compares
+the complete stable identity (chain, address, symbol, name, decimals,
+`coingecko_id`, source and `source_token_id`) with the approved snapshot.
+Identity changes safely return to `approved` for manual investigation, before
+any job or registry effect. Pool, TVL and volume evidence may change; the same
+verified current candidate creates the job without a second resolution.
+Email is notification-only and disabled in both
+environment examples. Set the sole reviewer's mailbox and SMTP credentials only
+in private operator configuration. The server automatically loads the ignored
+repository `.env` without shell execution, preserving existing environment
+values. Production uses a private mode-0600 systemd EnvironmentFile and sets
+`DASHBOARD_SKIP_LOCAL_ENV=true` to refuse the repository fallback.
+Public and protected reviewer processes must share
+the same durable review database. Open-local mode can view reviews but cannot
+submit, decide, retry notifications, or start onboarding.
+
+Production must keep the Python process on loopback and expose the read-only
+dashboard through the Nginx HTTPS example. The systemd service, Nginx template,
+health check, rollback procedure, cache behavior, and CEX-depth raw retention
+timer are documented in `docs/production-hardening.md`. The deployable files
+are `deploy/systemd/cex-dex-dashboard.service.in`,
+`deploy/nginx/cex-dex-dashboard.conf.in`,
+`scripts/retain_cex_depth_raw.py`, and
+`deploy/systemd/cex-dex-cex-depth-retention.service.in` plus
+`deploy/systemd/cex-dex-cex-depth-retention.timer`.
+
+## Local verification
+
+From the repository root, run the full unit-test suite:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Focused review, deployment, and frontend checks:
+
+```bash
+python3 -m unittest tests.test_token_reviews tests.test_admin tests.test_public_actions tests.test_token_onboarding tests.test_token_registry tests.test_public_actions_frontend tests.test_static_delivery tests.test_framework tests.test_release_smoke tests.test_deploy_templates tests.test_proxy_deployment -v
+node --check dashboard/static/actions.js
+node --check dashboard/static/admin.js
+git diff --check
+```
+
+Unit tests use local fixtures and fake effects; passing them does not demonstrate
+live SMTP delivery, real-source collection, deployment health, or publication.
+
+## Fact semantics
+
+- Token-level volume and DEX share are aggregate facts across all cataloged
+  markets in the selected window. The expanded CEX and DEX rows describe only
+  the selected pair and pool.
+- Window return is first-to-last observed close. Daily realized volatility uses
+  log returns only between adjacent UTC calendar days; intervals crossing a
+  missing day are excluded and reported as gaps.
+- TVL is a source-reported point-in-time pool snapshot. CEX order-book depth
+  and DEX pool-state depth are separately collected point-in-time snapshots.
+  None is historical daily liquidity, and TVL is never converted into depth.
+- The ordinary Liquidity & Execution fixed-notional quote walks the original
+  CEX levels or executes the
+  supported DEX V2 invariant captured by those collectors. DEX V3 execution is
+  explicitly unsupported in this release. Cost is never interpolated from the
+  four depth bands. Every CEX row in that ordinary quote view explicitly marks
+  its numeric trading fee as
+  `excluded_unknown_account_tier`; the value remains null rather than being
+  treated as zero. Supported DEX V2 rows include the pool's swap fee in the
+  invariant calculation. This is a pool swap fee, not a claim about protocol
+  treasury or revenue. DEX gas/router/MEV costs stay explicitly outside the
+  quoted-cost fact.
+- The A/B comparison reports absolute USD price difference and
+  midpoint-relative bps only when both selected markets have prices on the
+  same UTC date. Its Price, Spread, and Volume lines preserve gaps instead of
+  filling them.
+- Event Facts are manually reviewed facts about event timing and status. Their
+  Compare markers show only temporal overlap with the displayed daily series;
+  the monitor does not infer causal effects.
+
+## Future scope
+
+Funding rates, authenticated CEX account-fee integration in the ordinary
+Liquidity & Execution quote view, gas/MEV-aware quotes, DEX V3 fixed-notional
+execution, event-study returns/impact, additional DEX protocol adapters,
+anomaly rules, historical TVL backfills, historical depth reconstruction, and
+automatic CEX mapping for runtime Tokens require separate data contracts and
+acceptance tests. Unsupported facts remain null or explicitly `unsupported`;
+the dashboard does not estimate them from adjacent facts.

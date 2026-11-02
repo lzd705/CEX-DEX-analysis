@@ -1,0 +1,18 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.okx.com/help/okx-to-list-morpho-morpho-for-spot-trading",
+  "checked_at_utc": "2026-07-29T07:33:00Z",
+  "source_title": "OKX to list MORPHO (Morpho) for spot trading",
+  "publisher": "OKX",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "OKX scheduled MORPHO/USDT spot trading to open at 10:05 UTC on 2024-11-21.",
+      "time_precision": "minute",
+      "source_section": "Listing Timeline"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "Deposit, call-auction, and withdrawal times are separate facts and are not represented as the listing event."
+  ]
+}

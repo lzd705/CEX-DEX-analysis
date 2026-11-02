@@ -1,0 +1,15 @@
+[Unit]
+Description=TCP proxy to the loopback-only CEX/DEX Market Monitor
+Requires=cex-dex-dashboard.service
+After=cex-dex-dashboard.service
+
+[Service]
+Type=simple
+ExecStart=/lib/systemd/systemd-socket-proxyd --connections-max=64 127.0.0.1:8766
+NoNewPrivileges=true
+PrivateTmp=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native

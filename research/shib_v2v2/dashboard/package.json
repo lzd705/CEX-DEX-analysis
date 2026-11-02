@@ -1,0 +1,13 @@
+{
+  "name": "cex-dex-market-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fact-only CEX/DEX market monitor",
+  "scripts": {
+    "start": "python3 server.py",
+    "test": "cd .. && python3 -m unittest discover -s tests -p 'test_dashboard.py'"
+  },
+  "dependencies": {
+    "lucide": "0.468.0"
+  }
+}

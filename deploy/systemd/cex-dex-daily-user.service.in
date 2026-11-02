@@ -1,0 +1,22 @@
+[Unit]
+Description=CEX/DEX daily OHLCV and TVL collection (unprivileged)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PROJECT_ROOT@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=MARKET_DATA_DIR=@MARKET_DATA_DIR@
+ExecStart=/usr/bin/python3 scripts/run_collection_cycle.py --profile daily --publish-local --data-dir @MARKET_DATA_DIR@
+TimeoutStartSec=75min
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077

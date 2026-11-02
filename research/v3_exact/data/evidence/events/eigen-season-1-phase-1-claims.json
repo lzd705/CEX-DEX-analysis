@@ -1,0 +1,19 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://blog.eigenfoundation.org/claims-s1-p1/",
+  "checked_at_utc": "2026-07-29T07:33:00Z",
+  "source_title": "EIGEN stakedrop claims are open",
+  "publisher": "Eigen Foundation",
+  "facts": {
+    "claim_start": {
+      "statement": "Season 1 Phase 1 claims opened on 2024-05-10 with 6.05 percent of initial supply ready to claim.",
+      "time_precision": "day",
+      "size_relation": "exact",
+      "source_section": "Season 1 Rewards Are Here"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "The approximately 113 million EIGEN stated for the full season is not assigned to the Phase 1 opening event."
+  ]
+}

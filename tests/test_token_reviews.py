@@ -1,0 +1,571 @@
+import sqlite3
+import ssl
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import Mock
+
+from dashboard.token_reviews import TokenReviewError, TokenReviewStore
+from dashboard.token_review_email import (
+    SmtpTokenReviewMailer,
+    TokenReviewEmailSettings,
+    build_token_review_message,
+)
+
+
+ADDRESS = "0x" + "12" * 20
+
+
+def candidate(*, chain="ETH", address=ADDRESS.upper().replace("0X", "0x"), symbol="test"):
+    return {
+        "identity": {
+            "chain": chain,
+            "contract_address": address,
+            "token_symbol": symbol,
+            "token_name": "Test Token",
+            "decimals": 18,
+            "coingecko_id": None,
+            "source": "geckoterminal",
+            "source_token_id": "eth_%s" % ADDRESS,
+        },
+        "discovery": {"usable_pool_count": 1, "top_pools": []},
+        "capabilities": {"dex_daily": "available"},
+    }
+
+
+class TokenReviewStoreTest(unittest.TestCase):
+    def test_identity_lookup_is_canonical_read_only_and_rejects_invalid_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenReviewStore(Path(directory) / "reviews.sqlite3")
+            review, _ = store.create_or_get(candidate(address="0x" + "ab" * 20), requested_history_days=30, submitter="public")
+            self.assertTrue(store.has_identity(" ETH ", "0x" + "AB" * 20))
+            self.assertFalse(store.has_identity("eth", "0x" + "cd" * 20))
+            self.assertEqual(store.get(review["request_id"]), review)
+            self.assertEqual(len(store.list_reviews()), 1)
+            for chain, address in [("unknown", ADDRESS), ("eth", "bad")]:
+                with self.subTest(chain=chain, address=address), self.assertRaises(TokenReviewError):
+                    store.has_identity(chain, address)
+
+    def test_identity_lookup_rejects_corrupt_persisted_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reviews.sqlite3"
+            store = TokenReviewStore(path)
+            store.create_or_get(candidate(), requested_history_days=30, submitter="public")
+            with sqlite3.connect(path) as connection:
+                connection.execute("UPDATE token_reviews SET candidate_sha256 = 'bad'")
+            with self.assertRaises(TokenReviewError) as caught:
+                store.has_identity("eth", ADDRESS)
+            self.assertEqual(caught.exception.code, "invalid_review_database")
+
+    def test_start_rollback_preserves_original_reviewer_and_decision_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenReviewStore(Path(directory) / "reviews.sqlite3")
+            review, _ = store.create_or_get(candidate(), requested_history_days=30, submitter="public")
+            approved = store.transition(review["request_id"], "approved", expected_revision=review["revision"], actor="reviewer", at="2026-09-09T01:00:00+00:00")
+            starting = store.transition(review["request_id"], "onboarding_starting", expected_revision=approved["revision"], actor="reviewer")
+            restored = store.transition(review["request_id"], "approved", expected_revision=starting["revision"], actor="system", onboarding_error_code="onboarding_start_failed", at="2026-09-09T02:00:00+00:00")
+            self.assertEqual(restored["reviewer"], "reviewer")
+            self.assertEqual(restored["reviewed_at"], "2026-09-09T01:00:00+00:00")
+            self.assertEqual(restored["audit"][-1]["at"], "2026-09-09T02:00:00+00:00")
+
+    def test_unavailable_notification_is_durable_without_consuming_smtp_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenReviewStore(Path(directory) / "reviews.sqlite3")
+            review, _ = store.create_or_get(candidate(), requested_history_days=30, submitter="public")
+            unavailable = store.record_notification(
+                review["request_id"], expected_revision=review["revision"],
+                status="disabled", actor="system", at="2026-09-09T01:00:00+00:00",
+                retry_at="2026-09-09T01:01:00+00:00",
+            )
+            self.assertEqual(unavailable["notification"]["attempts"], 0)
+            self.assertEqual(unavailable["notification"]["retry_at"], "2026-09-09T01:01:00+00:00")
+            with self.assertRaises(TokenReviewError) as caught:
+                store.record_notification(review["request_id"], expected_revision=review["revision"], status="unconfigured", actor="system")
+            self.assertEqual(caught.exception.code, "stale_revision")
+            with self.assertRaises(TokenReviewError) as caught:
+                store.record_notification(review["request_id"], expected_revision=unavailable["revision"], status="sent", actor="system")
+            self.assertEqual(caught.exception.code, "invalid_notification_transition")
+            claimed = store.claim_notification_attempt(review["request_id"], expected_revision=unavailable["revision"], actor="reviewer")
+            self.assertEqual(claimed["notification"]["attempts"], 1)
+
+    def test_create_persists_canonical_identity_digest_notification_and_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenReviewStore(Path(directory) / "reviews.sqlite3")
+
+            review, deduplicated = store.create_or_get(
+                candidate(),
+                requested_history_days=30,
+                submitter="public:add_token",
+                created_at="2026-09-09T01:02:03+00:00",
+            )
+
+            self.assertFalse(deduplicated)
+            self.assertEqual(review["chain"], "eth")
+            self.assertEqual(review["contract_address"], ADDRESS)
+            self.assertEqual(review["token_symbol"], "TEST")
+            self.assertEqual(len(review["candidate_sha256"]), 64)
+            self.assertEqual(review["status"], "pending_review")
+            self.assertEqual(review["notification"]["status"], "pending")
+            self.assertEqual(review["revision"], 1)
+            self.assertEqual(
+                review["audit"],
+                [{
+                    "event": "created",
+                    "at": "2026-09-09T01:02:03+00:00",
+                    "actor": "public:add_token",
+                }],
+            )
+
+    def test_concurrent_identical_creates_return_one_canonical_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenReviewStore(Path(directory) / "reviews.sqlite3")
+
+            def create():
+                return store.create_or_get(
+                    candidate(),
+                    requested_history_days=30,
+                    submitter="public:add_token",
+                )
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(lambda _ignored: create(), range(8)))
+
+            request_ids = {review["request_id"] for review, _duplicate in results}
+            self.assertEqual(len(request_ids), 1)
+            self.assertEqual(sum(duplicate for _review, duplicate in results), 7)
+            self.assertEqual(len(store.list_reviews()), 1)
+
+    def test_malformed_database_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reviews.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute("CREATE TABLE unrelated (value TEXT)")
+            connection.commit()
+            connection.close()
+
+            with self.assertRaises(TokenReviewError) as context:
+                TokenReviewStore(path)
+
+            self.assertEqual(context.exception.code, "invalid_review_database")
+
+    def test_existing_schema_without_integrity_constraints_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reviews.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TABLE token_review_meta (key TEXT, value TEXT);
+                INSERT INTO token_review_meta VALUES ('schema_version', '1');
+                CREATE TABLE token_reviews (
+                    request_id TEXT, revision INTEGER, chain TEXT,
+                    contract_address TEXT, token_symbol TEXT,
+                    requested_history_days INTEGER, submitter TEXT,
+                    created_at TEXT, status TEXT, candidate_json TEXT,
+                    candidate_sha256 TEXT, notification_status TEXT,
+                    notification_attempts INTEGER, notification_error_code TEXT,
+                    notification_retry_at TEXT, notification_sent_at TEXT,
+                    reviewer TEXT, reviewed_at TEXT, onboarding_job_id TEXT,
+                    onboarding_error_code TEXT
+                );
+                CREATE TABLE token_review_audit (
+                    id INTEGER, request_id TEXT, event TEXT, at TEXT, actor TEXT
+                );
+                """
+            )
+            connection.close()
+
+            with self.assertRaises(TokenReviewError) as context:
+                TokenReviewStore(path)
+
+            self.assertEqual(context.exception.code, "invalid_review_database")
+
+    def test_partial_identity_unique_index_is_not_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid_path = root / "valid.sqlite3"
+            TokenReviewStore(valid_path)
+            valid_connection = sqlite3.connect(valid_path)
+            table_sql = valid_connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'token_reviews'"
+            ).fetchone()[0]
+            valid_connection.close()
+            self.assertIn("UNIQUE(chain, contract_address)", table_sql)
+
+            path = root / "partial.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE token_review_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO token_review_meta VALUES ('schema_version', '1')"
+            )
+            partial_table_sql = table_sql.replace(
+                ",\n                UNIQUE(chain, contract_address)", ""
+            )
+            self.assertNotIn("UNIQUE(chain, contract_address)", partial_table_sql)
+            connection.execute(partial_table_sql)
+            connection.execute(
+                """CREATE TABLE token_review_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL REFERENCES token_reviews(request_id),
+                    event TEXT NOT NULL,
+                    at TEXT NOT NULL,
+                    actor TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                """CREATE UNIQUE INDEX pending_identity
+                ON token_reviews(chain, contract_address)
+                WHERE status='pending_review'"""
+            )
+            connection.commit()
+            connection.close()
+
+            with self.assertRaises(TokenReviewError) as context:
+                TokenReviewStore(path)
+
+            self.assertEqual(context.exception.code, "invalid_review_database")
+
+    def test_malformed_persisted_row_fails_closed_when_loaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reviews.sqlite3"
+            store = TokenReviewStore(path)
+            review, _duplicate = store.create_or_get(
+                candidate(), requested_history_days=30, submitter="public:add_token"
+            )
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "UPDATE token_reviews SET notification_error_code = ? WHERE request_id = ?",
+                ("not a safe error", review["request_id"]),
+            )
+            connection.commit()
+            connection.close()
+
+            with self.assertRaises(TokenReviewError) as context:
+                store.get(review["request_id"])
+
+            self.assertEqual(context.exception.code, "invalid_review_database")
+
+    def test_forged_approved_row_cannot_load_or_transition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reviews.sqlite3"
+            store = TokenReviewStore(path)
+            review, _duplicate = store.create_or_get(
+                candidate(), requested_history_days=30, submitter="public:add_token"
+            )
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "UPDATE token_reviews SET status = 'approved' WHERE request_id = ?",
+                (review["request_id"],),
+            )
+            connection.commit()
+            connection.close()
+
+            with self.assertRaises(TokenReviewError) as load_context:
+                store.get(review["request_id"])
+            self.assertEqual(load_context.exception.code, "invalid_review_database")
+
+            with self.assertRaises(TokenReviewError) as transition_context:
+                store.transition(
+                    review["request_id"],
+                    "onboarding_starting",
+                    expected_revision=1,
+                    actor="research-admin",
+                )
+            self.assertEqual(transition_context.exception.code, "invalid_review_database")
+
+    def test_stale_revision_cannot_mutate_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenReviewStore(Path(directory) / "reviews.sqlite3")
+            review, _duplicate = store.create_or_get(
+                candidate(),
+                requested_history_days=30,
+                submitter="public:add_token",
+            )
+
+            updated = store.transition(
+                review["request_id"],
+                "approved",
+                expected_revision=1,
+                actor="research-admin",
+            )
+            self.assertEqual(updated["revision"], 2)
+            with self.assertRaises(TokenReviewError) as context:
+                store.transition(
+                    review["request_id"],
+                    "rejected",
+                    expected_revision=1,
+                    actor="research-admin",
+                )
+
+            self.assertEqual(context.exception.code, "stale_revision")
+            self.assertEqual(store.get(review["request_id"])["status"], "approved")
+
+    def test_daily_count_reads_persisted_requests_in_utc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reviews.sqlite3"
+            store = TokenReviewStore(path)
+            store.create_or_get(
+                candidate(),
+                requested_history_days=30,
+                submitter="public:add_token",
+                created_at="2026-09-09T23:59:59+00:00",
+            )
+            store.create_or_get(
+                candidate(address="0x" + "34" * 20),
+                requested_history_days=30,
+                submitter="public:add_token",
+                created_at="2026-09-10T00:00:00+00:00",
+            )
+
+            self.assertEqual(store.count_created_on(date(2026, 9, 9)), 1)
+            self.assertEqual(store.count_created_on("2026-09-10"), 1)
+
+    def test_notification_attempt_and_completion_are_revision_checked_and_audited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenReviewStore(Path(directory) / "reviews.sqlite3")
+            review, _duplicate = store.create_or_get(
+                candidate(),
+                requested_history_days=30,
+                submitter="public:add_token",
+            )
+
+            sending = store.claim_notification_attempt(
+                review["request_id"], expected_revision=1, actor="system:mailer"
+            )
+            sent = store.record_notification(
+                review["request_id"],
+                expected_revision=sending["revision"],
+                status="sent",
+                actor="system:mailer",
+                at="2026-09-09T01:02:03+00:00",
+            )
+
+            self.assertEqual(sent["notification"], {
+                "status": "sent",
+                "attempts": 1,
+                "error_code": None,
+                "retry_at": None,
+                "sent_at": "2026-09-09T01:02:03+00:00",
+            })
+            self.assertEqual(
+                [event["event"] for event in sent["audit"]],
+                ["created", "notification_claimed", "notification_sent"],
+            )
+            with self.assertRaises(TokenReviewError) as context:
+                store.record_notification(
+                    review["request_id"],
+                    expected_revision=sending["revision"],
+                    status="sent",
+                    actor="system:mailer",
+                )
+            self.assertEqual(context.exception.code, "stale_revision")
+
+
+class TokenReviewEmailTest(unittest.TestCase):
+    @staticmethod
+    def environment(**overrides):
+        values = {
+            "TOKEN_REVIEW_EMAIL_ENABLED": "true",
+            "TOKEN_REVIEWER_EMAIL": "reviewer@example.com",
+            "TOKEN_REVIEW_BASE_URL": "https://admin.example/portal/",
+            "TOKEN_REVIEW_SMTP_HOST": "smtp.example",
+            "TOKEN_REVIEW_SMTP_PORT": "587",
+            "TOKEN_REVIEW_SMTP_STARTTLS": "true",
+            "TOKEN_REVIEW_SMTP_FROM": "notices@example.com",
+        }
+        values.update(overrides)
+        return values
+
+    @staticmethod
+    def review():
+        with tempfile.TemporaryDirectory() as directory:
+            store = TokenReviewStore(Path(directory) / "reviews.sqlite3")
+            value, _duplicate = store.create_or_get(
+                candidate(),
+                requested_history_days=30,
+                submitter="public:add_token",
+                created_at="2026-09-09T01:02:03+00:00",
+            )
+            return value
+
+    def test_enabled_email_requires_complete_strict_server_configuration(self):
+        settings = TokenReviewEmailSettings.from_environment(self.environment())
+        self.assertTrue(settings.enabled)
+        self.assertEqual(settings.reviewer_email, "reviewer@example.com")
+        self.assertEqual(settings.smtp_port, 587)
+
+        for name, value in (
+            ("TOKEN_REVIEWER_EMAIL", ""),
+            ("TOKEN_REVIEW_BASE_URL", "https://admin.example/?private=1"),
+            ("TOKEN_REVIEW_SMTP_PORT", "0"),
+            ("TOKEN_REVIEW_SMTP_USERNAME", "username"),
+        ):
+            with self.subTest(name=name), self.assertRaises(TokenReviewError) as context:
+                TokenReviewEmailSettings.from_environment(self.environment(**{name: value}))
+            self.assertEqual(context.exception.code, "invalid_token_review_email_config")
+
+    def test_message_uses_only_fixed_server_headers_and_plain_text_body(self):
+        settings = TokenReviewEmailSettings.from_environment(self.environment())
+        review = self.review()
+
+        message = build_token_review_message(settings, review)
+
+        self.assertEqual(message["To"], "reviewer@example.com")
+        self.assertEqual(message["From"], "notices@example.com")
+        self.assertEqual(message["Subject"], "Token contract review requested")
+        self.assertEqual(message.get_content_type(), "text/plain")
+        self.assertNotIn("<a ", message.get_content().lower())
+        expected_url = "https://admin.example/portal/admin.html#token-review=%s" % review["request_id"]
+        self.assertIn(expected_url, message.get_content())
+        self.assertIn(ADDRESS, message.get_content())
+        self.assertNotIn(ADDRESS, expected_url)
+
+    def test_message_includes_submission_time_and_explicit_no_collection_boundary(self):
+        settings = TokenReviewEmailSettings.from_environment(self.environment())
+        review = self.review()
+        body = build_token_review_message(settings, review).get_content()
+        self.assertIn("Created at: " + review["created_at"], body)
+        self.assertIn("This email does not approve the request.", body)
+        self.assertIn("Approval and a separate Start are required before any runtime registry entry, collection, or publication.", body)
+
+    def test_configuration_rejects_crlf_and_address_cannot_form_url(self):
+        for name in (
+            "TOKEN_REVIEWER_EMAIL",
+            "TOKEN_REVIEW_BASE_URL",
+            "TOKEN_REVIEW_SMTP_HOST",
+            "TOKEN_REVIEW_SMTP_FROM",
+        ):
+            with self.subTest(name=name), self.assertRaises(TokenReviewError) as context:
+                TokenReviewEmailSettings.from_environment(
+                    self.environment(**{name: "safe\r\nBcc: victim@example.com"})
+                )
+            self.assertEqual(context.exception.code, "invalid_token_review_email_config")
+
+        settings = TokenReviewEmailSettings.from_environment(self.environment())
+        review = self.review()
+        review["contract_address"] = "0x" + "ab" * 20
+        message = build_token_review_message(settings, review)
+        urls = [line for line in message.get_content().splitlines() if line.startswith("Review URL: ")]
+        self.assertEqual(len(urls), 1)
+        self.assertNotIn(review["contract_address"], urls[0])
+
+    def test_base_url_rejects_invalid_parse_port_and_hostname(self):
+        for value in (
+            "https://admin.example:bogus",
+            "https://bad host",
+            "https://[broken",
+        ):
+            with self.subTest(value=value):
+                try:
+                    TokenReviewEmailSettings.from_environment(
+                        self.environment(TOKEN_REVIEW_BASE_URL=value)
+                    )
+                except Exception as error:
+                    self.assertIsInstance(error, TokenReviewError)
+                    self.assertEqual(
+                        error.code, "invalid_token_review_email_config"
+                    )
+                else:
+                    self.fail("invalid base URL was accepted")
+
+    def test_mailer_uses_optional_starttls_and_optional_credentials(self):
+        class FakeSmtp:
+            def __init__(
+                self,
+                host="",
+                port=0,
+                local_hostname=None,
+                timeout=None,
+                source_address=None,
+            ):
+                self.host = host
+                self.port = port
+                self.local_hostname = local_hostname
+                self.timeout = timeout
+                self.source_address = source_address
+                self.starttls_called = False
+                self.tls_context = None
+                self.events = []
+                self.login_values = None
+                self.message = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _type, _value, _traceback):
+                return False
+
+            def starttls(self, *, context=None):
+                self.events.append("starttls")
+                self.starttls_called = True
+                self.tls_context = context
+
+            def login(self, username, password):
+                self.events.append("login")
+                self.login_values = (username, password)
+
+            def send_message(self, message):
+                self.events.append("send")
+                self.message = message
+
+        settings = TokenReviewEmailSettings.from_environment(
+            self.environment(
+                TOKEN_REVIEW_SMTP_USERNAME="mailer",
+                TOKEN_REVIEW_SMTP_PASSWORD="secret",
+            )
+        )
+        created = []
+
+        def smtp_factory(*args, **kwargs):
+            instance = FakeSmtp(*args, **kwargs)
+            created.append(instance)
+            return instance
+
+        mailer = SmtpTokenReviewMailer(settings, smtp_factory=smtp_factory)
+        mailer.send(self.review())
+
+        self.assertEqual(len(created), 1)
+        self.assertIsNone(created[0].local_hostname)
+        self.assertEqual(created[0].timeout, 30)
+        self.assertTrue(created[0].starttls_called)
+        self.assertIsInstance(created[0].tls_context, ssl.SSLContext)
+        self.assertTrue(created[0].tls_context.check_hostname)
+        self.assertEqual(created[0].tls_context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertEqual(created[0].login_values, ("mailer", "secret"))
+        self.assertEqual(created[0].message["To"], "reviewer@example.com")
+        self.assertEqual(created[0].events, ["starttls", "login", "send"])
+
+        relay_settings = TokenReviewEmailSettings.from_environment(
+            self.environment(TOKEN_REVIEW_SMTP_STARTTLS="false")
+        )
+        SmtpTokenReviewMailer(relay_settings, smtp_factory=smtp_factory).send(self.review())
+        self.assertFalse(created[1].starttls_called)
+        self.assertIsNone(created[1].login_values)
+        self.assertIsNotNone(created[1].message)
+        self.assertEqual(created[1].events, ["send"])
+
+    def test_credentials_require_starttls_before_any_transport_is_opened(self):
+        environment = self.environment(
+            TOKEN_REVIEW_SMTP_STARTTLS="false",
+            TOKEN_REVIEW_SMTP_USERNAME="mailer",
+            TOKEN_REVIEW_SMTP_PASSWORD="test-only-password",
+        )
+        with self.assertRaises(TokenReviewError) as caught:
+            TokenReviewEmailSettings.from_environment(environment)
+        self.assertEqual(caught.exception.code, "invalid_token_review_email_config")
+
+        valid = TokenReviewEmailSettings.from_environment({**environment, "TOKEN_REVIEW_SMTP_STARTTLS": "true"})
+        factory = Mock()
+        with self.assertRaises(TokenReviewError) as caught:
+            mailer = SmtpTokenReviewMailer(replace(valid, smtp_starttls=False), smtp_factory=factory)
+            mailer.send(self.review())
+        self.assertEqual(caught.exception.code, "invalid_token_review_email_config")
+        factory.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

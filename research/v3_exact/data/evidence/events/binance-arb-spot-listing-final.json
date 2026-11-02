@@ -1,0 +1,27 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.binance.com/en/support/announcement/detail/87531c3b2e994f27a8640e903cf0443b",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "Arbitrum (ARB) Listing Will Be Advanced",
+  "publisher": "Binance",
+  "supporting_sources": [
+    {
+      "source_url": "https://www.binance.com/en/support/announcement/detail/c9cae13aa4ed405e97af29da3e509b46",
+      "source_title": "Binance Will List Arbitrum (ARB)",
+      "role": "Identifies ARB/USDT as a spot pair and the superseded tentative time."
+    }
+  ],
+  "facts": {
+    "spot_trading_start": {
+      "statement": "Binance's final-time notice scheduled ARB trading to open at the advanced time of 15:00 UTC on 2023-03-23; its linked original listing identifies ARB/USDT as a spot pair.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Final-time notice and linked original listing"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not immutable copies of the third-party webpages.",
+    "The original 17:00 UTC time was explicitly superseded and is not published as the latest fact.",
+    "Both pages are first-party Binance sources; evidence_status therefore remains primary_confirmed rather than cross_checked."
+  ]
+}

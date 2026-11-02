@@ -1,0 +1,4958 @@
+"""Sealed command boundary for historical Foundry replay operations.
+
+The module owns the canonical import/binding boundary, exact CLI grammar,
+live-pointer invariant, and fail-closed scan/publication orchestration.
+Audit-only verification remains a separate command path.
+"""
+
+from __future__ import annotations
+
+import sys as _startup_sys
+
+
+SAFE_HISTORICAL_REPLAY_STARTUP_FLAGS = (
+    "-E",
+    "-s",
+    "-S",
+    "-B",
+    "-X",
+    "pycache_prefix=/dev/null",
+)
+_SAFE_CPYTHON_VERSION = (3, 8, 10)
+_SAFE_RUNTIME_BASENAME = "cpython-3.8.10-runtime"
+_ENTRYPOINT_SUFFIX = "/scripts/run_historical_foundry_replay.py"
+_UNSAFE_STARTUP_MESSAGE = "historical replay startup is unsafe"
+
+
+def _trusted_launch_is_exact() -> bool:
+    flags = _startup_sys.flags
+    version = _startup_sys.version_info
+    source_path = __file__
+    if (
+        not isinstance(source_path, str)
+        or not source_path.startswith("/")
+        or not source_path.endswith(_ENTRYPOINT_SUFFIX)
+    ):
+        return False
+    project_root = source_path[: -len(_ENTRYPOINT_SUFFIX)]
+    prefix = _startup_sys.prefix
+    if (
+        not isinstance(prefix, str)
+        or not prefix.startswith("/")
+        or prefix.endswith("/")
+    ):
+        return False
+    expected_path = [
+        project_root,
+        prefix + "/lib/python38.zip",
+        prefix + "/lib/python3.8",
+        prefix + "/lib/python3.8/lib-dynload",
+    ]
+    expected_prefix = (
+        project_root.rsplit("/", 1)[0] + "/" + _SAFE_RUNTIME_BASENAME
+    )
+    return (
+        _startup_sys.implementation.name == "cpython"
+        and (version.major, version.minor, version.micro)
+        == _SAFE_CPYTHON_VERSION
+        and version.releaselevel == "final"
+        and version.serial == 0
+        and _startup_sys.implementation.cache_tag == "cpython-38"
+        and prefix == expected_prefix
+        and prefix.rsplit("/", 1)[-1] == _SAFE_RUNTIME_BASENAME
+        and _startup_sys.base_prefix == prefix
+        and _startup_sys.exec_prefix == prefix
+        and _startup_sys.base_exec_prefix == prefix
+        and _startup_sys.executable == prefix + "/bin/python3.8"
+        and _startup_sys.path == expected_path
+        and _startup_sys.pycache_prefix == "/dev/null"
+        and _startup_sys._xoptions == {"pycache_prefix": "/dev/null"}
+        and _startup_sys.warnoptions == []
+        and flags.debug == 0
+        and flags.inspect == 0
+        and flags.interactive == 0
+        and flags.optimize == 0
+        and flags.dont_write_bytecode == 1
+        and flags.no_user_site == 1
+        and flags.no_site == 1
+        and flags.ignore_environment == 1
+        and flags.verbose == 0
+        and flags.bytes_warning == 0
+        and flags.quiet == 0
+        and flags.hash_randomization == 1
+        and flags.isolated == 0
+        and flags.dev_mode is False
+    )
+
+
+if __name__ == "__main__":
+    # ``python -m`` executes a transient ``__main__`` module.  Import the
+    # canonical module so the verifier sees its one authentic module-top bind.
+    if not _trusted_launch_is_exact():
+        _startup_sys.stderr.write(_UNSAFE_STARTUP_MESSAGE + "\n")
+        raise SystemExit(1)
+    import importlib as _importlib
+
+    _canonical_entrypoint = _importlib.import_module(
+        "scripts.run_historical_foundry_replay"
+    )
+    raise SystemExit(_canonical_entrypoint.main(_startup_sys.argv[1:]))
+
+import argparse
+import base64
+from dataclasses import dataclass
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from types import MappingProxyType
+from typing import Any, Mapping, Optional, Sequence, Tuple
+import weakref
+
+
+class HistoricalReplayEntrypointError(RuntimeError):
+    """Stable fail-closed command-boundary error."""
+
+
+def _require_safe_historical_startup() -> None:
+    if not _trusted_launch_is_exact():
+        raise HistoricalReplayEntrypointError(_UNSAFE_STARTUP_MESSAGE)
+
+
+def _production_connected_historical_verification_engine(
+    request: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Run the sealed verifier worker under the exact production runtime."""
+    _require_safe_historical_startup()
+    request_bytes = _encode_connected_worker_request(request)
+    runtime = (
+        _PROJECT_ROOT.parent / _SAFE_RUNTIME_BASENAME
+        / "bin" / "python3.8"
+    )
+    response = _run_bounded_connected_worker_process(
+        command=(
+            str(runtime), *SAFE_HISTORICAL_REPLAY_STARTUP_FLAGS,
+            "-c", _CONNECTED_WORKER_BOOTSTRAP,
+        ),
+        cwd=_PROJECT_ROOT,
+        request_bytes=request_bytes,
+    )
+    return _decode_connected_worker_result(response)
+
+
+# This must remain a genuine canonical module-top call edge.  The verifier
+# authenticates the loader/code/global namespace and consumes its binder once.
+import scripts.historical_foundry_verifier as _historical_verifier
+
+_connected_engine_binder = (
+    _historical_verifier._bind_connected_historical_verification_engine
+)
+_connected_engine_binder(
+    _production_connected_historical_verification_engine
+)
+del _connected_engine_binder
+del _historical_verifier
+
+
+_LIVE_POINTER_PATHS = (
+    "routes/core/latest.json",
+    "routes/latest.json",
+)
+_MAX_LIVE_POINTER_BYTES = 1024 * 1024
+_PROJECT_ROOT = Path(__file__).parent.parent
+_FORGE_STD_COMMIT = "620536fa5277db4e3fd46772d5cbc1ea0696fb43"
+_TRACKED_SOURCE_INVENTORY = (
+    ("policy", "config/historical_foundry_replay_policy.json"),
+    ("authority", "config/historical_foundry_replay_authority.json"),
+    ("toolchain_config", "config/historical_foundry_replay_toolchain.json"),
+    ("executor", "foundry/src/TwoVenueV2Executor.sol"),
+    ("unit_test", "foundry/test/TwoVenueV2Unit.t.sol"),
+    ("fork_test", "foundry/test/TwoVenueV2Fork.t.sol"),
+    ("foundry_toml", "foundry.toml"),
+    ("foundry_lock", "foundry.lock"),
+    ("gitmodules", ".gitmodules"),
+)
+_PRODUCTION_PYTHON_SOURCE_INVENTORY = (
+    ("source:scripts_package", "scripts/__init__.py"),
+    ("source:atomic_publication", "scripts/atomic_publication.py"),
+    (
+        "source:bootstrap_historical_foundry_toolchain",
+        "scripts/bootstrap_historical_foundry_toolchain.py",
+    ),
+    ("source:bounded_json", "scripts/bounded_json.py"),
+    ("source:bounded_snapshot_merge", "scripts/bounded_snapshot_merge.py"),
+    ("source:cex_fee_facts", "scripts/cex_fee_facts.py"),
+    (
+        "source:cex_instrument_lifecycle",
+        "scripts/cex_instrument_lifecycle.py",
+    ),
+    ("source:collection_deadline", "scripts/collection_deadline.py"),
+    ("source:execution_cost", "scripts/execution_cost.py"),
+    (
+        "source:execution_cost_components",
+        "scripts/execution_cost_components.py",
+    ),
+    ("source:fact_quality", "scripts/fact_quality.py"),
+    ("source:fetch_cex", "scripts/fetch_cex.py"),
+    ("source:fetch_cex_depth", "scripts/fetch_cex_depth.py"),
+    ("source:fetch_dex_depth", "scripts/fetch_dex_depth.py"),
+    ("source:fetch_tvl", "scripts/fetch_tvl.py"),
+    (
+        "source:historical_foundry_anvil",
+        "scripts/historical_foundry_anvil.py",
+    ),
+    (
+        "source:historical_foundry_contracts",
+        "scripts/historical_foundry_contracts.py",
+    ),
+    (
+        "source:historical_foundry_replay",
+        "scripts/historical_foundry_replay.py",
+    ),
+    (
+        "source:historical_foundry_rpc",
+        "scripts/historical_foundry_rpc.py",
+    ),
+    (
+        "source:historical_foundry_scan",
+        "scripts/historical_foundry_scan.py",
+    ),
+    (
+        "source:historical_foundry_storage",
+        "scripts/historical_foundry_storage.py",
+    ),
+    (
+        "source:historical_foundry_verifier",
+        "scripts/historical_foundry_verifier.py",
+    ),
+    (
+        "source:historical_route_publication",
+        "scripts/historical_route_publication.py",
+    ),
+    (
+        "source:market_lifecycle_reviews",
+        "scripts/market_lifecycle_reviews.py",
+    ),
+    ("source:publication_gate", "scripts/publication_gate.py"),
+    ("source:quality_outcomes", "scripts/quality_outcomes.py"),
+    ("source:route_cohort", "scripts/route_cohort.py"),
+    ("source:route_cost_evidence", "scripts/route_cost_evidence.py"),
+    ("source:route_cost_topology", "scripts/route_cost_topology.py"),
+    ("source:route_inventory", "scripts/route_inventory.py"),
+    ("source:route_opportunity", "scripts/route_opportunity.py"),
+    ("source:route_publication", "scripts/route_publication.py"),
+    ("source:route_quantity", "scripts/route_quantity.py"),
+    ("source:route_shadow_audit", "scripts/route_shadow_audit.py"),
+    ("source:route_shadow_inputs", "scripts/route_shadow_inputs.py"),
+    ("source:route_universe", "scripts/route_universe.py"),
+    (
+        "source:run_historical_foundry_replay",
+        "scripts/run_historical_foundry_replay.py",
+    ),
+    ("source:timestamp_contract", "scripts/timestamp_contract.py"),
+    ("source:token_registry", "scripts/token_registry.py"),
+)
+_PRODUCTION_PYTHON_SOURCE_PATHS = tuple(
+    relative_path
+    for _role, relative_path in _PRODUCTION_PYTHON_SOURCE_INVENTORY
+)
+_TRACKED_SOURCE_INVENTORY += _PRODUCTION_PYTHON_SOURCE_INVENTORY
+_MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024
+_MAX_TRACKED_SOURCE_BYTES = 1024 * 1024
+_GIT_TIMEOUT_SECONDS = 30.0
+_PROCESS_CLEANUP_SECONDS = 1.0
+_CONNECTED_WORKER_REQUEST_SCHEMA = (
+    "historical_foundry_connected_verification_request/v1"
+)
+_CONNECTED_WORKER_RESULT_SCHEMA = "historical_connected_worker_result/v1"
+_MAX_CONNECTED_WORKER_REQUEST_BYTES = 16 * 1024
+_MAX_CONNECTED_WORKER_OUTPUT_BYTES = 1024 * 1024
+_MAX_CONNECTED_WORKER_STDERR_BYTES = 64 * 1024
+_CONNECTED_WORKER_TIMEOUT_SECONDS = 21_600.0
+_CONNECTED_WORKER_BOOTSTRAP = (
+    "import os,sys\n"
+    "sys.path[:]=[os.getcwd(),sys.prefix+'/lib/python38.zip',"
+    "sys.prefix+'/lib/python3.8',sys.prefix+'/lib/python3.8/lib-dynload']\n"
+    "from scripts import run_historical_foundry_replay as worker\n"
+    "raise SystemExit(worker._connected_worker_main())\n"
+)
+
+
+@dataclass(frozen=True)
+class LivePointerSnapshot:
+    relative_path: str
+    present: bool
+    size: Optional[int]
+    sha256: Optional[str]
+    bytes_value: Optional[bytes]
+
+
+def _entrypoint_error(reason: str) -> HistoricalReplayEntrypointError:
+    return HistoricalReplayEntrypointError(reason)
+
+
+def _close_descriptor_inventory(descriptors: Sequence[int]) -> None:
+    first_error = None
+    attempted = set()
+    for descriptor in reversed(tuple(descriptors)):
+        if descriptor in attempted:
+            continue
+        attempted.add(descriptor)
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            if first_error is None or (
+                isinstance(first_error, Exception)
+                and not isinstance(error, Exception)
+            ):
+                first_error = error
+    if first_error is not None:
+        if not isinstance(first_error, Exception):
+            raise first_error
+        raise _entrypoint_error("live pointer snapshot is invalid") from first_error
+
+
+def _raise_after_cleanup(
+    original_error: BaseException,
+    cleanup_error: Optional[BaseException],
+) -> None:
+    if not isinstance(original_error, Exception):
+        raise original_error from cleanup_error
+    if cleanup_error is not None and not isinstance(cleanup_error, Exception):
+        raise cleanup_error from original_error
+    raise original_error
+
+
+def _close_after_error(
+    descriptors: Sequence[int], original_error: BaseException,
+) -> None:
+    cleanup_error = None
+    try:
+        _close_descriptor_inventory(descriptors)
+    except BaseException as error:
+        cleanup_error = error
+    _raise_after_cleanup(original_error, cleanup_error)
+
+
+def _stable_metadata(metadata: os.stat_result) -> Tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        getattr(
+            metadata,
+            "st_mtime_ns",
+            int(metadata.st_mtime * 1000000000),
+        ),
+        getattr(
+            metadata,
+            "st_ctime_ns",
+            int(metadata.st_ctime * 1000000000),
+        ),
+    )
+
+
+def _secure_file_flags() -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    cloexec = getattr(os, "O_CLOEXEC", None)
+    if (
+        type(nofollow) is not int
+        or nofollow == 0
+        or type(cloexec) is not int
+        or cloexec == 0
+    ):
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    return os.O_RDONLY | nofollow | cloexec
+
+
+def _secure_directory_flags() -> int:
+    directory = getattr(os, "O_DIRECTORY", None)
+    if type(directory) is not int or directory == 0:
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    return _secure_file_flags() | directory
+
+
+def _require_descriptor_noninheritable(descriptor: int) -> None:
+    try:
+        inheritable = os.get_inheritable(descriptor)
+    except (AttributeError, OSError) as error:
+        raise _entrypoint_error("live pointer snapshot is invalid") from error
+    if inheritable is not False:
+        raise _entrypoint_error("live pointer snapshot is invalid")
+
+
+def _canonical_connected_worker_bytes(value: Any) -> bytes:
+    try:
+        return json.dumps(
+            value, allow_nan=False, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        ) from error
+
+
+def _connected_worker_pointer_core(value: Any) -> Mapping[str, Any]:
+    if (
+        type(value) is not dict
+        or set(value) != {
+            "schema", "bundle_stage", "replay_id", "route_cohort_id",
+            "manifest_sha256",
+        }
+        or value.get("schema") != "route_historical_replay_pointer/v1"
+        or value.get("bundle_stage")
+        != "route_historical_foundry_replay/v1"
+        or type(value.get("replay_id")) is not str
+        or re.fullmatch(r"replay:[0-9a-f]{64}", value["replay_id"])
+        is None
+        or type(value.get("route_cohort_id")) is not str
+        or re.fullmatch(
+            r"cohort:[0-9a-f]{64}", value["route_cohort_id"]
+        ) is None
+        or type(value.get("manifest_sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", value["manifest_sha256"])
+        is None
+    ):
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    return dict(value)
+
+
+def _connected_worker_paths(request: Mapping[str, Any]) -> Mapping[str, Path]:
+    paths = {}
+    for field in ("data_dir", "raw_root", "bundle_path"):
+        value = request.get(field)
+        if (
+            not isinstance(value, Path)
+            or not value.is_absolute()
+            or Path(os.path.normpath(str(value))) != value
+        ):
+            raise _entrypoint_error(
+                "historical connected verification input is invalid"
+            )
+        paths[field] = value
+    pointer = request["pointer_core"]
+    if paths["raw_root"] != (
+        paths["data_dir"] / "raw" / "historical-foundry-replay"
+    ) or paths["bundle_path"] != (
+        paths["data_dir"] / "routes" / "historical" / "bundles"
+        / pointer["replay_id"]
+    ):
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    return paths
+
+
+def _encode_connected_worker_request(request: Mapping[str, Any]) -> bytes:
+    if (
+        type(request) is not dict
+        or set(request) != {
+            "schema", "data_dir", "raw_root", "bundle_path",
+            "pointer_core",
+        }
+        or request.get("schema") != _CONNECTED_WORKER_REQUEST_SCHEMA
+    ):
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    pointer = _connected_worker_pointer_core(request.get("pointer_core"))
+    normalized = dict(request)
+    normalized["pointer_core"] = pointer
+    paths = _connected_worker_paths(normalized)
+    encoded = _canonical_connected_worker_bytes({
+        "schema": _CONNECTED_WORKER_REQUEST_SCHEMA,
+        "data_dir": str(paths["data_dir"]),
+        "raw_root": str(paths["raw_root"]),
+        "bundle_path": str(paths["bundle_path"]),
+        "pointer_core": pointer,
+    })
+    if not 0 < len(encoded) <= _MAX_CONNECTED_WORKER_REQUEST_BYTES:
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    return encoded
+
+
+def _decode_connected_worker_request(payload: bytes) -> Mapping[str, Any]:
+    if (
+        type(payload) is not bytes
+        or not 0 < len(payload) <= _MAX_CONNECTED_WORKER_REQUEST_BYTES
+    ):
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        ) from error
+    if type(value) is not dict or _canonical_connected_worker_bytes(value) != payload:
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    converted = dict(value)
+    for field in ("data_dir", "raw_root", "bundle_path"):
+        if type(converted.get(field)) is not str:
+            raise _entrypoint_error(
+                "historical connected verification input is invalid"
+            )
+        converted[field] = Path(converted[field])
+    if _encode_connected_worker_request(converted) != payload:
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    return converted
+
+
+def _decode_connected_worker_result(payload: bytes) -> Mapping[str, Any]:
+    failure = "historical connected worker failed"
+    if (
+        type(payload) is not bytes
+        or not 0 < len(payload) <= _MAX_CONNECTED_WORKER_OUTPUT_BYTES
+    ):
+        raise _entrypoint_error(failure)
+    try:
+        value = json.loads(payload)
+        canonical = _canonical_connected_worker_bytes(value)
+    except Exception:
+        raise _entrypoint_error(failure) from None
+    if (
+        canonical != payload
+        or type(value) is not dict
+        or set(value) != {"schema", "status", "observation"}
+        or value.get("schema") != _CONNECTED_WORKER_RESULT_SCHEMA
+        or value.get("status") != "ok"
+        or type(value.get("observation")) is not dict
+    ):
+        raise _entrypoint_error(failure)
+    return value["observation"]
+
+
+def _reap_connected_worker(process: Any) -> None:
+    try:
+        returncode = process.poll()
+    except BaseException:
+        returncode = None
+    if returncode is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        returncode = process.poll()
+    if returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+    if process.poll() is None:
+        raise _entrypoint_error("historical connected worker failed")
+
+
+def _run_bounded_connected_worker_process(
+    *, command: Tuple[str, ...], cwd: Path, request_bytes: bytes,
+) -> bytes:
+    failure = "historical connected worker failed"
+    if (
+        type(command) is not tuple
+        or not command
+        or any(type(value) is not str for value in command)
+        or not isinstance(cwd, Path)
+        or not cwd.is_absolute()
+        or type(request_bytes) is not bytes
+        or not 0 < len(request_bytes) <= _MAX_CONNECTED_WORKER_REQUEST_BYTES
+    ):
+        raise _entrypoint_error(failure)
+    process = None
+    selector = None
+    streams = []
+    result = None
+    original_error = None
+    try:
+        with tempfile.TemporaryFile() as request_file:
+            request_file.write(request_bytes)
+            request_file.seek(0)
+            process = subprocess.Popen(
+                command, cwd=str(cwd), stdin=request_file,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                close_fds=True,
+            )
+            if process.stdout is None or process.stderr is None:
+                raise _entrypoint_error(failure)
+            streams = [process.stdout, process.stderr]
+            for stream in streams:
+                if os.get_inheritable(stream.fileno()) is not False:
+                    raise _entrypoint_error(failure)
+            selector = selectors.DefaultSelector()
+            selector.register(
+                process.stdout, selectors.EVENT_READ,
+                ("stdout", _MAX_CONNECTED_WORKER_OUTPUT_BYTES),
+            )
+            selector.register(
+                process.stderr, selectors.EVENT_READ,
+                ("stderr", _MAX_CONNECTED_WORKER_STDERR_BYTES),
+            )
+            buffers = {"stdout": [], "stderr": []}
+            sizes = {"stdout": 0, "stderr": 0}
+            deadline = time.monotonic() + _CONNECTED_WORKER_TIMEOUT_SECONDS
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _entrypoint_error(failure)
+                events = selector.select(remaining)
+                if not events:
+                    raise _entrypoint_error(failure)
+                for key, _mask in events:
+                    label, maximum = key.data
+                    allowance = maximum - sizes[label] + 1
+                    chunk = os.read(
+                        key.fileobj.fileno(), min(65_536, allowance)
+                    )
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    buffers[label].append(chunk)
+                    sizes[label] += len(chunk)
+                    if sizes[label] > maximum:
+                        raise _entrypoint_error(failure)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _entrypoint_error(failure)
+            returncode = process.wait(timeout=remaining)
+            stdout = b"".join(buffers["stdout"])
+            stderr = b"".join(buffers["stderr"])
+            if returncode != 0 or stderr:
+                raise _entrypoint_error(failure)
+            result = stdout
+    except BaseException as error:
+        original_error = error
+
+    cleanup_error = None
+    if selector is not None:
+        try:
+            selector.close()
+        except BaseException as error:
+            cleanup_error = error
+    for stream in streams:
+        try:
+            stream.close()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+    if process is not None:
+        try:
+            _reap_connected_worker(process)
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+    if original_error is not None:
+        if not isinstance(original_error, Exception):
+            raise original_error from cleanup_error
+        raise _entrypoint_error(failure) from original_error
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        raise _entrypoint_error(failure) from cleanup_error
+    if type(result) is not bytes:
+        raise _entrypoint_error(failure)
+    return result
+
+
+def _connected_worker_main() -> int:
+    if not _trusted_launch_is_exact():
+        return 1
+    try:
+        payload = sys.stdin.buffer.read(
+            _MAX_CONNECTED_WORKER_REQUEST_BYTES + 1
+        )
+        request = _decode_connected_worker_request(payload)
+        observation = _build_production_connected_historical_observation(
+            request
+        )
+        response = {
+            "schema": _CONNECTED_WORKER_RESULT_SCHEMA,
+            "status": "ok",
+            "observation": observation,
+        }
+    except Exception:
+        response = {
+            "schema": _CONNECTED_WORKER_RESULT_SCHEMA,
+            "status": "failed",
+        }
+    try:
+        encoded = _canonical_connected_worker_bytes(response)
+        if not 0 < len(encoded) <= _MAX_CONNECTED_WORKER_OUTPUT_BYTES:
+            encoded = _canonical_connected_worker_bytes({
+                "schema": _CONNECTED_WORKER_RESULT_SCHEMA,
+                "status": "failed",
+            })
+        sys.stdout.buffer.write(encoded)
+        sys.stdout.buffer.flush()
+    except Exception:
+        return 1
+    return 0
+
+
+def _open_descriptor(
+    name: str,
+    flags: int,
+    *,
+    parent_descriptor: Optional[int] = None,
+) -> int:
+    try:
+        if parent_descriptor is None:
+            descriptor = os.open(name, flags)
+        else:
+            descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except OSError as error:
+        raise _entrypoint_error("live pointer snapshot is invalid") from error
+    try:
+        _require_descriptor_noninheritable(descriptor)
+    except BaseException as error:
+        _close_after_error((descriptor,), error)
+        raise AssertionError("unreachable")
+    return descriptor
+
+
+def _read_descriptor_bounded(descriptor: int, maximum: int) -> bytes:
+    chunks = []
+    size = 0
+    while True:
+        chunk = os.read(descriptor, min(65536, maximum - size + 1))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > maximum:
+            raise _entrypoint_error("live pointer snapshot is invalid")
+    return b"".join(chunks)
+
+
+def _reread_descriptor_bounded(descriptor: int, maximum: int) -> bytes:
+    chunks = []
+    size = 0
+    offset = 0
+    while True:
+        try:
+            chunk = os.pread(
+                descriptor,
+                min(65536, maximum - size + 1),
+                offset,
+            )
+        except OSError as error:
+            raise _entrypoint_error("live pointer snapshot is invalid") from error
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+        offset += len(chunk)
+        if size > maximum:
+            raise _entrypoint_error("live pointer snapshot is invalid")
+    return b"".join(chunks)
+
+
+def _directory_identity(metadata: os.stat_result) -> Tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _absolute_path(path: Path) -> Path:
+    if not isinstance(path, Path):
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    try:
+        expanded = os.path.abspath(os.fspath(path))
+    except (TypeError, ValueError, OSError) as error:
+        raise _entrypoint_error("live pointer snapshot is invalid") from error
+    if "\x00" in expanded:
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    if sys.platform == "darwin":
+        if expanded == "/var" or expanded.startswith("/var/"):
+            expanded = "/private" + expanded
+        elif expanded == "/tmp" or expanded.startswith("/tmp/"):
+            expanded = "/private" + expanded
+    return Path(expanded)
+
+
+def _open_absolute_directory_chain(
+    path: Path,
+) -> Tuple[Tuple[int, Optional[int], str, Tuple[int, ...]], ...]:
+    absolute = _absolute_path(path)
+    descriptors = []
+    owned_descriptors = []
+    try:
+        root_descriptor = _open_descriptor(
+            os.sep, _secure_directory_flags()
+        )
+        owned_descriptors.append(root_descriptor)
+        root_metadata = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise _entrypoint_error("live pointer snapshot is invalid")
+        descriptors.append((
+            root_descriptor,
+            None,
+            os.sep,
+            _directory_identity(root_metadata),
+        ))
+        parent_descriptor = root_descriptor
+        for component in absolute.parts[1:]:
+            descriptor = _open_descriptor(
+                component,
+                _secure_directory_flags(),
+                parent_descriptor=parent_descriptor,
+            )
+            owned_descriptors.append(descriptor)
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise _entrypoint_error("live pointer snapshot is invalid")
+            descriptors.append((
+                descriptor,
+                parent_descriptor,
+                component,
+                _directory_identity(metadata),
+            ))
+            parent_descriptor = descriptor
+        return tuple(descriptors)
+    except BaseException as error:
+        _close_after_error(owned_descriptors, error)
+        raise AssertionError("unreachable")
+
+
+def _require_absolute_directory_chain_stable(
+    chain: Sequence[Tuple[int, Optional[int], str, Tuple[int, ...]]],
+) -> None:
+    if not chain:
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    for descriptor, parent_descriptor, name, expected in chain:
+        _require_descriptor_noninheritable(descriptor)
+        try:
+            current = os.fstat(descriptor)
+            if parent_descriptor is None:
+                by_path = os.stat(os.sep, follow_symlinks=False)
+            else:
+                by_path = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+        except OSError as error:
+            raise _entrypoint_error("live pointer snapshot is invalid") from error
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or _directory_identity(current) != expected
+            or _directory_identity(by_path) != expected
+        ):
+            raise _entrypoint_error("live pointer snapshot is invalid")
+
+
+def _require_directory_stable(
+    *,
+    parent_descriptor: Optional[int],
+    name: str,
+    descriptor: int,
+    expected: Tuple[int, ...],
+) -> None:
+    if parent_descriptor is None:
+        by_path = os.stat(name, follow_symlinks=False)
+    else:
+        by_path = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    current = os.fstat(descriptor)
+    _require_descriptor_noninheritable(descriptor)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or _stable_metadata(current) != expected
+        or _stable_metadata(by_path) != expected
+    ):
+        raise _entrypoint_error("live pointer snapshot is invalid")
+
+
+def _open_child_directory(
+    *, parent_descriptor: int, name: str,
+) -> Optional[Tuple[int, Tuple[int, ...]]]:
+    try:
+        by_path = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise _entrypoint_error("live pointer snapshot is invalid") from error
+    if not stat.S_ISDIR(by_path.st_mode):
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    descriptor = _open_descriptor(
+        name,
+        _secure_directory_flags(),
+        parent_descriptor=parent_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        expected = _stable_metadata(opened)
+        if (
+            not stat.S_ISDIR(by_path.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or _stable_metadata(by_path) != expected
+        ):
+            raise _entrypoint_error("live pointer snapshot is invalid")
+        return descriptor, expected
+    except BaseException as error:
+        _close_after_error((descriptor,), error)
+        raise AssertionError("unreachable")
+
+
+def _absent_snapshot(relative_path: str) -> LivePointerSnapshot:
+    return LivePointerSnapshot(relative_path, False, None, None, None)
+
+
+def _open_held_pointer(
+    *,
+    relative_path: str,
+    parent_descriptor: int,
+    leaf_name: str,
+) -> Mapping[str, Any]:
+    try:
+        by_path = os.stat(
+            leaf_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return {
+            "relative_path": relative_path,
+            "present": False,
+            "parent_descriptor": parent_descriptor,
+            "leaf_name": leaf_name,
+            "descriptor": None,
+            "metadata": None,
+            "payload": None,
+        }
+    except OSError as error:
+        raise _entrypoint_error("live pointer snapshot is invalid") from error
+    if (
+        not stat.S_ISREG(by_path.st_mode)
+        or by_path.st_nlink != 1
+        or by_path.st_size > _MAX_LIVE_POINTER_BYTES
+    ):
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    descriptor = _open_descriptor(
+        leaf_name,
+        _secure_file_flags(),
+        parent_descriptor=parent_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        expected = _stable_metadata(opened)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size > _MAX_LIVE_POINTER_BYTES
+            or _stable_metadata(by_path) != expected
+        ):
+            raise _entrypoint_error("live pointer snapshot is invalid")
+        payload = _read_descriptor_bounded(
+            descriptor, _MAX_LIVE_POINTER_BYTES
+        )
+    except BaseException as error:
+        _close_after_error((descriptor,), error)
+        raise AssertionError("unreachable")
+    return {
+        "relative_path": relative_path,
+        "present": True,
+        "parent_descriptor": parent_descriptor,
+        "leaf_name": leaf_name,
+        "descriptor": descriptor,
+        "metadata": expected,
+        "payload": payload,
+    }
+
+
+def _require_held_pointer_stable(pointer: Mapping[str, Any]) -> None:
+    parent_descriptor = pointer["parent_descriptor"]
+    leaf_name = pointer["leaf_name"]
+    if not pointer["present"]:
+        try:
+            os.stat(
+                leaf_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise _entrypoint_error("live pointer snapshot is invalid") from error
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    descriptor = pointer["descriptor"]
+    expected = pointer["metadata"]
+    payload = pointer["payload"]
+    _require_descriptor_noninheritable(descriptor)
+    try:
+        current = os.fstat(descriptor)
+        by_path = os.stat(
+            leaf_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise _entrypoint_error("live pointer snapshot is invalid") from error
+    reread = _reread_descriptor_bounded(
+        descriptor, _MAX_LIVE_POINTER_BYTES
+    )
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_nlink != 1
+        or _stable_metadata(current) != expected
+        or _stable_metadata(by_path) != expected
+        or reread != payload
+        or len(reread) != current.st_size
+    ):
+        raise _entrypoint_error("live pointer snapshot is invalid")
+
+
+def _snapshot_from_held_pointer(
+    pointer: Mapping[str, Any],
+) -> LivePointerSnapshot:
+    if not pointer["present"]:
+        return _absent_snapshot(pointer["relative_path"])
+    payload = pointer["payload"]
+    return LivePointerSnapshot(
+        relative_path=pointer["relative_path"],
+        present=True,
+        size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        bytes_value=payload,
+    )
+
+
+def capture_live_pointer_snapshots(
+    *, data_dir: Path,
+) -> Tuple[LivePointerSnapshot, LivePointerSnapshot]:
+    chain = ()
+    internal_directories = []
+    held_pointers = []
+    result = None
+    original_error = None
+    try:
+        chain = _open_absolute_directory_chain(data_dir)
+        data_descriptor = chain[-1][0]
+        data_metadata = _stable_metadata(os.fstat(data_descriptor))
+        routes = _open_child_directory(
+            parent_descriptor=data_descriptor, name="routes"
+        )
+        if routes is None:
+            held_pointers = [
+                {
+                    "relative_path": relative_path,
+                    "present": False,
+                    "parent_descriptor": data_descriptor,
+                    "leaf_name": "routes",
+                    "descriptor": None,
+                    "metadata": None,
+                    "payload": None,
+                }
+                for relative_path in _LIVE_POINTER_PATHS
+            ]
+        else:
+            routes_descriptor, routes_metadata = routes
+            internal_directories.append((
+                data_descriptor,
+                "routes",
+                routes_descriptor,
+                routes_metadata,
+            ))
+            core = _open_child_directory(
+                parent_descriptor=routes_descriptor, name="core"
+            )
+            if core is None:
+                held_pointers.append({
+                    "relative_path": _LIVE_POINTER_PATHS[0],
+                    "present": False,
+                    "parent_descriptor": routes_descriptor,
+                    "leaf_name": "core",
+                    "descriptor": None,
+                    "metadata": None,
+                    "payload": None,
+                })
+            else:
+                core_descriptor, core_metadata = core
+                internal_directories.append((
+                    routes_descriptor,
+                    "core",
+                    core_descriptor,
+                    core_metadata,
+                ))
+                held_pointers.append(_open_held_pointer(
+                    relative_path=_LIVE_POINTER_PATHS[0],
+                    parent_descriptor=core_descriptor,
+                    leaf_name="latest.json",
+                ))
+            held_pointers.append(_open_held_pointer(
+                relative_path=_LIVE_POINTER_PATHS[1],
+                parent_descriptor=routes_descriptor,
+                leaf_name="latest.json",
+            ))
+
+        for pointer in held_pointers:
+            _require_held_pointer_stable(pointer)
+        for parent, name, descriptor, expected in reversed(
+            internal_directories
+        ):
+            _require_directory_stable(
+                parent_descriptor=parent,
+                name=name,
+                descriptor=descriptor,
+                expected=expected,
+            )
+        if _stable_metadata(os.fstat(data_descriptor)) != data_metadata:
+            raise _entrypoint_error("live pointer snapshot is invalid")
+        _require_absolute_directory_chain_stable(chain)
+        result = tuple(
+            _snapshot_from_held_pointer(pointer)
+            for pointer in held_pointers
+        )
+    except BaseException as error:
+        original_error = error
+
+    cleanup_error = None
+    try:
+        _close_descriptor_inventory(
+            tuple(
+                pointer["descriptor"]
+                for pointer in held_pointers
+                if pointer.get("descriptor") is not None
+            )
+            + tuple(row[2] for row in internal_directories)
+            + tuple(row[0] for row in chain)
+        )
+    except BaseException as error:
+        cleanup_error = error
+    if original_error is not None:
+        if not isinstance(original_error, Exception):
+            raise original_error from cleanup_error
+        if cleanup_error is not None and not isinstance(cleanup_error, Exception):
+            raise cleanup_error from original_error
+        raise original_error
+    if cleanup_error is not None:
+        raise cleanup_error
+    if type(result) is not tuple or len(result) != 2:
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    return result  # type: ignore[return-value]
+
+
+def _require_snapshot_valid(snapshot: LivePointerSnapshot) -> None:
+    if (
+        type(snapshot) is not LivePointerSnapshot
+        or type(snapshot.relative_path) is not str
+        or type(snapshot.present) is not bool
+    ):
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    if snapshot.relative_path not in _LIVE_POINTER_PATHS:
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    if snapshot.present is False:
+        if any(
+            value is not None
+            for value in (
+                snapshot.size,
+                snapshot.sha256,
+                snapshot.bytes_value,
+            )
+        ):
+            raise _entrypoint_error("live pointer snapshot is invalid")
+        return
+    if (
+        snapshot.present is not True
+        or type(snapshot.size) is not int
+        or snapshot.size < 0
+        or type(snapshot.bytes_value) is not bytes
+        or snapshot.size != len(snapshot.bytes_value)
+        or type(snapshot.sha256) is not str
+        or snapshot.sha256 != hashlib.sha256(snapshot.bytes_value).hexdigest()
+    ):
+        raise _entrypoint_error("live pointer snapshot is invalid")
+
+
+def _require_snapshot_sequence(
+    snapshots: Sequence[LivePointerSnapshot],
+) -> Tuple[LivePointerSnapshot, LivePointerSnapshot]:
+    try:
+        value = tuple(snapshots)
+    except TypeError as error:
+        raise _entrypoint_error("live pointer snapshot is invalid") from error
+    if len(value) != len(_LIVE_POINTER_PATHS):
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    for snapshot in value:
+        _require_snapshot_valid(snapshot)
+    if tuple(row.relative_path for row in value) != _LIVE_POINTER_PATHS:
+        raise _entrypoint_error("live pointer snapshot is invalid")
+    return value  # type: ignore[return-value]
+
+
+def require_live_pointer_snapshots_unchanged(
+    before: Sequence[LivePointerSnapshot],
+    after: Sequence[LivePointerSnapshot],
+) -> None:
+    held_before = _require_snapshot_sequence(before)
+    held_after = _require_snapshot_sequence(after)
+    if held_before != held_after:
+        raise _entrypoint_error("live pointer changed")
+
+
+def project_live_pointer_snapshots(
+    snapshots: Sequence[LivePointerSnapshot],
+) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+    held = _require_snapshot_sequence(snapshots)
+    return tuple(
+        {
+            "relative_path": snapshot.relative_path,
+            "present": snapshot.present,
+            "size": snapshot.size,
+            "sha256": snapshot.sha256,
+            "bytes_base64": (
+                base64.b64encode(snapshot.bytes_value).decode("ascii")
+                if snapshot.present
+                else None
+            ),
+        }
+        for snapshot in held
+    )  # type: ignore[return-value]
+
+
+class _LivePointerGuard:
+    __slots__ = ("_data_dir", "_entered", "before", "after")
+
+    def __init__(self, *, data_dir: Path) -> None:
+        self._data_dir = data_dir
+        self._entered = False
+        self.before = None
+        self.after = None
+
+    def __enter__(self) -> "_LivePointerGuard":
+        if self._entered:
+            raise _entrypoint_error("live pointer guard is invalid")
+        self._entered = True
+        self.before = capture_live_pointer_snapshots(data_dir=self._data_dir)
+        return self
+
+    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> bool:
+        guard_error = None
+        try:
+            self.after = capture_live_pointer_snapshots(
+                data_dir=self._data_dir
+            )
+            require_live_pointer_snapshots_unchanged(
+                self.before, self.after
+            )
+        except BaseException as error:
+            guard_error = error
+        if (
+            _type is not None
+            and not issubclass(_type, Exception)
+            and isinstance(_value, BaseException)
+        ):
+            raise _value.with_traceback(_traceback) from guard_error
+        if guard_error is not None:
+            raise guard_error
+        return False
+
+
+def _absolute_bundle_path(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError(
+            "bundle must be an absolute immutable bundle path"
+        )
+    return path
+
+
+def _parse_arguments(arguments: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m scripts.run_historical_foundry_replay",
+        allow_abbrev=False,
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    scan = commands.add_parser("scan", allow_abbrev=False)
+    scan.add_argument("--data-dir", type=Path, required=True)
+    mode = scan.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--publish", action="store_true")
+    mode.add_argument("--dry-run", action="store_true")
+    verify = commands.add_parser("verify", allow_abbrev=False)
+    verify.add_argument("--data-dir", type=Path, required=True)
+    verify.add_argument(
+        "--bundle", type=_absolute_bundle_path, required=True
+    )
+    try:
+        supplied = tuple(arguments)
+    except TypeError:
+        parser.error("invalid arguments")
+    if (
+        any(type(token) is not str for token in supplied)
+        or any(token.startswith("--") and "=" in token for token in supplied)
+    ):
+        parser.error("invalid arguments")
+    if supplied[:1] == ("scan",):
+        exact_shape = (
+            len(supplied) == 4
+            and supplied.count("--data-dir") == 1
+            and supplied.count("--publish")
+            + supplied.count("--dry-run") == 1
+            and supplied.count("--publish") <= 1
+            and supplied.count("--dry-run") <= 1
+        )
+    elif supplied[:1] == ("verify",):
+        exact_shape = (
+            len(supplied) == 5
+            and supplied.count("--data-dir") == 1
+            and supplied.count("--bundle") == 1
+        )
+    else:
+        exact_shape = False
+    if not exact_shape:
+        parser.error("invalid arguments")
+    return parser.parse_args(supplied)
+
+
+def _open_reviewed_historical_toolchain():
+    # Kept lazy so canonical import and invalid CLI parsing remain zero-I/O.
+    from scripts.bootstrap_historical_foundry_toolchain import (
+        open_reviewed_historical_toolchain,
+    )
+
+    return open_reviewed_historical_toolchain()
+
+
+def _initialize_clean_source_verifier():
+    hash_pattern = re.compile(r"[0-9a-f]{64}")
+    commit_pattern = re.compile(r"[0-9a-f]{40}")
+    token = object()
+    retired = object()
+    authority_registry = {}
+    git_environment = {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
+
+    def fail(error: Optional[BaseException] = None) -> None:
+        value = _entrypoint_error("historical source preflight failed")
+        if error is None:
+            raise value
+        raise value from error
+
+    def reap_process(process: Any) -> None:
+        first_error = None
+
+        def remember(error: BaseException) -> None:
+            nonlocal first_error
+            if first_error is None or (
+                isinstance(first_error, Exception)
+                and not isinstance(error, Exception)
+            ):
+                first_error = error
+
+        def poll() -> Any:
+            try:
+                return process.poll()
+            except BaseException as error:
+                remember(error)
+                return None
+
+        returncode = poll()
+        if returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            except BaseException as error:
+                remember(error)
+            try:
+                process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+            except BaseException as error:
+                remember(error)
+            returncode = poll()
+        if returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except BaseException as error:
+                remember(error)
+            try:
+                process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+            except BaseException as error:
+                remember(error)
+            returncode = poll()
+        if returncode is None and first_error is None:
+            first_error = _entrypoint_error(
+                "historical source preflight failed"
+            )
+        if first_error is not None:
+            if not isinstance(first_error, Exception):
+                raise first_error
+            fail(first_error)
+
+    def run_bounded_process(
+        command: Tuple[str, ...], *, stdout_maximum: int,
+    ) -> Tuple[int, bytes, bytes]:
+        if (
+            type(command) is not tuple
+            or not command
+            or any(type(argument) is not str for argument in command)
+            or type(stdout_maximum) is not int
+            or stdout_maximum < 0
+        ):
+            fail()
+        process = None
+        selector = None
+        streams = []
+        original_error = None
+        result = None
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=dict(git_environment),
+                close_fds=True,
+            )
+            if process.stdout is None or process.stderr is None:
+                fail()
+            streams = [process.stdout, process.stderr]
+            for stream in streams:
+                _require_descriptor_noninheritable(stream.fileno())
+            selector = selectors.DefaultSelector()
+            selector.register(
+                process.stdout, selectors.EVENT_READ, ("stdout", stdout_maximum)
+            )
+            selector.register(
+                process.stderr,
+                selectors.EVENT_READ,
+                ("stderr", _MAX_GIT_OUTPUT_BYTES),
+            )
+            buffers = {"stdout": [], "stderr": []}
+            sizes = {"stdout": 0, "stderr": 0}
+            deadline = time.monotonic() + _GIT_TIMEOUT_SECONDS
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    fail()
+                events = selector.select(remaining)
+                if not events:
+                    fail()
+                for key, _mask in events:
+                    label, maximum = key.data
+                    allowance = maximum - sizes[label] + 1
+                    try:
+                        chunk = os.read(
+                            key.fileobj.fileno(), min(65536, allowance)
+                        )
+                    except OSError as error:
+                        fail(error)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    buffers[label].append(chunk)
+                    sizes[label] += len(chunk)
+                    if sizes[label] > maximum:
+                        fail()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail()
+            returncode = process.wait(timeout=remaining)
+            result = (
+                returncode,
+                b"".join(buffers["stdout"]),
+                b"".join(buffers["stderr"]),
+            )
+        except BaseException as error:
+            original_error = error
+
+        cleanup_error = None
+        if selector is not None:
+            try:
+                selector.close()
+            except BaseException as error:
+                cleanup_error = error
+        for stream in streams:
+            try:
+                stream.close()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if process is not None:
+            try:
+                reap_process(process)
+            except BaseException as error:
+                if cleanup_error is None or (
+                    isinstance(cleanup_error, Exception)
+                    and not isinstance(error, Exception)
+                ):
+                    cleanup_error = error
+        if original_error is not None:
+            if not isinstance(original_error, Exception):
+                raise original_error from cleanup_error
+            if cleanup_error is not None and not isinstance(
+                cleanup_error, Exception
+            ):
+                raise cleanup_error from original_error
+            raise original_error
+        if cleanup_error is not None:
+            if not isinstance(cleanup_error, Exception):
+                raise cleanup_error
+            fail(cleanup_error)
+        if result is None:
+            fail()
+        return result
+
+    def run_git(
+        arguments: Tuple[str, ...], *,
+        stdout_maximum: int = _MAX_GIT_OUTPUT_BYTES,
+    ) -> bytes:
+        # Only closure-owned frozen call sites can reach this command channel.
+        if (
+            type(arguments) is not tuple
+            or not arguments
+            or any(type(argument) is not str for argument in arguments)
+        ):
+            fail()
+        command = (
+            "/usr/bin/git",
+            "-C",
+            str(_PROJECT_ROOT),
+        ) + arguments
+        returncode, stdout, _stderr = run_bounded_process(
+            command, stdout_maximum=stdout_maximum
+        )
+        if returncode != 0:
+            fail()
+        return stdout
+
+    def parse_commit(payload: bytes) -> str:
+        try:
+            value = payload.decode("ascii")
+        except UnicodeDecodeError as error:
+            fail(error)
+        if not value.endswith("\n") or commit_pattern.fullmatch(value[:-1]) is None:
+            fail()
+        return value[:-1]
+
+    def parse_size(payload: bytes) -> int:
+        try:
+            value = payload.decode("ascii")
+        except UnicodeDecodeError as error:
+            fail(error)
+        if (
+            not value.endswith("\n")
+            or not value[:-1]
+            or not value[:-1].isdigit()
+        ):
+            fail()
+        size = int(value[:-1])
+        if size < 0 or size > _MAX_TRACKED_SOURCE_BYTES:
+            fail()
+        return size
+
+    def require_digest(value: Any) -> str:
+        if type(value) is not str or hash_pattern.fullmatch(value) is None:
+            fail()
+        return value
+
+    def require_version(value: Any) -> str:
+        if (
+            type(value) is not str
+            or not value
+            or len(value) > 128
+            or any(character in value for character in ("/", "\\", "\n", "\r", "\x00"))
+        ):
+            fail()
+        return value
+
+    def safe_toolchain_projection(identity: Any) -> Tuple[Mapping[str, str], ...]:
+        if (
+            not isinstance(identity, Mapping)
+            or identity.get("schema")
+            != "historical_foundry_toolchain_candidate/v1"
+        ):
+            fail()
+        rows = identity.get("binaries")
+        solc = identity.get("solc")
+        if type(rows) is not list or len(rows) != 3 or not isinstance(solc, Mapping):
+            fail()
+        foundry = {}
+        for row in rows:
+            if (
+                type(row) is not dict
+                or set(row) != {"name", "sha256", "version"}
+                or row.get("name") not in ("forge", "cast", "anvil")
+                or row["name"] in foundry
+            ):
+                fail()
+            foundry[row["name"]] = {
+                "name": row["name"],
+                "sha256": require_digest(row["sha256"]),
+                "version": require_version(row["version"]),
+            }
+        if set(foundry) != {"forge", "cast", "anvil"}:
+            fail()
+        projected = []
+        for name in ("forge", "anvil", "cast"):
+            projected.append(foundry[name])
+        projected.append({
+            "name": "solc",
+            "sha256": require_digest(solc.get("sha256")),
+            "version": require_version(solc.get("version")),
+        })
+        return tuple(projected)
+
+    def frozen_projection(value: Any) -> Any:
+        if type(value) is dict:
+            return MappingProxyType({
+                key: frozen_projection(item)
+                for key, item in value.items()
+            })
+        if type(value) in (list, tuple):
+            return tuple(frozen_projection(item) for item in value)
+        return value
+
+    def open_tracked_members():
+        chain = ()
+        members = []
+        owned_member_descriptors = []
+        try:
+            chain = _open_absolute_directory_chain(_PROJECT_ROOT)
+            root_descriptor = chain[-1][0]
+            for name, relative_path in _TRACKED_SOURCE_INVENTORY:
+                components = relative_path.split("/")
+                parent_descriptor = root_descriptor
+                directories = []
+                for component in components[:-1]:
+                    opened = _open_child_directory(
+                        parent_descriptor=parent_descriptor,
+                        name=component,
+                    )
+                    if opened is None:
+                        fail()
+                    descriptor, expected = opened
+                    owned_member_descriptors.append(descriptor)
+                    directories.append((
+                        parent_descriptor,
+                        component,
+                        descriptor,
+                        expected,
+                    ))
+                    parent_descriptor = descriptor
+                pointer = _open_held_pointer(
+                    relative_path=relative_path,
+                    parent_descriptor=parent_descriptor,
+                    leaf_name=components[-1],
+                )
+                if not pointer["present"]:
+                    fail()
+                owned_member_descriptors.append(pointer["descriptor"])
+                members.append({
+                    "name": name,
+                    "relative_path": relative_path,
+                    "directories": tuple(directories),
+                    "pointer": pointer,
+                })
+            return chain, tuple(members)
+        except BaseException as original_error:
+            _close_after_error(
+                tuple(owned_member_descriptors)
+                + tuple(row[0] for row in chain),
+                original_error,
+            )
+            raise AssertionError("unreachable")
+
+    def require_members_unchanged(chain: Any, members: Any) -> None:
+        for member in members:
+            _require_held_pointer_stable(member["pointer"])
+            for parent, name, descriptor, expected in reversed(
+                member["directories"]
+            ):
+                _require_directory_stable(
+                    parent_descriptor=parent,
+                    name=name,
+                    descriptor=descriptor,
+                    expected=expected,
+                )
+        _require_absolute_directory_chain_stable(chain)
+
+    def close_members(chain: Any, members: Any) -> None:
+        descriptors = []
+        for member in members:
+            pointer_descriptor = member["pointer"].get("descriptor")
+            if pointer_descriptor is not None:
+                descriptors.append(pointer_descriptor)
+            descriptors.extend(row[2] for row in member["directories"])
+        descriptors.extend(row[0] for row in chain)
+        _close_descriptor_inventory(descriptors)
+
+    def parse_tree_member(
+        payload: bytes, *, relative_path: str, expected_mode: str,
+        expected_type: str,
+    ) -> str:
+        prefix = (expected_mode + " " + expected_type + " ").encode("ascii")
+        suffix = b"\t" + relative_path.encode("ascii") + b"\x00"
+        if (
+            not payload.startswith(prefix)
+            or not payload.endswith(suffix)
+            or payload.count(b"\x00") != 1
+        ):
+            fail()
+        oid_bytes = payload[len(prefix):-len(suffix)]
+        try:
+            oid = oid_bytes.decode("ascii")
+        except UnicodeDecodeError as error:
+            fail(error)
+        if commit_pattern.fullmatch(oid) is None:
+            fail()
+        return oid
+
+    def parse_index_member(
+        payload: bytes, *, relative_path: str, expected_mode: str,
+    ) -> str:
+        prefix = (expected_mode + " ").encode("ascii")
+        suffix = b" 0\t" + relative_path.encode("ascii") + b"\x00"
+        if (
+            not payload.startswith(prefix)
+            or not payload.endswith(suffix)
+            or payload.count(b"\x00") != 1
+        ):
+            fail()
+        oid_bytes = payload[len(prefix):-len(suffix)]
+        try:
+            oid = oid_bytes.decode("ascii")
+        except UnicodeDecodeError as error:
+            fail(error)
+        if commit_pattern.fullmatch(oid) is None:
+            fail()
+        return oid
+
+    def member_payloads(members: Any) -> Mapping[str, bytes]:
+        return {
+            member["relative_path"]: member["pointer"]["payload"]
+            for member in members
+        }
+
+    def read_git_source_state(
+        *, frozen_head: str, members: Any,
+    ) -> Tuple[Mapping[str, Any], ...]:
+        physical = member_payloads(members)
+        rows = []
+        for name, relative_path in _TRACKED_SOURCE_INVENTORY:
+            tree_payload = run_git((
+                "ls-tree", "-z", frozen_head, "--", relative_path,
+            ))
+            oid = parse_tree_member(
+                tree_payload,
+                relative_path=relative_path,
+                expected_mode="100644",
+                expected_type="blob",
+            )
+            index_oid = parse_index_member(
+                run_git((
+                    "ls-files", "--stage", "-z", "--", relative_path,
+                )),
+                relative_path=relative_path,
+                expected_mode="100644",
+            )
+            if index_oid != oid:
+                fail()
+            size = parse_size(run_git(("cat-file", "-s", oid)))
+            payload = run_git(
+                ("show", frozen_head + ":" + relative_path),
+                stdout_maximum=size,
+            )
+            if len(payload) != size or payload != physical[relative_path]:
+                fail()
+            rows.append({
+                "name": name,
+                "relative_path": relative_path,
+                "mode": "100644",
+                "oid": oid,
+                "size": size,
+                "payload": payload,
+            })
+        return tuple(rows)
+
+    def read_gitlink_state(*, frozen_head: str) -> Mapping[str, str]:
+        head_oid = parse_tree_member(
+            run_git((
+                "ls-tree", "-z", frozen_head, "--", "lib/forge-std",
+            )),
+            relative_path="lib/forge-std",
+            expected_mode="160000",
+            expected_type="commit",
+        )
+        index_oid = parse_index_member(
+            run_git((
+                "ls-files", "--stage", "-z", "--", "lib/forge-std",
+            )),
+            relative_path="lib/forge-std",
+            expected_mode="160000",
+        )
+        checkout_oid = parse_commit(run_git((
+            "-C",
+            "lib/forge-std",
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        )))
+        if (
+            head_oid != _FORGE_STD_COMMIT
+            or index_oid != head_oid
+            or checkout_oid != head_oid
+        ):
+            fail()
+        return {
+            "head_oid": head_oid,
+            "index_oid": index_oid,
+            "checkout_oid": checkout_oid,
+        }
+
+    def git_state_equal(left: Any, right: Any) -> bool:
+        return left == right
+
+    def require_git_and_members_unchanged(
+        *, frozen: Mapping[str, Any], chain: Any, members: Any,
+    ) -> None:
+        if (
+            parse_commit(run_git((
+                "rev-parse", "--verify", "HEAD^{commit}",
+            ))) != frozen["head"]
+            or run_git((
+                "status", "--porcelain=v1", "--untracked-files=all",
+            )) != b""
+        ):
+            fail()
+        rows = read_git_source_state(
+            frozen_head=frozen["head"], members=members
+        )
+        gitlink = read_gitlink_state(frozen_head=frozen["head"])
+        if (
+            not git_state_equal(rows, frozen["rows"])
+            or not git_state_equal(gitlink, frozen["gitlink"])
+        ):
+            fail()
+        require_members_unchanged(chain, members)
+
+    def require_project_identity(
+        project_identity: Any, record_digests: Mapping[str, str],
+    ) -> str:
+        if (
+            type(project_identity) is not dict
+            or set(project_identity) != {
+                "schema",
+                "foundry_toml_sha256",
+                "foundry_lock_sha256",
+                "gitmodules_sha256",
+                "forge_std_commit",
+                "forge_std_tree_sha256",
+            }
+            or project_identity.get("schema")
+            != "historical_foundry_project_input_identity/v1"
+            or project_identity.get("foundry_toml_sha256")
+            != record_digests["foundry_toml"]
+            or project_identity.get("foundry_lock_sha256")
+            != record_digests["foundry_lock"]
+            or project_identity.get("gitmodules_sha256")
+            != record_digests["gitmodules"]
+            or project_identity.get("forge_std_commit")
+            != _FORGE_STD_COMMIT
+        ):
+            fail()
+        return require_digest(project_identity.get("forge_std_tree_sha256"))
+
+    def close_authority_parts(
+        *, chain: Any, members: Any, toolchain: Any,
+        original_error: Optional[BaseException] = None,
+    ) -> None:
+        cleanup_error = None
+        if toolchain is not None:
+            try:
+                toolchain.__exit__(
+                    type(original_error) if original_error is not None else None,
+                    original_error,
+                    original_error.__traceback__
+                    if original_error is not None else None,
+                )
+            except BaseException as error:
+                cleanup_error = error
+        try:
+            close_members(chain, members)
+        except BaseException as error:
+            if cleanup_error is None or (
+                isinstance(cleanup_error, Exception)
+                and not isinstance(error, Exception)
+            ):
+                cleanup_error = error
+        if original_error is not None:
+            if not isinstance(original_error, Exception):
+                raise original_error from cleanup_error
+            if cleanup_error is not None and not isinstance(
+                cleanup_error, Exception
+            ):
+                raise cleanup_error from original_error
+            raise original_error
+        if cleanup_error is not None:
+            if not isinstance(cleanup_error, Exception):
+                raise cleanup_error
+            fail(cleanup_error)
+
+    def close_authority_state(state: Mapping[str, Any]) -> None:
+        close_authority_parts(
+            chain=state["chain"],
+            members=state["members"],
+            toolchain=state["toolchain"],
+        )
+
+    def require_authority(instance: Any) -> Mapping[str, Any]:
+        if type(instance) is not HeldCleanSource:
+            fail()
+        row = authority_registry.get(id(instance))
+        if (
+            type(row) is not tuple
+            or len(row) != 2
+            or row[0]() is not instance
+            or row[1] is retired
+        ):
+            fail()
+        return row[1]
+
+    def retire_authority(instance: Any) -> Optional[Mapping[str, Any]]:
+        if type(instance) is not HeldCleanSource:
+            fail()
+        identity = id(instance)
+        row = authority_registry.get(identity)
+        if (
+            type(row) is not tuple
+            or len(row) != 2
+            or row[0]() is not instance
+        ):
+            fail()
+        if row[1] is retired:
+            return None
+        authority_registry[identity] = (row[0], retired)
+        return row[1]
+
+    def register_authority(
+        instance: Any, state: Mapping[str, Any],
+    ) -> None:
+        if type(instance) is not HeldCleanSource:
+            fail()
+        identity = id(instance)
+        if identity in authority_registry:
+            fail()
+
+        def discard(reference: Any) -> None:
+            row = authority_registry.get(identity)
+            if type(row) is not tuple or row[0] is not reference:
+                return
+            authority_registry.pop(identity, None)
+            if row[1] is retired:
+                return
+            try:
+                close_authority_state(row[1])
+            except BaseException:
+                pass
+
+        reference = weakref.ref(instance, discard)
+        authority_registry[identity] = (reference, state)
+
+    class HeldCleanSource:
+        __slots__ = ("__weakref__",)
+
+        def __new__(cls, key: Any, *args: Any, **kwargs: Any):
+            if cls is not HeldCleanSource or key is not token:
+                fail()
+            return super().__new__(cls)
+
+        def __init__(self, key: Any) -> None:
+            if key is not token:
+                fail()
+
+        def __init_subclass__(cls, **kwargs: Any) -> None:
+            raise TypeError("held clean source cannot be subclassed")
+
+        def __repr__(self) -> str:
+            return "HeldCleanHistoricalSource(<sealed>)"
+
+        def __reduce__(self) -> Any:
+            raise TypeError("held clean source is not serializable")
+
+        def __reduce_ex__(self, _protocol: int) -> Any:
+            raise TypeError("held clean source is not serializable")
+
+        def __copy__(self) -> Any:
+            raise TypeError("held clean source is not copyable")
+
+        def __deepcopy__(self, _memo: Any) -> Any:
+            raise TypeError("held clean source is not copyable")
+
+        @property
+        def identity_projection(self) -> Mapping[str, Any]:
+            return require_authority(self)["identity_projection"]
+
+        def reread_unchanged(self) -> None:
+            state = require_authority(self)
+            try:
+                state["toolchain"]._verify_versions_and_hardfork()
+                current_toolchain_identity = (
+                    state["toolchain"].verified_identity
+                )
+                safe_toolchain_projection(current_toolchain_identity)
+                if (
+                    frozen_projection(current_toolchain_identity)
+                    != state["toolchain_identity"]
+                ):
+                    fail()
+                current_project_identity = (
+                    state["toolchain"].verified_project_input_identity()
+                )
+                if current_project_identity != state["project_identity"]:
+                    fail()
+                require_project_identity(
+                    current_project_identity, state["record_digests"]
+                )
+                require_git_and_members_unchanged(
+                    frozen=state["frozen_git"],
+                    chain=state["chain"],
+                    members=state["members"],
+                )
+            except HistoricalReplayEntrypointError:
+                raise
+            except Exception as error:
+                fail(error)
+
+        def close(self) -> None:
+            state = retire_authority(self)
+            if state is None:
+                return
+            close_authority_state(state)
+
+        def __enter__(self):
+            require_authority(self)
+            return self
+
+        def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
+            cleanup_error = None
+            try:
+                self.close()
+            except BaseException as error:
+                cleanup_error = error
+            if (
+                _type is not None
+                and not issubclass(_type, Exception)
+                and isinstance(_value, BaseException)
+            ):
+                raise _value.with_traceback(_traceback) from cleanup_error
+            if cleanup_error is not None:
+                raise cleanup_error
+            return None
+
+        def __del__(self) -> None:
+            try:
+                self.close()
+            except BaseException:
+                pass
+
+    def verify() -> HeldCleanSource:
+        chain = ()
+        members = ()
+        toolchain = None
+        try:
+            chain, members = open_tracked_members()
+            if run_git((
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            )) != b"":
+                fail()
+            repository_head = parse_commit(
+                run_git(("rev-parse", "--verify", "HEAD^{commit}"))
+            )
+            rows = read_git_source_state(
+                frozen_head=repository_head, members=members
+            )
+            gitlink = read_gitlink_state(frozen_head=repository_head)
+            frozen_git = {
+                "head": repository_head,
+                "rows": rows,
+                "gitlink": gitlink,
+            }
+            record_digests = {
+                row["name"]: hashlib.sha256(row["payload"]).hexdigest()
+                for row in rows
+            }
+            records = tuple({
+                "name": row["name"],
+                "size": row["size"],
+                "sha256": record_digests[row["name"]],
+            } for row in rows)
+
+            toolchain = _open_reviewed_historical_toolchain()
+            entered = toolchain.__enter__()
+            if entered is not toolchain:
+                fail()
+            toolchain._verify_versions_and_hardfork()
+            toolchain_identity = toolchain.verified_identity
+            safe_toolchain = safe_toolchain_projection(toolchain_identity)
+            frozen_toolchain_identity = frozen_projection(toolchain_identity)
+            project_identity = (
+                toolchain.verified_project_input_identity()
+            )
+            forge_std_tree_sha256 = require_digest(
+                require_project_identity(project_identity, record_digests)
+            )
+            require_git_and_members_unchanged(
+                frozen=frozen_git, chain=chain, members=members
+            )
+            projection = frozen_projection({
+                "schema": "historical_foundry_clean_source_preflight/v1",
+                "repository_head": repository_head,
+                "tracked_source": records,
+                "forge_std": {
+                    "commit": _FORGE_STD_COMMIT,
+                    "tree_sha256": forge_std_tree_sha256,
+                },
+                "toolchain": safe_toolchain,
+            })
+            authority = HeldCleanSource(token)
+            register_authority(
+                authority,
+                MappingProxyType({
+                    "chain": chain,
+                    "members": members,
+                    "toolchain": toolchain,
+                    "toolchain_identity": frozen_toolchain_identity,
+                    "frozen_git": frozen_git,
+                    "project_identity": project_identity,
+                    "record_digests": record_digests,
+                    "identity_projection": projection,
+                }),
+            )
+            chain = ()
+            members = ()
+            toolchain = None
+            return authority
+        except BaseException as error:
+            if not isinstance(error, HistoricalReplayEntrypointError) and isinstance(
+                error, Exception
+            ):
+                error = _entrypoint_error(
+                    "historical source preflight failed"
+                )
+            close_authority_parts(
+                chain=chain,
+                members=members,
+                toolchain=toolchain,
+                original_error=error,
+            )
+            raise AssertionError("unreachable")
+
+    verify.__name__ = "verify_clean_tracked_historical_source"
+    verify.__qualname__ = "verify_clean_tracked_historical_source"
+    return verify
+
+
+verify_clean_tracked_historical_source = _initialize_clean_source_verifier()
+del _initialize_clean_source_verifier
+
+
+def _drive_historical_candidate_replay(
+    *, snapshot: Any, replay_context: Any,
+) -> Mapping[str, Any]:
+    """Consume the sealed newest-first selection protocol to one terminal."""
+    import scripts.historical_foundry_anvil as anvil
+    import scripts.historical_foundry_scan as scan
+
+    replay_ledger = None
+    while True:
+        step = scan._advance_historical_selection_controller(
+            snapshot=snapshot, replay_ledger=replay_ledger
+        )
+        if isinstance(step, Mapping):
+            status = step.get("status")
+            if status in (
+                "found_publishable_profitable_block",
+                "no_publishable_profitable_block",
+            ):
+                return step
+            if status == "candidate_unresolved":
+                raise _entrypoint_error(
+                    "historical replay candidate is unresolved"
+                )
+            raise _entrypoint_error(
+                "historical replay selection is invalid"
+            )
+
+        action = step
+        scenario = scan._consume_historical_selection_action(
+            action=action, context=replay_context
+        )
+        sink = anvil._open_scenario_evidence_sink(
+            context=replay_context, scenario=scenario
+        )
+        try:
+            anvil._replay_historical_scenario(
+                context=replay_context, scenario=scenario, sink=sink
+            )
+        except anvil.HistoricalReplayError as error:
+            scan._record_historical_selection_failure(
+                action=action, error=error
+            )
+            terminal = scan._advance_historical_selection_controller(
+                snapshot=snapshot, replay_ledger=replay_ledger
+            )
+            if (
+                not isinstance(terminal, Mapping)
+                or terminal.get("status") != "candidate_unresolved"
+            ):
+                raise _entrypoint_error(
+                    "historical replay selection is invalid"
+                )
+            raise _entrypoint_error(
+                "historical replay candidate is unresolved"
+            ) from None
+        replay_ledger = sink.validated_ledger()
+
+
+def _close_historical_controller_resources(
+    resources: Sequence[Any],
+) -> Optional[BaseException]:
+    first_error = None
+    closed = set()
+    for resource in reversed(tuple(resources)):
+        if resource is None or id(resource) in closed:
+            continue
+        closed.add(id(resource))
+        closer = getattr(resource, "close", None)
+        if not callable(closer):
+            exit_method = getattr(resource, "__exit__", None)
+            closer = (
+                (lambda method=exit_method: method(None, None, None))
+                if callable(exit_method)
+                else None
+            )
+        if not callable(closer):
+            continue
+        try:
+            closer()
+        except BaseException as error:
+            if first_error is None or (
+                isinstance(first_error, Exception)
+                and not isinstance(error, Exception)
+            ):
+                first_error = error
+    return first_error
+
+
+def _produce_historical_raw_run(
+    *, data_dir: Path,
+    _connected_anchor: Optional[Mapping[str, Any]] = None,
+) -> Mapping[str, Any]:
+    """Execute capture through immutable raw-run finalization once."""
+    import scripts.historical_foundry_anvil as anvil
+    import scripts.historical_foundry_contracts as contracts
+    import scripts.historical_foundry_rpc as rpc
+    import scripts.historical_foundry_scan as scan
+    import scripts.historical_foundry_storage as storage
+
+    owned = []
+    try:
+        config = contracts.load_historical_foundry_config_set()
+        spool = storage._open_historical_window_exchange_spool(
+            data_dir=data_dir
+        )
+        owned = [spool]
+        if _connected_anchor is None:
+            rpc_context = rpc._open_production_archive_rpc_run()
+        else:
+            rpc_context = (
+                rpc
+                ._open_production_archive_rpc_run_for_connected_verification(
+                    anchor_header=_connected_anchor
+                )
+            )
+        owned = [spool, rpc_context]
+        claim = (
+            rpc._claim_fresh_production_archive_rpc_run_for_historical_window(
+                context=rpc_context
+            )
+        )
+        owned = [spool, claim]
+        capability = scan._capture_production_historical_window(
+            claim=claim, spool=spool
+        )
+        owned = [capability]
+        capture = scan._materialize_historical_window_staging_snapshot(
+            capability=capability
+        )
+        owned = [capture]
+        window = scan.open_validated_historical_window(
+            config=config, staging=capture
+        )
+        rows = scan.build_historical_prefilter_grid(
+            config=config, window=window
+        )
+        prefilter = storage._freeze_historical_prefilter_grid(
+            staging=capture, rows=rows
+        )
+        owned = [prefilter]
+        snapshot = scan.open_validated_historical_scan_snapshot(
+            config=config, staging=prefilter
+        )
+        artifact = contracts.build_validated_executor_artifact(config)
+        replay_context = anvil.open_historical_replay_context(
+            config=config,
+            staging=prefilter,
+            window=snapshot.validated_window,
+            grid=snapshot.validated_grid,
+            executor_artifact=artifact,
+        )
+        owned = [replay_context]
+        selection = _drive_historical_candidate_replay(
+            snapshot=snapshot, replay_context=replay_context
+        )
+        finalized = scan._finalize_historical_replay_run(
+            config=config, snapshot=snapshot, selection=selection
+        )
+        owned = [replay_context, finalized]
+        run_identity = dict(finalized.identity_projection())
+        replay_context.close()
+        owned = [finalized]
+        selection_projection = dict(selection)
+        if selection_projection.get("status") == (
+            "no_publishable_profitable_block"
+        ):
+            finalized.close()
+            owned = []
+            return {
+                "config": config,
+                "selection": selection_projection,
+                "run": None,
+                "run_identity": run_identity,
+                "publication_lease": None,
+            }
+        if selection_projection.get("status") != (
+            "found_publishable_profitable_block"
+        ):
+            raise _entrypoint_error(
+                "historical replay selection is invalid"
+            )
+        publication_lease = (
+            storage._acquire_historical_run_publication_lease(
+                run_id=run_identity["run_id"],
+                expected_manifest_sha256=run_identity[
+                    "run_manifest_sha256"
+                ],
+            )
+        )
+        owned = [finalized, publication_lease]
+        result = {
+            "config": config,
+            "selection": selection_projection,
+            "run": finalized,
+            "run_identity": run_identity,
+            "publication_lease": publication_lease,
+        }
+        owned = []
+        return result
+    except BaseException as error:
+        cleanup_error = _close_historical_controller_resources(owned)
+        if not isinstance(error, Exception):
+            raise error from cleanup_error
+        if cleanup_error is not None and not isinstance(
+            cleanup_error, Exception
+        ):
+            raise cleanup_error from error
+        if isinstance(error, HistoricalReplayEntrypointError):
+            raise error
+        raise _entrypoint_error(
+            "historical production scan failed"
+        ) from error
+
+
+def _build_production_connected_historical_observation(
+    request: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Rebuild retained evidence through a fresh RPC and fresh Anvil run."""
+    import scripts.historical_foundry_verifier as verifier
+
+    started = datetime.now(timezone.utc)
+    preflight = None
+    raw_state = None
+    result = None
+    original_error = None
+    try:
+        preflight = verify_clean_tracked_historical_source()
+        source_identity = preflight.identity_projection
+        if not isinstance(source_identity, Mapping):
+            raise _entrypoint_error(
+                "historical connected verification failed"
+            )
+        retained = (
+            verifier._build_retained_connected_projection_for_request(
+                request
+            )
+        )
+        if (
+            not isinstance(retained, Mapping)
+            or not isinstance(retained.get("capture_anchor"), Mapping)
+            or type(retained.get("toolchain_sha256")) is not str
+        ):
+            raise _entrypoint_error(
+                "historical connected verification failed"
+            )
+        with tempfile.TemporaryDirectory(
+            prefix="historical-connected-verification-", dir="/tmp"
+        ) as temporary:
+            raw_error = None
+            cleanup_error = None
+            try:
+                raw_state = _produce_historical_raw_run(
+                    data_dir=Path(temporary),
+                    _connected_anchor=retained["capture_anchor"],
+                )
+                if (
+                    type(raw_state) is not dict
+                    or raw_state.get("run") is None
+                    or raw_state.get("publication_lease") is None
+                ):
+                    raise _entrypoint_error(
+                        "historical connected verification failed"
+                    )
+                fresh = (
+                    verifier
+                    ._build_connected_raw_projection_for_verification(
+                        source=raw_state["run"],
+                        config=raw_state["config"],
+                    )
+                )
+                verifier._require_connected_raw_projection_parity(
+                    retained=retained, fresh=fresh
+                )
+                provider_identity = fresh.get(
+                    "provider_identity_sha256"
+                )
+                fresh_run_id = fresh.get("run_id")
+                if (
+                    type(provider_identity) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", provider_identity)
+                    is None
+                    or type(fresh_run_id) is not str
+                ):
+                    raise _entrypoint_error(
+                        "historical connected verification failed"
+                    )
+                process_id = os.getpid()
+                connection_identity = hashlib.sha256(
+                    _canonical_connected_worker_bytes({
+                        "schema": (
+                            "historical_connected_connection_identity/v1"
+                        ),
+                        "process_id": process_id,
+                        "provider_identity_sha256": provider_identity,
+                        "fresh_run_id": fresh_run_id,
+                    })
+                ).hexdigest()
+                try:
+                    verifier_source = Path(verifier.__file__).read_bytes()
+                except (OSError, TypeError) as error:
+                    raise _entrypoint_error(
+                        "historical connected verification failed"
+                    ) from error
+                finished = datetime.now(timezone.utc)
+                result = {
+                    "schema": (
+                        "historical_foundry_connected_verification_"
+                        "observation/v1"
+                    ),
+                    "evidence_mode": "production_connected",
+                    "fresh_process": True,
+                    "fresh_connection": True,
+                    "process_id": process_id,
+                    "process_identity_sha256": hashlib.sha256(
+                        str(process_id).encode("ascii")
+                    ).hexdigest(),
+                    "connection_identity_sha256": connection_identity,
+                    "provider_identity_sha256": provider_identity,
+                    "verifier_source_sha256": hashlib.sha256(
+                        verifier_source
+                    ).hexdigest(),
+                    "verifier_toolchain_sha256": retained[
+                        "toolchain_sha256"
+                    ],
+                    "started_at": started.strftime(
+                        "%Y-%m-%dT%H:%M:%S.%fZ"
+                    ),
+                    "finished_at": finished.strftime(
+                        "%Y-%m-%dT%H:%M:%S.%fZ"
+                    ),
+                    "projection": dict(retained),
+                }
+            except BaseException as error:
+                raw_error = error
+            if raw_state is not None:
+                cleanup_error = _close_historical_controller_resources((
+                    raw_state.get("run"),
+                    raw_state.get("publication_lease"),
+                ))
+                raw_state = None
+            if raw_error is not None:
+                _raise_after_cleanup(raw_error, cleanup_error)
+            if cleanup_error is not None:
+                if not isinstance(cleanup_error, Exception):
+                    raise cleanup_error
+                raise _entrypoint_error(
+                    "historical connected verification failed"
+                ) from cleanup_error
+    except BaseException as error:
+        original_error = error
+    cleanup_error = _close_historical_controller_resources((preflight,))
+    if original_error is not None:
+        _raise_after_cleanup(original_error, cleanup_error)
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        raise _entrypoint_error(
+            "historical connected verification failed"
+        ) from cleanup_error
+    if not isinstance(result, Mapping):
+        raise _entrypoint_error(
+            "historical connected verification failed"
+        )
+    return result
+
+
+def _prepare_historical_replay_bundle(
+    *, data_dir: Path, raw_state: Mapping[str, Any], publish: bool,
+) -> Mapping[str, Any]:
+    """Stage the private core and complete bundle from one raw authority."""
+    import scripts.historical_route_publication as publication
+
+    if (
+        type(raw_state) is not dict
+        or type(publish) is not bool
+        or raw_state.get("run") is None
+        or raw_state.get("publication_lease") is None
+    ):
+        raise _entrypoint_error(
+            "historical publication preparation is invalid"
+        )
+    finalized = raw_state["run"]
+    publication_lease = raw_state["publication_lease"]
+    raw_state["run"] = None
+    raw_state["publication_lease"] = None
+    owned = [finalized, publication_lease]
+    try:
+        core_stage = publication.stage_historical_replay_core(
+            data_dir=data_dir,
+            config=raw_state["config"],
+            publication_lease=publication_lease,
+        )
+        owned = [finalized, core_stage]
+        staged_context = (
+            publication.load_validated_historical_replay_core_at(
+                staged_core=core_stage
+            )
+        )
+        owned = [finalized, core_stage, staged_context]
+        staged_projection_bytes = publication._canonical_bytes(
+            dict(staged_context.identity_projection())
+        )
+        staged_payload_bytes = publication._canonical_bytes(dict(
+            publication._build_historical_complete_payload(
+                context=staged_context
+            )
+        ))
+
+        if publish:
+            staged_context.close()
+            owned = [finalized, core_stage]
+            context = publication.publish_historical_replay_core(
+                data_dir=data_dir, staged_core=core_stage
+            )
+            core_stage = None
+            owned = [finalized, context]
+            if publication._canonical_bytes(
+                dict(context.identity_projection())
+            ) != staged_projection_bytes:
+                raise _entrypoint_error(
+                    "historical committed core differs from staged core"
+                )
+        else:
+            context = staged_context
+
+        authoritative_payload_bytes = publication._canonical_bytes(dict(
+            publication._build_historical_complete_payload(
+                context=context
+            )
+        ))
+        if authoritative_payload_bytes != staged_payload_bytes:
+            raise _entrypoint_error(
+                "historical opportunity economics changed after core staging"
+            )
+        bundle = publication.stage_historical_replay_bundle(
+            data_dir=data_dir,
+            raw_root=(data_dir / "raw" / "historical-foundry-replay"),
+            context=context,
+        )
+        if not isinstance(bundle, Mapping):
+            raise _entrypoint_error(
+                "historical complete bundle is invalid"
+            )
+        subject = bundle.get("verification_subject")
+        pointer_publication = bundle.get("pointer_publication")
+        if subject is None or pointer_publication is None:
+            raise _entrypoint_error(
+                "historical complete bundle is invalid"
+            )
+        owned.append(subject)
+        owned.append(pointer_publication)
+        prepared = {
+            "mode": "publish" if publish else "dry-run",
+            "data_dir": data_dir,
+            "selection": raw_state["selection"],
+            "run_identity": raw_state["run_identity"],
+            "run": finalized,
+            "core_stage": core_stage,
+            "context": context,
+            "bundle": bundle,
+            "verification_subject": subject,
+            "pointer_publication": pointer_publication,
+            "_owned_resources": owned,
+        }
+        owned = []
+        return prepared
+    except BaseException as error:
+        cleanup_error = _close_historical_controller_resources(owned)
+        if not isinstance(error, Exception):
+            raise error from cleanup_error
+        if cleanup_error is not None and not isinstance(
+            cleanup_error, Exception
+        ):
+            raise cleanup_error from error
+        if isinstance(error, HistoricalReplayEntrypointError):
+            raise error
+        raise _entrypoint_error(
+            "historical publication preparation failed"
+        ) from error
+
+
+def _close_prepared_historical_bundle(
+    prepared: Mapping[str, Any],
+) -> None:
+    if type(prepared) is not dict:
+        raise _entrypoint_error(
+            "historical publication cleanup is invalid"
+        )
+    resources = prepared.get("_owned_resources")
+    if type(resources) is not list:
+        if resources == ():
+            return None
+        raise _entrypoint_error(
+            "historical publication cleanup is invalid"
+        )
+    prepared["_owned_resources"] = ()
+    cleanup_error = _close_historical_controller_resources(resources)
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        raise _entrypoint_error(
+            "historical publication cleanup failed"
+        ) from cleanup_error
+    return None
+
+
+def _verify_prepared_historical_bundle(
+    *, prepared: Mapping[str, Any], publish: bool,
+) -> Mapping[str, Any]:
+    """Run the sealed connected verifier and validate its handoff bytes."""
+    import scripts.historical_foundry_verifier as verifier
+
+    if (
+        type(prepared) is not dict
+        or type(publish) is not bool
+        or prepared.get("mode")
+        != ("publish" if publish else "dry-run")
+    ):
+        raise _entrypoint_error(
+            "historical connected verification input is invalid"
+        )
+    subject = prepared.get("verification_subject")
+    try:
+        subject.reread_unchanged()
+        result = verifier.run_connected_historical_verification(
+            subject, mode="publish" if publish else "staged"
+        )
+        subject.reread_unchanged()
+        if not isinstance(result, Mapping):
+            raise _entrypoint_error(
+                "historical connected verification result is invalid"
+            )
+        report = result.get("report")
+        report_bytes = result.get("report_bytes")
+        report_sha256 = result.get("report_sha256")
+        pointer_core = result.get("pointer_core")
+        final_pointer = result.get("final_pointer")
+        final_pointer_bytes = result.get("final_pointer_bytes")
+        bundle = prepared.get("bundle")
+        bundle_pointer_core = (
+            bundle.get("pointer_core")
+            if isinstance(bundle, Mapping)
+            else None
+        )
+        expected_mode = "publish" if publish else "staged"
+        if (
+            result.get("schema")
+            != "historical_connected_verification_result/v1"
+            or result.get("mode") != expected_mode
+            or not isinstance(report, Mapping)
+            or report.get("schema")
+            != "route_historical_replay_verification/v1"
+            or report.get("status") != "verified"
+            or report.get("evidence_mode") != "production_connected"
+            or type(report_bytes) is not bytes
+            or type(report_sha256) is not str
+            or hashlib.sha256(report_bytes).hexdigest() != report_sha256
+            or not isinstance(pointer_core, Mapping)
+            or not isinstance(bundle_pointer_core, Mapping)
+            or dict(pointer_core) != dict(bundle_pointer_core)
+            or not isinstance(final_pointer, Mapping)
+            or type(final_pointer_bytes) is not bytes
+            or final_pointer_bytes
+            != verifier._canonical_bytes(dict(final_pointer))
+            or final_pointer.get("verification_report_sha256")
+            != report_sha256
+            or dict(verifier.historical_replay_pointer_core(
+                final_pointer
+            )) != dict(pointer_core)
+            or publish and result.get("install_result") is None
+            or not publish and result.get("install_result") is not None
+        ):
+            if (
+                isinstance(report, Mapping)
+                and report.get("evidence_mode")
+                != "production_connected"
+            ):
+                raise _entrypoint_error(
+                    "historical production-connected evidence is required"
+                )
+            raise _entrypoint_error(
+                "historical connected verification result is invalid"
+            )
+        prepared["verification"] = result
+        return result
+    except BaseException as error:
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, HistoricalReplayEntrypointError):
+            raise
+        raise _entrypoint_error(
+            "historical connected verification failed"
+        ) from error
+
+
+def _publish_verified_historical_bundle(
+    *, prepared: Mapping[str, Any], verification: Mapping[str, Any],
+    publish: bool,
+) -> Optional[Mapping[str, Any]]:
+    """Hand the exact connected-verification result to the pointer CAS."""
+    import scripts.historical_route_publication as publication
+
+    expected_prepared_mode = "publish" if publish else "dry-run"
+    expected_verification_mode = "publish" if publish else "staged"
+    if (
+        type(prepared) is not dict
+        or type(publish) is not bool
+        or prepared.get("mode") != expected_prepared_mode
+        or verification is not prepared.get("verification")
+        or not isinstance(verification, Mapping)
+        or verification.get("mode") != expected_verification_mode
+    ):
+        raise _entrypoint_error(
+            "historical complete publication handoff is invalid"
+        )
+    if not publish:
+        return None
+    subject = prepared.get("verification_subject")
+    data_dir = prepared.get("data_dir")
+    authority = prepared.get("pointer_publication")
+    final_pointer = verification.get("final_pointer")
+    final_pointer_bytes = verification.get("final_pointer_bytes")
+    if (
+        subject is None
+        or not isinstance(data_dir, Path)
+        or authority is None
+        or not isinstance(final_pointer, Mapping)
+        or type(final_pointer_bytes) is not bytes
+    ):
+        raise _entrypoint_error(
+            "historical complete publication handoff is invalid"
+        )
+    try:
+        subject.reread_unchanged()
+        installed = publication.publish_historical_replay_bundle(
+            data_dir=data_dir,
+            pointer_publication=authority,
+            final_pointer_bytes=final_pointer_bytes,
+        )
+        subject.reread_unchanged()
+        if (
+            not isinstance(installed, Mapping)
+            or dict(installed) != dict(final_pointer)
+        ):
+            raise _entrypoint_error(
+                "historical complete pointer result is invalid"
+            )
+        prepared["complete_pointer"] = installed
+        return installed
+    except BaseException as error:
+        if not isinstance(error, Exception):
+            raise
+        if isinstance(error, HistoricalReplayEntrypointError):
+            raise
+        raise _entrypoint_error(
+            "historical complete pointer publication failed"
+        ) from error
+
+
+def _invalid_historical_reference_gc_inventory() -> Mapping[str, Any]:
+    return {
+        "schema": "historical_reference_gc_validated_inventory/v1",
+        "status": "invalid",
+        "complete_bundles": (),
+        "core_bundles": (),
+        "historical_pointers": {"core": None, "complete": None},
+        "raw_runs": (),
+        "verification_reports": (),
+    }
+
+
+def _build_validated_historical_reference_gc_inventory(
+    *, data_dir: Path,
+) -> Mapping[str, Any]:
+    return _build_validated_historical_reference_gc_inventory_impl(
+        data_dir=data_dir, acquire_root_locks=True
+    )
+
+
+def _build_validated_historical_reference_gc_inventory_impl(
+    *, data_dir: Path, acquire_root_locks: bool,
+) -> Mapping[str, Any]:
+    """Fully validate retained historical references without mutating them."""
+    import scripts.historical_foundry_storage as storage
+    import scripts.historical_foundry_verifier as verifier
+    import scripts.historical_route_publication as publication
+    import scripts.route_publication as route_publication
+
+    def invalid(reason: str) -> None:
+        del reason
+        raise _entrypoint_error("historical GC inventory is invalid")
+
+    def exact_sha256(value: Any) -> bool:
+        return (
+            type(value) is str
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        )
+
+    def exact_json(
+        payload: bytes, encoder: Any,
+    ) -> Mapping[str, Any]:
+        try:
+            value = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            invalid("JSON decode failed")
+        if type(value) is not dict or encoder(value) != payload:
+            invalid("JSON is not canonical")
+        return value
+
+    def close_child(descriptor: int, original_error: Any = None) -> None:
+        if original_error is not None:
+            _close_after_error((descriptor,), original_error)
+        _close_descriptor_inventory((descriptor,))
+
+    if (
+        not isinstance(data_dir, Path)
+        or type(acquire_root_locks) is not bool
+    ):
+        return _invalid_historical_reference_gc_inventory()
+
+    descriptors = []
+    handles = []
+    result = None
+    original_error = None
+    cleanup_error = None
+    try:
+        data = route_publication._absolute_without_symlink_resolution(
+            data_dir
+        )
+        raw_root, raw_fd, raw_details = (
+            route_publication._open_verified_directory(
+                data / "raw" / "historical-foundry-replay",
+                "historical raw run inventory",
+            )
+        )
+        descriptors.append(raw_fd)
+        historical_root, historical_fd, historical_details = (
+            route_publication._open_verified_directory(
+                data / "routes" / "historical",
+                "historical reference inventory root",
+            )
+        )
+        descriptors.append(historical_fd)
+        if acquire_root_locks:
+            fcntl.flock(historical_fd, fcntl.LOCK_SH)
+        complete_fd, complete_details = (
+            route_publication._open_directory_at(
+                historical_fd, "bundles",
+                "historical complete bundle inventory",
+            )
+        )
+        descriptors.append(complete_fd)
+        core_fd, core_details = route_publication._open_directory_at(
+            historical_fd, "core", "historical core inventory"
+        )
+        descriptors.append(core_fd)
+        if acquire_root_locks:
+            fcntl.flock(core_fd, fcntl.LOCK_SH)
+        core_bundles_fd, core_bundles_details = (
+            route_publication._open_directory_at(
+                core_fd, "bundles", "historical core bundle inventory"
+            )
+        )
+        descriptors.append(core_bundles_fd)
+        verification_fd, verification_details = (
+            route_publication._open_directory_at(
+                historical_fd, "verifications",
+                "historical verification inventory",
+            )
+        )
+        descriptors.append(verification_fd)
+        reports_fd, reports_details = route_publication._open_directory_at(
+            verification_fd, "by-sha256",
+            "historical verification report inventory",
+        )
+        descriptors.append(reports_fd)
+
+        complete_pointer_snapshot = (
+            route_publication._optional_pointer_snapshot_at(historical_fd)
+        )
+        core_pointer_snapshot = (
+            route_publication._optional_pointer_snapshot_at(core_fd)
+        )
+        complete_pointer = None
+        complete_pointer_core = None
+        if complete_pointer_snapshot is not None:
+            complete_pointer = exact_json(
+                complete_pointer_snapshot[0], verifier._canonical_bytes
+            )
+            complete_pointer_core = dict(
+                verifier.historical_replay_pointer_core(complete_pointer)
+            )
+        core_pointer = None
+        if core_pointer_snapshot is not None:
+            core_pointer = exact_json(
+                core_pointer_snapshot[0], publication._json_file_bytes
+            )
+            if (
+                set(core_pointer) != {
+                    "schema", "bundle_stage", "route_cohort_id",
+                    "manifest_sha256",
+                }
+                or core_pointer.get("schema")
+                != "route_historical_replay_core_pointer/v1"
+                or core_pointer.get("bundle_stage")
+                != "route_historical_replay_core/v1"
+                or re.fullmatch(
+                    r"cohort:[0-9a-f]{64}",
+                    core_pointer.get("route_cohort_id", ""),
+                ) is None
+                or not exact_sha256(core_pointer.get("manifest_sha256"))
+            ):
+                invalid("core pointer schema differs")
+
+        raw_names = tuple(sorted(os.listdir(raw_fd)))
+        if any(
+            re.fullmatch(r"[0-9a-f]{64}", name) is None
+            for name in raw_names
+        ):
+            invalid("raw run name differs")
+        raw_rows = []
+        for name in raw_names:
+            run_fd = None
+            try:
+                run_fd, run_details = route_publication._open_directory_at(
+                    raw_fd, name, "historical raw run"
+                )
+                _manifest_bytes, manifest_sha256, _manifest_details = (
+                    route_publication._read_bounded_bytes_at(
+                        run_fd, "run_manifest.json", limit=8_388_608,
+                        label="historical raw run manifest",
+                    )
+                )
+                run_id = "run:" + name
+                snapshot = storage.open_validated_run(
+                    data_dir=data, run_id=run_id,
+                    expected_manifest_sha256=manifest_sha256,
+                )
+                handles.append(snapshot)
+                snapshot.reread_unchanged()
+                projection = dict(snapshot.identity_projection())
+                if (
+                    projection.get("run_id") != run_id
+                    or projection.get("run_manifest_sha256")
+                    != manifest_sha256
+                ):
+                    invalid("raw run projection differs")
+                route_publication._verify_directory_entry_snapshot(
+                    raw_fd, name, run_details, "historical raw run"
+                )
+                raw_rows.append({
+                    "run_id": run_id,
+                    "run_manifest_sha256": manifest_sha256,
+                })
+            except BaseException as error:
+                if run_fd is not None:
+                    close_child(run_fd, error)
+                raise
+            if run_fd is not None:
+                close_child(run_fd)
+
+        complete_names = tuple(sorted(os.listdir(complete_fd)))
+        if any(
+            re.fullmatch(r"replay:[0-9a-f]{64}", name) is None
+            for name in complete_names
+        ):
+            invalid("complete bundle name differs")
+        complete_rows = []
+        complete_pointer_cores = {}
+        for replay_id in complete_names:
+            bundle_fd = None
+            try:
+                bundle_fd, bundle_details = (
+                    route_publication._open_directory_at(
+                        complete_fd, replay_id,
+                        "historical complete bundle",
+                    )
+                )
+                bundle_path = (
+                    historical_root / "bundles" / replay_id
+                )
+                validated = publication.validate_historical_replay_bundle(
+                    data_dir=data, raw_root=raw_root,
+                    bundle_path=bundle_path,
+                    expected_pointer_core=None,
+                )
+                subject = validated.get("verification_subject")
+                if subject is not None:
+                    handles.append(subject)
+                if subject is None:
+                    invalid("complete subject is missing")
+                subject.reread_unchanged()
+                manifest = validated.get("manifest")
+                pointer_core = validated.get("pointer_core")
+                manifest_sha256 = validated.get("manifest_sha256")
+                if (
+                    validated.get("path") != bundle_path
+                    or not isinstance(manifest, Mapping)
+                    or manifest.get("replay_id") != replay_id
+                    or re.fullmatch(
+                        r"cohort:[0-9a-f]{64}",
+                        manifest.get("route_cohort_id", ""),
+                    ) is None
+                    or re.fullmatch(
+                        r"run:[0-9a-f]{64}",
+                        manifest.get("run_id", ""),
+                    ) is None
+                    or not exact_sha256(
+                        manifest.get("run_manifest_sha256")
+                    )
+                    or not exact_sha256(manifest_sha256)
+                    or not isinstance(pointer_core, Mapping)
+                    or dict(pointer_core) != {
+                        "schema": "route_historical_replay_pointer/v1",
+                        "bundle_stage": (
+                            "route_historical_foundry_replay/v1"
+                        ),
+                        "replay_id": replay_id,
+                        "route_cohort_id": manifest["route_cohort_id"],
+                        "manifest_sha256": manifest_sha256,
+                    }
+                ):
+                    invalid("complete bundle projection differs")
+                complete_rows.append({
+                    "replay_id": replay_id,
+                    "run_id": manifest["run_id"],
+                    "run_manifest_sha256": manifest[
+                        "run_manifest_sha256"
+                    ],
+                })
+                complete_pointer_cores[replay_id] = dict(pointer_core)
+                route_publication._verify_directory_entry_snapshot(
+                    complete_fd, replay_id, bundle_details,
+                    "historical complete bundle",
+                )
+            except BaseException as error:
+                if bundle_fd is not None:
+                    close_child(bundle_fd, error)
+                raise
+            if bundle_fd is not None:
+                close_child(bundle_fd)
+
+        core_names = tuple(sorted(os.listdir(core_bundles_fd)))
+        if any(
+            re.fullmatch(r"cohort:[0-9a-f]{64}", name) is None
+            for name in core_names
+        ):
+            invalid("core bundle name differs")
+        core_rows = []
+        core_projections = {}
+        for route_cohort_id in core_names:
+            bundle_fd = None
+            try:
+                bundle_fd, bundle_details = (
+                    route_publication._open_directory_at(
+                        core_bundles_fd, route_cohort_id,
+                        "historical core bundle",
+                    )
+                )
+                manifest_bytes, manifest_sha256, _manifest_details = (
+                    route_publication._read_bounded_bytes_at(
+                        bundle_fd, "manifest.json",
+                        limit=route_publication._MAX_JSON_BYTES,
+                        label="historical core manifest",
+                    )
+                )
+                manifest = exact_json(
+                    manifest_bytes, publication._json_file_bytes
+                )
+                if (
+                    manifest.get("schema")
+                    != "route_historical_replay_core_manifest/v1"
+                    or manifest.get("bundle_stage")
+                    != "route_historical_replay_core/v1"
+                    or manifest.get("route_cohort_id") != route_cohort_id
+                    or re.fullmatch(
+                        r"run:[0-9a-f]{64}",
+                        manifest.get("raw_evidence_run_id", ""),
+                    ) is None
+                    or not exact_sha256(
+                        manifest.get("raw_run_manifest_sha256")
+                    )
+                ):
+                    invalid("core manifest schema differs")
+                expected_pointer = publication._pointer(
+                    manifest, manifest_sha256
+                )
+                expected_pointer_sha256 = hashlib.sha256(
+                    publication._json_file_bytes(expected_pointer)
+                ).hexdigest()
+                context = (
+                    publication._load_immutable_historical_replay_core(
+                        data_dir=data,
+                        route_cohort_id=route_cohort_id,
+                        expected_manifest_sha256=manifest_sha256,
+                        expected_pointer_sha256=expected_pointer_sha256,
+                    )
+                )
+                handles.append(context)
+                context.reread_unchanged()
+                projection = dict(context.identity_projection())
+                if (
+                    projection.get("run_id")
+                    != manifest["raw_evidence_run_id"]
+                    or projection.get("run_manifest_sha256")
+                    != manifest["raw_run_manifest_sha256"]
+                    or projection.get("core_manifest_sha256")
+                    != manifest_sha256
+                    or projection.get("core_pointer_sha256")
+                    != expected_pointer_sha256
+                    or not isinstance(
+                        projection.get("core_pointer"), Mapping
+                    )
+                    or dict(projection["core_pointer"])
+                    != expected_pointer
+                ):
+                    invalid("core projection differs")
+                core_rows.append({
+                    "route_cohort_id": route_cohort_id,
+                    "run_id": manifest["raw_evidence_run_id"],
+                    "run_manifest_sha256": manifest[
+                        "raw_run_manifest_sha256"
+                    ],
+                })
+                core_projections[route_cohort_id] = projection
+                route_publication._verify_directory_entry_snapshot(
+                    core_bundles_fd, route_cohort_id, bundle_details,
+                    "historical core bundle",
+                )
+            except BaseException as error:
+                if bundle_fd is not None:
+                    close_child(bundle_fd, error)
+                raise
+            if bundle_fd is not None:
+                close_child(bundle_fd)
+
+        report_names = tuple(sorted(os.listdir(reports_fd)))
+        if any(
+            re.fullmatch(r"[0-9a-f]{64}\.json", name) is None
+            for name in report_names
+        ):
+            invalid("verification report name differs")
+        report_rows = []
+        report_payloads = {}
+        report_details_by_sha = {}
+        for filename in report_names:
+            report_sha256 = filename[:-5]
+            report_bytes, physical_sha256, report_details = (
+                route_publication._read_bounded_bytes_at(
+                    reports_fd, filename, limit=verifier._MAX_REPORT_BYTES,
+                    label="historical verification report",
+                )
+            )
+            if physical_sha256 != report_sha256:
+                invalid("verification report hash differs")
+            report = verifier._validate_exact_historical_verification_report(
+                report_bytes
+            )
+            if not isinstance(report, Mapping):
+                invalid("verification report projection differs")
+            report_pointer_core = {
+                "schema": "route_historical_replay_pointer/v1",
+                "bundle_stage": "route_historical_foundry_replay/v1",
+                "replay_id": report.get("replay_id"),
+                "route_cohort_id": report.get("route_cohort_id"),
+                "manifest_sha256": report.get("manifest_sha256"),
+            }
+            verifier._validate_retained_historical_verification_report(
+                report_bytes=report_bytes,
+                pointer_core=report_pointer_core,
+            )
+            report_rows.append({"sha256": report_sha256})
+            report_payloads[report_sha256] = report_bytes
+            report_details_by_sha[report_sha256] = report_details
+
+        core_pointer_row = None
+        if core_pointer is not None:
+            route_cohort_id = core_pointer["route_cohort_id"]
+            if (
+                route_cohort_id not in core_projections
+                or core_projections[route_cohort_id].get(
+                    "core_manifest_sha256"
+                ) != core_pointer["manifest_sha256"]
+                or dict(core_projections[route_cohort_id].get(
+                    "core_pointer", {}
+                )) != core_pointer
+            ):
+                invalid("current core target differs")
+            current_context = (
+                publication.load_latest_historical_replay_core(
+                    data_dir=data
+                )
+            )
+            handles.append(current_context)
+            current_context.reread_unchanged()
+            current_projection = dict(
+                current_context.identity_projection()
+            )
+            if (
+                current_projection.get("core_manifest_sha256")
+                != core_pointer["manifest_sha256"]
+                or not isinstance(
+                    current_projection.get("core_pointer"), Mapping
+                )
+                or dict(current_projection["core_pointer"])
+                != core_pointer
+            ):
+                invalid("current core projection differs")
+            core_pointer_row = {"route_cohort_id": route_cohort_id}
+
+        complete_pointer_row = None
+        if complete_pointer is not None:
+            replay_id = complete_pointer["replay_id"]
+            report_sha256 = complete_pointer[
+                "verification_report_sha256"
+            ]
+            if (
+                replay_id not in complete_pointer_cores
+                or complete_pointer_cores[replay_id]
+                != complete_pointer_core
+                or report_sha256 not in report_payloads
+            ):
+                invalid("current complete target differs")
+            retained_report = (
+                publication._reread_historical_verification_report(
+                    data_dir=data, final_pointer=complete_pointer
+                )
+            )
+            if retained_report != report_payloads[report_sha256]:
+                invalid("current verification report differs")
+            complete_pointer_row = {
+                "replay_id": replay_id,
+                "verification_report_sha256": report_sha256,
+            }
+
+        for handle in handles:
+            handle.reread_unchanged()
+        for report_sha256, expected_payload in report_payloads.items():
+            payload, physical_sha256, details = (
+                route_publication._read_bounded_bytes_at(
+                    reports_fd, report_sha256 + ".json",
+                    limit=verifier._MAX_REPORT_BYTES,
+                    label="historical verification report",
+                )
+            )
+            if (
+                payload != expected_payload
+                or physical_sha256 != report_sha256
+                or route_publication._stable_file_metadata(details)
+                != route_publication._stable_file_metadata(
+                    report_details_by_sha[report_sha256]
+                )
+            ):
+                invalid("verification report changed")
+        if (
+            tuple(sorted(os.listdir(raw_fd))) != raw_names
+            or tuple(sorted(os.listdir(complete_fd))) != complete_names
+            or tuple(sorted(os.listdir(core_bundles_fd))) != core_names
+            or tuple(sorted(os.listdir(reports_fd))) != report_names
+            or not publication._snapshot_matches(
+                route_publication._optional_pointer_snapshot_at(
+                    historical_fd
+                ),
+                complete_pointer_snapshot,
+            )
+            or not publication._snapshot_matches(
+                route_publication._optional_pointer_snapshot_at(core_fd),
+                core_pointer_snapshot,
+            )
+        ):
+            invalid("historical inventory changed")
+        route_publication._verify_open_path_snapshot(
+            raw_root, raw_details, "historical raw run inventory"
+        )
+        route_publication._verify_directory_entry_snapshot(
+            historical_fd, "bundles", complete_details,
+            "historical complete bundle inventory",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            historical_fd, "core", core_details,
+            "historical core inventory",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            core_fd, "bundles", core_bundles_details,
+            "historical core bundle inventory",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            historical_fd, "verifications", verification_details,
+            "historical verification inventory",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            verification_fd, "by-sha256", reports_details,
+            "historical verification report inventory",
+        )
+        route_publication._verify_open_path_snapshot(
+            historical_root, historical_details,
+            "historical reference inventory root",
+        )
+        result = {
+            "schema": "historical_reference_gc_validated_inventory/v1",
+            "status": "validated",
+            "complete_bundles": tuple(complete_rows),
+            "core_bundles": tuple(core_rows),
+            "historical_pointers": {
+                "core": core_pointer_row,
+                "complete": complete_pointer_row,
+            },
+            "raw_runs": tuple(raw_rows),
+            "verification_reports": tuple(report_rows),
+        }
+    except BaseException as error:
+        original_error = error
+    finally:
+        cleanup_error = _close_historical_controller_resources(handles)
+        try:
+            _close_descriptor_inventory(descriptors)
+        except BaseException as error:
+            if cleanup_error is None or (
+                isinstance(cleanup_error, Exception)
+                and not isinstance(error, Exception)
+            ):
+                cleanup_error = error
+    if original_error is not None:
+        if not isinstance(original_error, Exception):
+            _raise_after_cleanup(original_error, cleanup_error)
+        if cleanup_error is not None and not isinstance(
+            cleanup_error, Exception
+        ):
+            raise cleanup_error from original_error
+        return _invalid_historical_reference_gc_inventory()
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        return _invalid_historical_reference_gc_inventory()
+    if result is None:
+        return _invalid_historical_reference_gc_inventory()
+    return result
+
+
+def _plan_historical_reference_gc_inventory(
+    inventory: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Derive deletion candidates only from a closed validated inventory."""
+
+    def blocked() -> Mapping[str, Any]:
+        return MappingProxyType({
+            "schema": "historical_reference_gc_plan/v1",
+            "status": "blocked_invalid_inventory",
+            "protected_runs": (),
+            "delete_runs": (),
+            "protected_reports": (),
+            "delete_reports": (),
+        })
+
+    def exact_sha256(value: Any) -> bool:
+        return (
+            type(value) is str
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        )
+
+    def exact_run(row: Any) -> bool:
+        return (
+            type(row) is dict
+            and set(row) == {"run_id", "run_manifest_sha256"}
+            and type(row.get("run_id")) is str
+            and re.fullmatch(r"run:[0-9a-f]{64}", row["run_id"])
+            is not None
+            and exact_sha256(row.get("run_manifest_sha256"))
+        )
+
+    try:
+        if (
+            type(inventory) is not dict
+            or set(inventory) != {
+                "schema", "status", "complete_bundles", "core_bundles",
+                "historical_pointers", "raw_runs",
+                "verification_reports",
+            }
+            or inventory.get("schema")
+            != "historical_reference_gc_validated_inventory/v1"
+            or inventory.get("status") != "validated"
+            or type(inventory.get("complete_bundles")) is not tuple
+            or type(inventory.get("core_bundles")) is not tuple
+            or type(inventory.get("raw_runs")) is not tuple
+            or type(inventory.get("verification_reports")) is not tuple
+            or type(inventory.get("historical_pointers")) is not dict
+            or set(inventory["historical_pointers"])
+            != {"core", "complete"}
+        ):
+            return blocked()
+
+        complete_by_id = {}
+        referenced_runs = set()
+        for row in inventory["complete_bundles"]:
+            if (
+                type(row) is not dict
+                or set(row) != {
+                    "replay_id", "run_id", "run_manifest_sha256"
+                }
+                or type(row.get("replay_id")) is not str
+                or re.fullmatch(
+                    r"replay:[0-9a-f]{64}", row["replay_id"]
+                ) is None
+                or not exact_run({
+                    "run_id": row.get("run_id"),
+                    "run_manifest_sha256": row.get(
+                        "run_manifest_sha256"
+                    ),
+                })
+                or row["replay_id"] in complete_by_id
+            ):
+                return blocked()
+            complete_by_id[row["replay_id"]] = row
+            referenced_runs.add((
+                row["run_id"], row["run_manifest_sha256"]
+            ))
+
+        core_by_id = {}
+        for row in inventory["core_bundles"]:
+            if (
+                type(row) is not dict
+                or set(row) != {
+                    "route_cohort_id", "run_id", "run_manifest_sha256"
+                }
+                or type(row.get("route_cohort_id")) is not str
+                or re.fullmatch(
+                    r"cohort:[0-9a-f]{64}", row["route_cohort_id"]
+                ) is None
+                or not exact_run({
+                    "run_id": row.get("run_id"),
+                    "run_manifest_sha256": row.get(
+                        "run_manifest_sha256"
+                    ),
+                })
+                or row["route_cohort_id"] in core_by_id
+            ):
+                return blocked()
+            core_by_id[row["route_cohort_id"]] = row
+            referenced_runs.add((
+                row["run_id"], row["run_manifest_sha256"]
+            ))
+
+        raw_by_id = {}
+        for row in inventory["raw_runs"]:
+            if not exact_run(row) or row["run_id"] in raw_by_id:
+                return blocked()
+            raw_by_id[row["run_id"]] = row
+        if any(
+            run_id not in raw_by_id
+            or raw_by_id[run_id]["run_manifest_sha256"] != manifest_sha
+            for run_id, manifest_sha in referenced_runs
+        ):
+            return blocked()
+
+        reports = {}
+        for row in inventory["verification_reports"]:
+            if (
+                type(row) is not dict
+                or set(row) != {"sha256"}
+                or not exact_sha256(row.get("sha256"))
+                or row["sha256"] in reports
+            ):
+                return blocked()
+            reports[row["sha256"]] = row
+
+        pointers = inventory["historical_pointers"]
+        core_pointer = pointers["core"]
+        if core_pointer is not None and (
+            type(core_pointer) is not dict
+            or set(core_pointer) != {"route_cohort_id"}
+            or core_pointer.get("route_cohort_id") not in core_by_id
+        ):
+            return blocked()
+        complete_pointer = pointers["complete"]
+        referenced_reports = set()
+        if complete_pointer is not None:
+            if (
+                type(complete_pointer) is not dict
+                or set(complete_pointer)
+                != {"replay_id", "verification_report_sha256"}
+                or complete_pointer.get("replay_id") not in complete_by_id
+                or not exact_sha256(complete_pointer.get(
+                    "verification_report_sha256"
+                ))
+                or complete_pointer["verification_report_sha256"]
+                not in reports
+            ):
+                return blocked()
+            referenced_reports.add(
+                complete_pointer["verification_report_sha256"]
+            )
+
+        protected_runs = tuple(
+            {
+                "run_id": run_id,
+                "run_manifest_sha256": manifest_sha,
+            }
+            for run_id, manifest_sha in sorted(referenced_runs)
+        )
+        delete_runs = tuple(
+            dict(raw_by_id[run_id])
+            for run_id in sorted(raw_by_id)
+            if (
+                run_id,
+                raw_by_id[run_id]["run_manifest_sha256"],
+            ) not in referenced_runs
+        )
+        protected_reports = tuple(
+            {"sha256": digest}
+            for digest in sorted(referenced_reports)
+        )
+        delete_reports = tuple(
+            {"sha256": digest}
+            for digest in sorted(set(reports) - referenced_reports)
+        )
+        return MappingProxyType({
+            "schema": "historical_reference_gc_plan/v1",
+            "status": "planned",
+            "protected_runs": protected_runs,
+            "delete_runs": delete_runs,
+            "protected_reports": protected_reports,
+            "delete_reports": delete_reports,
+        })
+    except Exception:
+        return blocked()
+
+
+def _historical_reference_gc_result(
+    *, status: str, deleted_runs: tuple = (),
+    deleted_reports: tuple = (),
+) -> Mapping[str, Any]:
+    return {
+        "schema": "historical_reference_gc_result/v1",
+        "status": status,
+        "deleted_runs": deleted_runs,
+        "deleted_reports": deleted_reports,
+    }
+
+
+def _validate_historical_gc_private_file(
+    details: os.stat_result,
+) -> None:
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_nlink != 1
+        or details.st_uid != os.geteuid()
+        or stat.S_IMODE(details.st_mode) != 0o600
+    ):
+        raise _entrypoint_error("historical GC candidate is unsafe")
+
+
+def _preflight_historical_gc_tree_at(
+    *, parent_fd: int, name: str,
+) -> Tuple[os.stat_result, Mapping[str, Any]]:
+    """Reject every link, special file, broad mode, and oversized tree."""
+    import scripts.route_publication as route_publication
+
+    visited = [0]
+    inventory = {}
+
+    def walk(directory_fd: int, depth: int, prefix: str) -> None:
+        if depth > 32:
+            raise _entrypoint_error(
+                "historical GC candidate is unsafe"
+            )
+        for entry in sorted(os.listdir(directory_fd)):
+            route_publication._require_relative_basename(
+                entry, "historical GC candidate member"
+            )
+            visited[0] += 1
+            if visited[0] > 250_000:
+                raise _entrypoint_error(
+                    "historical GC candidate is unsafe"
+                )
+            details = os.stat(
+                entry, dir_fd=directory_fd, follow_symlinks=False
+            )
+            relative_path = prefix + entry
+            if stat.S_ISDIR(details.st_mode):
+                if (
+                    details.st_uid != os.geteuid()
+                    or stat.S_IMODE(details.st_mode) != 0o700
+                ):
+                    raise _entrypoint_error(
+                        "historical GC candidate is unsafe"
+                    )
+                child_fd, opened = route_publication._open_directory_at(
+                    directory_fd, entry,
+                    "historical GC candidate directory",
+                )
+                try:
+                    if (
+                        route_publication._stable_file_metadata(opened)
+                        != route_publication._stable_file_metadata(details)
+                    ):
+                        raise _entrypoint_error(
+                            "historical GC candidate is unsafe"
+                        )
+                    walk(child_fd, depth + 1, relative_path + "/")
+                    route_publication._verify_directory_entry_snapshot(
+                        directory_fd, entry, opened,
+                        "historical GC candidate directory",
+                    )
+                    inventory[relative_path] = (
+                        "directory",
+                        route_publication._stable_file_metadata(opened),
+                    )
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(details.st_mode):
+                file_fd, opened = route_publication._open_regular_file_at(
+                    directory_fd, entry,
+                    label="historical GC candidate member",
+                )
+                try:
+                    _validate_historical_gc_private_file(opened)
+                    current = os.stat(
+                        entry, dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        route_publication._stable_file_metadata(current)
+                        != route_publication._stable_file_metadata(opened)
+                    ):
+                        raise _entrypoint_error(
+                            "historical GC candidate is unsafe"
+                        )
+                    inventory[relative_path] = (
+                        "file",
+                        route_publication._stable_file_metadata(opened),
+                    )
+                finally:
+                    os.close(file_fd)
+            else:
+                raise _entrypoint_error(
+                    "historical GC candidate is unsafe"
+                )
+
+    root_fd, root_details = route_publication._open_directory_at(
+        parent_fd, name, "historical GC candidate run"
+    )
+    try:
+        if (
+            root_details.st_uid != os.geteuid()
+            or stat.S_IMODE(root_details.st_mode) != 0o700
+        ):
+            raise _entrypoint_error(
+                "historical GC candidate is unsafe"
+            )
+        walk(root_fd, 0, "")
+        route_publication._verify_directory_entry_snapshot(
+            parent_fd, name, root_details,
+            "historical GC candidate run",
+        )
+        return root_details, MappingProxyType(dict(inventory))
+    finally:
+        os.close(root_fd)
+
+
+def _remove_historical_gc_tree_at(
+    *, parent_fd: int, name: str,
+    expected: os.stat_result, expected_inventory: Mapping[str, Any],
+) -> None:
+    """Remove only the already isolated private directory generation."""
+    import scripts.route_publication as route_publication
+
+    visited = [0]
+
+    def remove_contents(directory_fd: int, depth: int) -> None:
+        if depth > 32:
+            raise _entrypoint_error(
+                "historical GC deletion is uncertain"
+            )
+        for entry in sorted(os.listdir(directory_fd)):
+            route_publication._require_relative_basename(
+                entry, "historical GC isolated member"
+            )
+            visited[0] += 1
+            if visited[0] > 250_000:
+                raise _entrypoint_error(
+                    "historical GC deletion is uncertain"
+                )
+            details = os.stat(
+                entry, dir_fd=directory_fd, follow_symlinks=False
+            )
+            if stat.S_ISDIR(details.st_mode):
+                if (
+                    details.st_uid != os.geteuid()
+                    or stat.S_IMODE(details.st_mode) != 0o700
+                ):
+                    raise _entrypoint_error(
+                        "historical GC deletion is uncertain"
+                    )
+                child_fd, opened = route_publication._open_directory_at(
+                    directory_fd, entry,
+                    "historical GC isolated directory",
+                )
+                try:
+                    if (
+                        opened.st_dev != details.st_dev
+                        or opened.st_ino != details.st_ino
+                    ):
+                        raise _entrypoint_error(
+                            "historical GC deletion is uncertain"
+                        )
+                    remove_contents(child_fd, depth + 1)
+                    if os.listdir(child_fd):
+                        raise _entrypoint_error(
+                            "historical GC deletion is uncertain"
+                        )
+                finally:
+                    os.close(child_fd)
+                current = os.stat(
+                    entry, dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(current.st_mode)
+                    or current.st_dev != details.st_dev
+                    or current.st_ino != details.st_ino
+                ):
+                    raise _entrypoint_error(
+                        "historical GC deletion is uncertain"
+                    )
+                os.rmdir(entry, dir_fd=directory_fd)
+            elif stat.S_ISREG(details.st_mode):
+                file_fd, opened = route_publication._open_regular_file_at(
+                    directory_fd, entry,
+                    label="historical GC isolated member",
+                )
+                try:
+                    _validate_historical_gc_private_file(opened)
+                    current = os.stat(
+                        entry, dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        route_publication._stable_file_metadata(current)
+                        != route_publication._stable_file_metadata(opened)
+                    ):
+                        raise _entrypoint_error(
+                            "historical GC deletion is uncertain"
+                        )
+                    os.unlink(entry, dir_fd=directory_fd)
+                    if os.fstat(file_fd).st_nlink != 0:
+                        raise _entrypoint_error(
+                            "historical GC deletion is uncertain"
+                        )
+                finally:
+                    os.close(file_fd)
+            else:
+                raise _entrypoint_error(
+                    "historical GC deletion is uncertain"
+                )
+        os.fsync(directory_fd)
+
+    current, current_inventory = _preflight_historical_gc_tree_at(
+        parent_fd=parent_fd, name=name
+    )
+    if dict(current_inventory) != dict(expected_inventory):
+        raise _entrypoint_error("historical GC deletion is uncertain")
+    root_fd, opened_root = route_publication._open_directory_at(
+        parent_fd, name, "historical GC isolated run"
+    )
+    try:
+        if (
+            current.st_dev != expected.st_dev
+            or current.st_ino != expected.st_ino
+            or opened_root.st_dev != current.st_dev
+            or opened_root.st_ino != current.st_ino
+        ):
+            raise _entrypoint_error(
+                "historical GC deletion is uncertain"
+            )
+        remove_contents(root_fd, 0)
+        if os.listdir(root_fd):
+            raise _entrypoint_error(
+                "historical GC deletion is uncertain"
+            )
+    finally:
+        os.close(root_fd)
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_dev != expected.st_dev
+        or current.st_ino != expected.st_ino
+    ):
+        raise _entrypoint_error("historical GC deletion is uncertain")
+    os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def _apply_historical_reference_gc(
+    *, data_dir: Path,
+) -> Mapping[str, Any]:
+    """Inventory, plan, isolate, and delete unreferenced evidence once."""
+    import scripts.historical_foundry_storage as storage
+    import scripts.historical_foundry_verifier as verifier
+    import scripts.historical_route_publication as publication
+    import scripts.route_publication as route_publication
+
+    if not isinstance(data_dir, Path):
+        return _historical_reference_gc_result(
+            status="blocked_invalid_inventory"
+        )
+
+    descriptors = []
+    moved = []
+    deletion_started = False
+
+    def close_descriptors() -> None:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def references_unchanged(
+        *, historical_fd: int, core_fd: int,
+        complete_fd: int, core_bundles_fd: int,
+        complete_pointer_snapshot: Any,
+        core_pointer_snapshot: Any,
+        complete_names: tuple, core_names: tuple,
+    ) -> bool:
+        return (
+            tuple(sorted(os.listdir(complete_fd))) == complete_names
+            and tuple(sorted(os.listdir(core_bundles_fd))) == core_names
+            and publication._snapshot_matches(
+                route_publication._optional_pointer_snapshot_at(
+                    historical_fd
+                ),
+                complete_pointer_snapshot,
+            )
+            and publication._snapshot_matches(
+                route_publication._optional_pointer_snapshot_at(core_fd),
+                core_pointer_snapshot,
+            )
+        )
+
+    def rollback_moves() -> None:
+        rollback_error = None
+        for row in reversed(moved):
+            try:
+                current = os.stat(
+                    row["hidden"], dir_fd=row["parent_fd"],
+                    follow_symlinks=False,
+                )
+                if (
+                    current.st_dev != row["details"].st_dev
+                    or current.st_ino != row["details"].st_ino
+                ):
+                    raise _entrypoint_error(
+                        "historical GC rollback is uncertain"
+                    )
+                route_publication._rename_directory_noreplace_at(
+                    row["parent_fd"], row["hidden"],
+                    row["parent_fd"], row["original"],
+                    destination_display=row["display_parent"]
+                    / row["original"],
+                )
+            except BaseException as error:
+                if rollback_error is None or (
+                    isinstance(rollback_error, Exception)
+                    and not isinstance(error, Exception)
+                ):
+                    rollback_error = error
+        for parent_fd in {row["parent_fd"] for row in moved}:
+            try:
+                os.fsync(parent_fd)
+            except BaseException as error:
+                if rollback_error is None or (
+                    isinstance(rollback_error, Exception)
+                    and not isinstance(error, Exception)
+                ):
+                    rollback_error = error
+        moved[:] = []
+        if rollback_error is not None:
+            if not isinstance(rollback_error, Exception):
+                raise rollback_error
+            raise _entrypoint_error(
+                "historical GC rollback is uncertain"
+            ) from rollback_error
+
+    try:
+        data = route_publication._absolute_without_symlink_resolution(
+            data_dir
+        )
+        historical_root, historical_fd, historical_details = (
+            route_publication._open_verified_directory(
+                data / "routes" / "historical",
+                "historical GC root",
+            )
+        )
+        descriptors.append(historical_fd)
+        fcntl.flock(historical_fd, fcntl.LOCK_EX)
+        core_fd, core_details = route_publication._open_directory_at(
+            historical_fd, "core", "historical GC core root"
+        )
+        descriptors.append(core_fd)
+        fcntl.flock(core_fd, fcntl.LOCK_EX)
+        complete_fd, complete_details = (
+            route_publication._open_directory_at(
+                historical_fd, "bundles",
+                "historical GC complete bundles",
+            )
+        )
+        descriptors.append(complete_fd)
+        core_bundles_fd, core_bundles_details = (
+            route_publication._open_directory_at(
+                core_fd, "bundles", "historical GC core bundles"
+            )
+        )
+        descriptors.append(core_bundles_fd)
+        complete_pointer_snapshot = (
+            route_publication._optional_pointer_snapshot_at(historical_fd)
+        )
+        core_pointer_snapshot = (
+            route_publication._optional_pointer_snapshot_at(core_fd)
+        )
+
+        inventory = (
+            _build_validated_historical_reference_gc_inventory_impl(
+                data_dir=data, acquire_root_locks=False
+            )
+        )
+        plan = _plan_historical_reference_gc_inventory(inventory)
+        if plan.get("status") != "planned":
+            return _historical_reference_gc_result(
+                status="blocked_invalid_inventory"
+            )
+        complete_names = tuple(sorted(
+            row["replay_id"] for row in inventory["complete_bundles"]
+        ))
+        core_names = tuple(sorted(
+            row["route_cohort_id"]
+            for row in inventory["core_bundles"]
+        ))
+        if not references_unchanged(
+            historical_fd=historical_fd, core_fd=core_fd,
+            complete_fd=complete_fd,
+            core_bundles_fd=core_bundles_fd,
+            complete_pointer_snapshot=complete_pointer_snapshot,
+            core_pointer_snapshot=core_pointer_snapshot,
+            complete_names=complete_names, core_names=core_names,
+        ):
+            return _historical_reference_gc_result(
+                status="blocked_validation"
+            )
+
+        raw_root, raw_fd, raw_details = (
+            route_publication._open_verified_directory(
+                data / "raw" / "historical-foundry-replay",
+                "historical GC raw root",
+            )
+        )
+        descriptors.append(raw_fd)
+        verification_fd, verification_details = (
+            route_publication._open_directory_at(
+                historical_fd, "verifications",
+                "historical GC verification root",
+            )
+        )
+        descriptors.append(verification_fd)
+        reports_fd, reports_details = route_publication._open_directory_at(
+            verification_fd, "by-sha256",
+            "historical GC verification reports",
+        )
+        descriptors.append(reports_fd)
+        raw_inventory_names = tuple(sorted(
+            row["run_id"][4:] for row in inventory["raw_runs"]
+        ))
+        report_inventory_names = tuple(sorted(
+            row["sha256"] + ".json"
+            for row in inventory["verification_reports"]
+        ))
+        if (
+            tuple(sorted(os.listdir(raw_fd))) != raw_inventory_names
+            or tuple(sorted(os.listdir(reports_fd)))
+            != report_inventory_names
+        ):
+            return _historical_reference_gc_result(
+                status="blocked_validation"
+            )
+
+        raw_candidates = []
+        for row in plan["delete_runs"]:
+            name = row["run_id"][4:]
+            candidate_details, candidate_inventory = (
+                _preflight_historical_gc_tree_at(
+                parent_fd=raw_fd, name=name
+                )
+            )
+            run_fd, opened = route_publication._open_directory_at(
+                raw_fd, name, "historical GC raw candidate"
+            )
+            try:
+                _payload, manifest_sha256, _manifest_details = (
+                    route_publication._read_bounded_bytes_at(
+                        run_fd, "run_manifest.json", limit=8_388_608,
+                        label="historical GC raw manifest",
+                    )
+                )
+            finally:
+                os.close(run_fd)
+            if (
+                manifest_sha256 != row["run_manifest_sha256"]
+                or route_publication._stable_file_metadata(opened)
+                != route_publication._stable_file_metadata(
+                    candidate_details
+                )
+            ):
+                raise _entrypoint_error(
+                    "historical GC candidate changed"
+                )
+            snapshot = storage.open_validated_run(
+                data_dir=data, run_id=row["run_id"],
+                expected_manifest_sha256=row["run_manifest_sha256"],
+            )
+            try:
+                snapshot.reread_unchanged()
+                projection = dict(snapshot.identity_projection())
+                if (
+                    projection.get("run_id") != row["run_id"]
+                    or projection.get("run_manifest_sha256")
+                    != row["run_manifest_sha256"]
+                ):
+                    raise _entrypoint_error(
+                        "historical GC candidate changed"
+                    )
+                snapshot.reread_unchanged()
+            finally:
+                snapshot.close()
+            raw_candidates.append({
+                "row": dict(row), "name": name,
+                "details": candidate_details,
+                "inventory": candidate_inventory,
+            })
+
+        report_candidates = []
+        for row in plan["delete_reports"]:
+            report_sha256 = row["sha256"]
+            filename = report_sha256 + ".json"
+            report_bytes, physical_sha256, report_details = (
+                route_publication._read_bounded_bytes_at(
+                    reports_fd, filename,
+                    limit=verifier._MAX_REPORT_BYTES,
+                    label="historical GC verification report",
+                )
+            )
+            _validate_historical_gc_private_file(report_details)
+            if physical_sha256 != report_sha256:
+                raise _entrypoint_error(
+                    "historical GC report changed"
+                )
+            report = verifier._validate_exact_historical_verification_report(
+                report_bytes
+            )
+            report_pointer_core = {
+                "schema": "route_historical_replay_pointer/v1",
+                "bundle_stage": "route_historical_foundry_replay/v1",
+                "replay_id": report.get("replay_id"),
+                "route_cohort_id": report.get("route_cohort_id"),
+                "manifest_sha256": report.get("manifest_sha256"),
+            }
+            verifier._validate_retained_historical_verification_report(
+                report_bytes=report_bytes,
+                pointer_core=report_pointer_core,
+            )
+            report_candidates.append({
+                "row": dict(row), "name": filename,
+                "details": report_details, "bytes": report_bytes,
+            })
+
+        if not references_unchanged(
+            historical_fd=historical_fd, core_fd=core_fd,
+            complete_fd=complete_fd,
+            core_bundles_fd=core_bundles_fd,
+            complete_pointer_snapshot=complete_pointer_snapshot,
+            core_pointer_snapshot=core_pointer_snapshot,
+            complete_names=complete_names, core_names=core_names,
+        ):
+            return _historical_reference_gc_result(
+                status="blocked_validation"
+            )
+        route_publication._verify_open_path_snapshot(
+            raw_root, raw_details, "historical GC raw root"
+        )
+        route_publication._verify_directory_entry_snapshot(
+            historical_fd, "bundles", complete_details,
+            "historical GC complete bundles",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            historical_fd, "core", core_details,
+            "historical GC core root",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            core_fd, "bundles", core_bundles_details,
+            "historical GC core bundles",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            historical_fd, "verifications", verification_details,
+            "historical GC verification root",
+        )
+        route_publication._verify_directory_entry_snapshot(
+            verification_fd, "by-sha256", reports_details,
+            "historical GC verification reports",
+        )
+        route_publication._verify_open_path_identity(
+            historical_root, historical_details, "historical GC root"
+        )
+
+        for candidate in raw_candidates:
+            current, current_inventory = (
+                _preflight_historical_gc_tree_at(
+                parent_fd=raw_fd, name=candidate["name"]
+                )
+            )
+            if (
+                route_publication._stable_file_metadata(current)
+                != route_publication._stable_file_metadata(
+                    candidate["details"]
+                )
+                or dict(current_inventory)
+                != dict(candidate["inventory"])
+            ):
+                raise _entrypoint_error(
+                    "historical GC candidate changed"
+                )
+            hidden = ".historical-gc-run-" + candidate["name"]
+            route_publication._rename_directory_noreplace_at(
+                raw_fd, candidate["name"], raw_fd, hidden,
+                destination_display=raw_root / hidden,
+            )
+            moved_row = {
+                "kind": "run", "parent_fd": raw_fd,
+                "display_parent": raw_root,
+                "original": candidate["name"], "hidden": hidden,
+                "details": current, "candidate": candidate,
+                "inventory": current_inventory,
+            }
+            moved.append(moved_row)
+            isolated = os.stat(
+                hidden, dir_fd=raw_fd, follow_symlinks=False
+            )
+            if (
+                isolated.st_dev != current.st_dev
+                or isolated.st_ino != current.st_ino
+            ):
+                raise _entrypoint_error(
+                    "historical GC isolation is uncertain"
+                )
+            moved_row["details"] = isolated
+
+        for candidate in report_candidates:
+            filename = candidate["name"]
+            file_fd, current = route_publication._open_regular_file_at(
+                reports_fd, filename,
+                label="historical GC report candidate",
+            )
+            try:
+                if (
+                    route_publication._stable_file_metadata(current)
+                    != route_publication._stable_file_metadata(
+                        candidate["details"]
+                    )
+                ):
+                    raise _entrypoint_error(
+                        "historical GC report changed"
+                    )
+            finally:
+                os.close(file_fd)
+            hidden = ".historical-gc-report-" + filename
+            route_publication._rename_directory_noreplace_at(
+                reports_fd, filename, reports_fd, hidden,
+                destination_display=(
+                    historical_root / "verifications" / "by-sha256"
+                    / hidden
+                ),
+            )
+            moved_row = {
+                "kind": "report", "parent_fd": reports_fd,
+                "display_parent": (
+                    historical_root / "verifications" / "by-sha256"
+                ),
+                "original": filename, "hidden": hidden,
+                "details": current, "candidate": candidate,
+            }
+            moved.append(moved_row)
+            isolated = os.stat(
+                hidden, dir_fd=reports_fd, follow_symlinks=False
+            )
+            if (
+                isolated.st_dev != current.st_dev
+                or isolated.st_ino != current.st_ino
+            ):
+                raise _entrypoint_error(
+                    "historical GC isolation is uncertain"
+                )
+            moved_row["details"] = isolated
+        os.fsync(raw_fd)
+        os.fsync(reports_fd)
+
+        if not references_unchanged(
+            historical_fd=historical_fd, core_fd=core_fd,
+            complete_fd=complete_fd,
+            core_bundles_fd=core_bundles_fd,
+            complete_pointer_snapshot=complete_pointer_snapshot,
+            core_pointer_snapshot=core_pointer_snapshot,
+            complete_names=complete_names, core_names=core_names,
+        ):
+            raise _entrypoint_error(
+                "historical GC references changed"
+            )
+
+        for row in moved:
+            if row["kind"] == "run":
+                isolated, isolated_inventory = (
+                    _preflight_historical_gc_tree_at(
+                        parent_fd=raw_fd, name=row["hidden"]
+                    )
+                )
+                if (
+                    isolated.st_dev != row["details"].st_dev
+                    or isolated.st_ino != row["details"].st_ino
+                    or dict(isolated_inventory)
+                    != dict(row["inventory"])
+                ):
+                    raise _entrypoint_error(
+                        "historical GC isolation is uncertain"
+                    )
+            else:
+                candidate = row["candidate"]
+                payload, digest, isolated = (
+                    route_publication._read_bounded_bytes_at(
+                        reports_fd, row["hidden"],
+                        limit=verifier._MAX_REPORT_BYTES,
+                        label="historical GC isolated report",
+                    )
+                )
+                _validate_historical_gc_private_file(isolated)
+                if (
+                    payload != candidate["bytes"]
+                    or digest != candidate["row"]["sha256"]
+                    or isolated.st_dev != row["details"].st_dev
+                    or isolated.st_ino != row["details"].st_ino
+                ):
+                    raise _entrypoint_error(
+                        "historical GC isolation is uncertain"
+                    )
+
+        deletion_started = True
+        for row in tuple(moved):
+            if row["kind"] == "report":
+                candidate = row["candidate"]
+                payload, digest, current = (
+                    route_publication._read_bounded_bytes_at(
+                        reports_fd, row["hidden"],
+                        limit=verifier._MAX_REPORT_BYTES,
+                        label="historical GC isolated report",
+                    )
+                )
+                if (
+                    payload != candidate["bytes"]
+                    or digest != candidate["row"]["sha256"]
+                    or current.st_dev != row["details"].st_dev
+                    or current.st_ino != row["details"].st_ino
+                ):
+                    raise _entrypoint_error(
+                        "historical GC deletion is uncertain"
+                    )
+                _validate_historical_gc_private_file(current)
+                os.unlink(row["hidden"], dir_fd=reports_fd)
+                os.fsync(reports_fd)
+            else:
+                _remove_historical_gc_tree_at(
+                    parent_fd=raw_fd, name=row["hidden"],
+                    expected=row["details"],
+                    expected_inventory=row["inventory"],
+                )
+            moved.remove(row)
+        route_publication._verify_open_path_identity(
+            historical_root, historical_details, "historical GC root"
+        )
+        if not references_unchanged(
+            historical_fd=historical_fd, core_fd=core_fd,
+            complete_fd=complete_fd,
+            core_bundles_fd=core_bundles_fd,
+            complete_pointer_snapshot=complete_pointer_snapshot,
+            core_pointer_snapshot=core_pointer_snapshot,
+            complete_names=complete_names, core_names=core_names,
+        ):
+            raise _entrypoint_error(
+                "historical GC deletion is uncertain"
+            )
+        return _historical_reference_gc_result(
+            status="applied",
+            deleted_runs=tuple(dict(row) for row in plan["delete_runs"]),
+            deleted_reports=tuple(
+                dict(row) for row in plan["delete_reports"]
+            ),
+        )
+    except BaseException as error:
+        if moved and not deletion_started:
+            try:
+                rollback_moves()
+            except BaseException as rollback_error:
+                if not isinstance(error, Exception):
+                    raise error from rollback_error
+                raise rollback_error from error
+        if not isinstance(error, Exception):
+            raise
+        if deletion_started:
+            if isinstance(error, HistoricalReplayEntrypointError):
+                raise
+            raise _entrypoint_error(
+                "historical GC deletion is uncertain"
+            ) from error
+        return _historical_reference_gc_result(
+            status="blocked_validation"
+        )
+    finally:
+        close_descriptors()
+
+
+def _audit_latest_historical_replay_bundle(
+    *, data_dir: Path, bundle_path: Path,
+) -> Mapping[str, Any]:
+    """Audit only the bundle pinned by the current historical pointer."""
+    import scripts.historical_foundry_verifier as verifier
+    import scripts.historical_route_publication as publication
+    import scripts.route_publication as route_publication
+
+    if (
+        not isinstance(data_dir, Path)
+        or not isinstance(bundle_path, Path)
+        or not bundle_path.is_absolute()
+    ):
+        raise _entrypoint_error("historical audit input is invalid")
+    historical_fd = None
+    locked = False
+    subject = None
+    result = None
+    original_error = None
+    try:
+        data = route_publication._absolute_without_symlink_resolution(
+            data_dir
+        )
+        requested_bundle = (
+            route_publication._absolute_without_symlink_resolution(
+                bundle_path
+            )
+        )
+        historical_root, historical_fd, historical_details = (
+            route_publication._open_verified_directory(
+                data / "routes" / "historical",
+                "historical audit root",
+            )
+        )
+        fcntl.flock(historical_fd, fcntl.LOCK_SH)
+        locked = True
+        pointer_before = route_publication._optional_pointer_snapshot_at(
+            historical_fd
+        )
+        if pointer_before is None:
+            raise _entrypoint_error(
+                "current historical pointer is missing"
+            )
+        pointer_bytes = pointer_before[0]
+        try:
+            pointer = json.loads(pointer_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise _entrypoint_error(
+                "current historical pointer is invalid"
+            ) from error
+        if (
+            type(pointer) is not dict
+            or publication._canonical_bytes(pointer) != pointer_bytes
+        ):
+            raise _entrypoint_error(
+                "current historical pointer is invalid"
+            )
+        pointer_core = dict(
+            verifier.historical_replay_pointer_core(pointer)
+        )
+        expected_bundle = (
+            historical_root / "bundles" / pointer_core["replay_id"]
+        )
+        if requested_bundle != expected_bundle:
+            raise _entrypoint_error(
+                "bundle is not the current historical pointer directory"
+            )
+        validated = publication.validate_historical_replay_bundle(
+            data_dir=data,
+            raw_root=(data / "raw" / "historical-foundry-replay"),
+            bundle_path=requested_bundle,
+            expected_pointer_core=pointer_core,
+        )
+        if not isinstance(validated, Mapping):
+            raise _entrypoint_error(
+                "historical audit bundle is invalid"
+            )
+        subject = validated.get("verification_subject")
+        manifest = validated.get("manifest")
+        if (
+            subject is None
+            or validated.get("path") != requested_bundle
+            or validated.get("replay_id") != pointer_core["replay_id"]
+            or validated.get("manifest_sha256")
+            != pointer_core["manifest_sha256"]
+            or not isinstance(validated.get("pointer_core"), Mapping)
+            or dict(validated["pointer_core"]) != pointer_core
+            or not isinstance(manifest, Mapping)
+        ):
+            raise _entrypoint_error(
+                "historical audit bundle is invalid"
+            )
+        report_before = (
+            publication._reread_historical_verification_report(
+                data_dir=data, final_pointer=pointer
+            )
+        )
+        if (
+            type(report_before) is not bytes
+            or hashlib.sha256(report_before).hexdigest()
+            != pointer["verification_report_sha256"]
+        ):
+            raise _entrypoint_error(
+                "historical retained verification report is invalid"
+            )
+        subject.reread_unchanged()
+        verification = verifier.run_connected_historical_verification(
+            subject, mode="audit"
+        )
+        subject.reread_unchanged()
+        if not isinstance(verification, Mapping):
+            raise _entrypoint_error(
+                "historical audit verification result is invalid"
+            )
+        audit_report = verification.get("report")
+        audit_report_bytes = verification.get("report_bytes")
+        audit_report_sha256 = verification.get("report_sha256")
+        audit_pointer = verification.get("final_pointer")
+        audit_pointer_bytes = verification.get("final_pointer_bytes")
+        if (
+            verification.get("schema")
+            != "historical_connected_verification_result/v1"
+            or verification.get("mode") != "audit"
+            or verification.get("install_result") is not None
+            or not isinstance(audit_report, Mapping)
+            or audit_report.get("status") != "verified"
+            or audit_report.get("evidence_mode")
+            != "production_connected"
+            or type(audit_report_bytes) is not bytes
+            or verifier._canonical_bytes(dict(audit_report))
+            != audit_report_bytes
+            or type(audit_report_sha256) is not str
+            or hashlib.sha256(audit_report_bytes).hexdigest()
+            != audit_report_sha256
+            or not isinstance(verification.get("pointer_core"), Mapping)
+            or dict(verification["pointer_core"]) != pointer_core
+            or not isinstance(audit_pointer, Mapping)
+            or type(audit_pointer_bytes) is not bytes
+            or publication._canonical_bytes(dict(audit_pointer))
+            != audit_pointer_bytes
+            or audit_pointer.get("verification_report_sha256")
+            != audit_report_sha256
+            or dict(verifier.historical_replay_pointer_core(
+                audit_pointer
+            )) != pointer_core
+        ):
+            raise _entrypoint_error(
+                "historical audit verification result is invalid"
+            )
+        verifier._require_historical_audit_report_parity(
+            retained_report_bytes=report_before,
+            audit_report=audit_report,
+        )
+        report_after = publication._reread_historical_verification_report(
+            data_dir=data, final_pointer=pointer
+        )
+        pointer_after = route_publication._optional_pointer_snapshot_at(
+            historical_fd
+        )
+        route_publication._verify_open_path_identity(
+            historical_root,
+            historical_details,
+            "historical audit root",
+        )
+        if (
+            report_after != report_before
+            or not publication._snapshot_matches(
+                pointer_after, pointer_before
+            )
+        ):
+            raise _entrypoint_error(
+                "historical audit changed during verification"
+            )
+        run_id = manifest.get("run_id")
+        run_manifest_sha256 = manifest.get("run_manifest_sha256")
+        if type(run_id) is not str or type(run_manifest_sha256) is not str:
+            raise _entrypoint_error(
+                "historical audit bundle is invalid"
+            )
+        result = MappingProxyType({
+            "status": "verified",
+            "run_identity": {
+                "run_id": run_id,
+                "run_manifest_sha256": run_manifest_sha256,
+            },
+            "bundle": {
+                "replay_id": pointer_core["replay_id"],
+                "manifest_sha256": pointer_core["manifest_sha256"],
+                "pointer_core": pointer_core,
+            },
+            "verification": {
+                "retained_report_sha256": pointer[
+                    "verification_report_sha256"
+                ],
+                "audit_report_sha256": audit_report_sha256,
+                "audit_final_pointer": dict(audit_pointer),
+            },
+            "published_pointer": dict(pointer),
+        })
+    except BaseException as error:
+        original_error = error
+
+    cleanup_error = _close_historical_controller_resources((subject,))
+    if locked and historical_fd is not None:
+        try:
+            fcntl.flock(historical_fd, fcntl.LOCK_UN)
+        except BaseException as error:
+            if cleanup_error is None or (
+                isinstance(cleanup_error, Exception)
+                and not isinstance(error, Exception)
+            ):
+                cleanup_error = error
+    if historical_fd is not None:
+        try:
+            os.close(historical_fd)
+        except BaseException as error:
+            if cleanup_error is None or (
+                isinstance(cleanup_error, Exception)
+                and not isinstance(error, Exception)
+            ):
+                cleanup_error = error
+    if original_error is not None:
+        if not isinstance(original_error, Exception):
+            raise original_error from cleanup_error
+        if cleanup_error is not None and not isinstance(
+            cleanup_error, Exception
+        ):
+            raise cleanup_error from original_error
+        if isinstance(original_error, HistoricalReplayEntrypointError):
+            raise original_error
+        raise _entrypoint_error("historical audit failed") from original_error
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        raise _entrypoint_error(
+            "historical audit cleanup failed"
+        ) from cleanup_error
+    if result is None:
+        raise _entrypoint_error("historical audit failed")
+    return result
+
+
+def _invoke_production_controller(
+    arguments: argparse.Namespace, preflight: Any,
+) -> Mapping[str, Any]:
+    if type(arguments) is not argparse.Namespace:
+        raise _entrypoint_error(
+            "historical production controller is unavailable"
+        )
+    if arguments.command == "scan":
+        valid_arguments = (
+            set(vars(arguments))
+            == {"command", "data_dir", "publish", "dry_run"}
+            and isinstance(arguments.data_dir, Path)
+            and type(arguments.publish) is bool
+            and type(arguments.dry_run) is bool
+            and arguments.publish != arguments.dry_run
+        )
+    elif arguments.command == "verify":
+        valid_arguments = (
+            set(vars(arguments)) == {"command", "data_dir", "bundle"}
+            and isinstance(arguments.data_dir, Path)
+            and isinstance(arguments.bundle, Path)
+            and arguments.bundle.is_absolute()
+        )
+    else:
+        valid_arguments = False
+    if not valid_arguments:
+        raise _entrypoint_error(
+            "historical production controller is unavailable"
+        )
+    try:
+        source_identity = preflight.identity_projection
+    except Exception as error:
+        raise _entrypoint_error(
+            "historical production controller input is invalid"
+        ) from error
+    if not isinstance(source_identity, Mapping):
+        raise _entrypoint_error(
+            "historical production controller input is invalid"
+        )
+
+    if arguments.command == "verify":
+        audit = _audit_latest_historical_replay_bundle(
+            data_dir=arguments.data_dir,
+            bundle_path=arguments.bundle,
+        )
+        if not isinstance(audit, Mapping):
+            raise _entrypoint_error(
+                "historical audit controller result is invalid"
+            )
+        return MappingProxyType({
+            "schema": "historical_replay_command_result/v1",
+            "command": "verify",
+            "mode": "audit",
+            "status": audit.get("status"),
+            "source_identity": dict(source_identity),
+            "run_identity": audit.get("run_identity"),
+            "bundle": audit.get("bundle"),
+            "verification": audit.get("verification"),
+            "published_pointer": audit.get("published_pointer"),
+        })
+
+    publish = arguments.publish
+    raw_state = None
+    prepared = None
+    result = None
+    original_error = None
+    try:
+        raw_state = _produce_historical_raw_run(
+            data_dir=arguments.data_dir
+        )
+        if type(raw_state) is not dict:
+            raise _entrypoint_error(
+                "historical raw controller result is invalid"
+            )
+        selection = raw_state.get("selection")
+        run_identity = raw_state.get("run_identity")
+        if (
+            type(selection) is not dict
+            or type(run_identity) is not dict
+        ):
+            raise _entrypoint_error(
+                "historical raw controller result is invalid"
+            )
+        status = selection.get("status")
+        result_base = {
+            "schema": "historical_replay_command_result/v1",
+            "command": "scan",
+            "mode": "publish" if publish else "dry-run",
+            "status": status,
+            "source_identity": dict(source_identity),
+            "selection": dict(selection),
+            "run_identity": dict(run_identity),
+        }
+        if status == "no_publishable_profitable_block":
+            if (
+                raw_state.get("run") is not None
+                or raw_state.get("publication_lease") is not None
+            ):
+                raise _entrypoint_error(
+                    "historical raw controller result is invalid"
+                )
+            result = MappingProxyType({
+                **result_base,
+                "bundle": None,
+                "verification": None,
+                "published_pointer": None,
+            })
+        elif status == "found_publishable_profitable_block":
+            if (
+                raw_state.get("run") is None
+                or raw_state.get("publication_lease") is None
+            ):
+                raise _entrypoint_error(
+                    "historical raw controller result is invalid"
+                )
+            prepared = _prepare_historical_replay_bundle(
+                data_dir=arguments.data_dir,
+                raw_state=raw_state,
+                publish=publish,
+            )
+            if type(prepared) is not dict:
+                raise _entrypoint_error(
+                    "historical publication preparation is invalid"
+                )
+            verification = _verify_prepared_historical_bundle(
+                prepared=prepared, publish=publish
+            )
+            published_pointer = _publish_verified_historical_bundle(
+                prepared=prepared,
+                verification=verification,
+                publish=publish,
+            )
+            bundle = prepared.get("bundle")
+            final_pointer = verification.get("final_pointer")
+            if (
+                not isinstance(bundle, Mapping)
+                or not isinstance(verification, Mapping)
+                or not isinstance(final_pointer, Mapping)
+                or type(bundle.get("replay_id")) is not str
+                or type(bundle.get("manifest_sha256")) is not str
+                or not isinstance(bundle.get("pointer_core"), Mapping)
+                or type(verification.get("report_sha256")) is not str
+                or publish
+                and (
+                    not isinstance(published_pointer, Mapping)
+                    or dict(published_pointer) != dict(final_pointer)
+                )
+                or not publish and published_pointer is not None
+            ):
+                raise _entrypoint_error(
+                    "historical production controller result is invalid"
+                )
+            result = MappingProxyType({
+                **result_base,
+                "bundle": {
+                    "replay_id": bundle["replay_id"],
+                    "manifest_sha256": bundle["manifest_sha256"],
+                    "pointer_core": dict(bundle["pointer_core"]),
+                },
+                "verification": {
+                    "report_sha256": verification["report_sha256"],
+                    "final_pointer": dict(final_pointer),
+                },
+                "published_pointer": (
+                    dict(published_pointer) if publish else None
+                ),
+            })
+        else:
+            raise _entrypoint_error(
+                "historical replay selection is invalid"
+            )
+    except BaseException as error:
+        original_error = error
+
+    cleanup_error = None
+    if prepared is not None:
+        try:
+            _close_prepared_historical_bundle(prepared)
+        except BaseException as error:
+            cleanup_error = error
+    if type(raw_state) is dict:
+        raw_resources = [
+            raw_state.get("run"), raw_state.get("publication_lease")
+        ]
+        raw_state["run"] = None
+        raw_state["publication_lease"] = None
+        raw_cleanup_error = _close_historical_controller_resources(
+            raw_resources
+        )
+        if cleanup_error is None or (
+            isinstance(cleanup_error, Exception)
+            and raw_cleanup_error is not None
+            and not isinstance(raw_cleanup_error, Exception)
+        ):
+            cleanup_error = raw_cleanup_error
+
+    if original_error is not None:
+        if not isinstance(original_error, Exception):
+            raise original_error from cleanup_error
+        if cleanup_error is not None and not isinstance(
+            cleanup_error, Exception
+        ):
+            raise cleanup_error from original_error
+        if isinstance(original_error, HistoricalReplayEntrypointError):
+            raise original_error
+        raise _entrypoint_error(
+            "historical production controller failed"
+        ) from original_error
+    if cleanup_error is not None:
+        if not isinstance(cleanup_error, Exception):
+            raise cleanup_error
+        raise _entrypoint_error(
+            "historical production controller cleanup failed"
+        ) from cleanup_error
+    if result is None:
+        raise _entrypoint_error(
+            "historical production controller is unavailable"
+        )
+    return result
+
+
+def _execute(arguments: argparse.Namespace) -> Mapping[str, Any]:
+    _require_safe_historical_startup()
+    guard = _LivePointerGuard(data_dir=arguments.data_dir)
+    with guard:
+        preflight = verify_clean_tracked_historical_source()
+        original_error = None
+        result = None
+        try:
+            preflight.reread_unchanged()
+            result = _invoke_production_controller(arguments, preflight)
+        except BaseException as error:
+            original_error = error
+        maintenance_error = None
+        try:
+            preflight.reread_unchanged()
+        except BaseException as error:
+            maintenance_error = error
+        try:
+            preflight.close()
+        except BaseException as error:
+            if maintenance_error is None or (
+                isinstance(maintenance_error, Exception)
+                and not isinstance(error, Exception)
+            ):
+                maintenance_error = error
+        if original_error is not None:
+            if not isinstance(original_error, Exception):
+                raise original_error from maintenance_error
+            if maintenance_error is not None:
+                if not isinstance(maintenance_error, Exception):
+                    raise maintenance_error from original_error
+                raise maintenance_error from original_error
+            raise original_error
+        if maintenance_error is not None:
+            raise maintenance_error
+        if result is None:
+            raise _entrypoint_error(
+                "historical production controller is unavailable"
+            )
+    if (
+        not isinstance(result, Mapping)
+        or "live_pointers_before" in result
+        or "live_pointers_after" in result
+        or guard.before is None
+        or guard.after is None
+    ):
+        raise _entrypoint_error(
+            "historical production controller result is invalid"
+        )
+    return MappingProxyType({
+        **dict(result),
+        "live_pointers_before": project_live_pointer_snapshots(
+            guard.before
+        ),
+        "live_pointers_after": project_live_pointer_snapshots(
+            guard.after
+        ),
+    })
+
+
+def main(arguments: Optional[Sequence[str]] = None) -> int:
+    try:
+        _require_safe_historical_startup()
+    except HistoricalReplayEntrypointError as error:
+        sys.stderr.write(str(error) + "\n")
+        return 1
+    parsed = _parse_arguments(
+        sys.argv[1:] if arguments is None else arguments
+    )
+    try:
+        _execute(parsed)
+    except HistoricalReplayEntrypointError as error:
+        sys.stderr.write(str(error) + "\n")
+        return 1
+    return 0

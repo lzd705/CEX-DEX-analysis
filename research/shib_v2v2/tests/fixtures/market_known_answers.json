@@ -1,0 +1,38 @@
+{
+  "price_spreads": [
+    {
+      "name": "one_and_a_quarter_dollars",
+      "price_a_usd": "100",
+      "price_b_usd": "101.25",
+      "expected_absolute_spread_usd": "1.25",
+      "expected_spread_bps": "124.2236024844720496894409938"
+    },
+    {
+      "name": "symmetric_input_order",
+      "price_a_usd": "9.9",
+      "price_b_usd": "10.1",
+      "expected_absolute_spread_usd": "0.2",
+      "expected_spread_bps": "200"
+    }
+  ],
+  "decimal_adjustments": [
+    {
+      "name": "usdc_six_decimals",
+      "raw_amount": "2500500",
+      "decimals": 6,
+      "expected_units": "2.500500"
+    },
+    {
+      "name": "weth_eighteen_decimals",
+      "raw_amount": "1000000000000000000",
+      "decimals": 18,
+      "expected_units": "1.000000000000000000"
+    },
+    {
+      "name": "zero_decimal_token",
+      "raw_amount": "42",
+      "decimals": 0,
+      "expected_units": "42"
+    }
+  ]
+}

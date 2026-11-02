@@ -1,0 +1,391 @@
+# Production hardening and rollback
+
+This runbook keeps the Python process private on loopback and exposes only the
+read-only dashboard through an HTTPS reverse proxy. The administrator surface
+remains disabled on the public hostname.
+
+## Required operator inputs
+
+Before deployment, choose:
+
+- `@DOMAIN@`: the DNS name whose A/AAAA records point to the server;
+- `@SERVICE_USER@` and `@SERVICE_GROUP@`: an unprivileged account that owns only
+  the runtime data directories;
+- `@PROJECT_ROOT@`: preferably a stable symlink such as
+  `/srv/cex-dex/app/current`;
+- `MARKET_DATA_DIR`: an absolute directory containing the published SQLite,
+  CSV, quality, registry, collection-lock, and raw-response files;
+- `MARKET_CEX_INSTRUMENT_LIFECYCLE`: exactly
+  `MARKET_DATA_DIR/cex_instrument_lifecycle.json`, so the dashboard reads the
+  atomically refreshed daily manifest rather than the tracked seed file;
+- `ADMIN_JOB_DIR`: an absolute directory for administrator job records. It may
+  live under `MARKET_DATA_DIR`, but it does not have to;
+- `TOKEN_REVIEW_DB_PATH`: the durable review ledger, normally
+  `MARKET_DATA_DIR/admin/token_reviews.sqlite3`. Public intake and a protected
+  reviewer process must use the same absolute path and compatible ownership;
+- TLS certificates for `@DOMAIN@`, normally issued and renewed by Certbot or the
+  host's certificate manager.
+
+Do not use the raw IP address as a substitute for the missing HTTPS domain.
+The runtime paths are not restricted to `/srv`; `/var/lib`, a mounted data
+volume, or another reviewed absolute path is supported. Do not use `/` itself,
+relative paths, or paths containing whitespace.
+
+## Install the process supervisor
+
+Render the environment file and systemd services together so the values loaded
+as `MARKET_DATA_DIR` and `ADMIN_JOB_DIR` exactly match the paths granted by
+`ReadWritePaths`. systemd does not expand environment-file variables inside
+filesystem-hardening directives, so manually copying the example without
+rendering is invalid.
+
+The collector uses a staging directory beside `MARKET_DATA_DIR`. For example,
+`/data/market/published` uses `/data/market/.published-processed`. Create all
+three writable directories before service startup, render the templates, and
+install the generated files:
+
+```bash
+sudo install -d -o market-monitor -g market-monitor -m 0750 \
+  /data/market/published \
+  /data/market/.published-processed \
+  /data/market/admin/jobs
+python3 deploy/render_runtime_templates.py \
+  --output-dir /tmp/cex-dex-rendered \
+  --project-root /opt/cex-dex/app/current \
+  --service-user market-monitor \
+  --service-group market-monitor \
+  --market-data-dir /data/market/published \
+  --admin-job-dir /data/market/admin/jobs
+sudo install -d -m 0750 /etc/cex-dex
+sudo install -m 0600 /tmp/cex-dex-rendered/dashboard.env \
+  /etc/cex-dex/dashboard.env
+sudo install -m 0644 /tmp/cex-dex-rendered/cex-dex-dashboard.service \
+  /etc/systemd/system/cex-dex-dashboard.service
+sudo install -m 0644 /tmp/cex-dex-rendered/cex-dex-daily.service \
+  /etc/systemd/system/cex-dex-daily.service
+sudo install -m 0644 /tmp/cex-dex-rendered/cex-dex-depth.service \
+  /etc/systemd/system/cex-dex-depth.service
+sudo install -m 0644 deploy/systemd/cex-dex-daily.timer \
+  /etc/systemd/system/cex-dex-daily.timer
+sudo install -m 0644 deploy/systemd/cex-dex-depth.timer \
+  /etc/systemd/system/cex-dex-depth.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now \
+  cex-dex-dashboard.service \
+  cex-dex-daily.timer \
+  cex-dex-depth.timer
+```
+
+The dashboard service binds only to `127.0.0.1:8765` and restarts after
+failures. The dashboard and both collectors run as the same explicitly rendered
+unprivileged account, without Linux capabilities, and write logs to journald.
+`ProtectSystem=strict` keeps the rest of the filesystem read-only. Their
+explicit write allowlists cover:
+
+- `MARKET_DATA_DIR`, including publication files, `admin/token_registry.json`,
+  `admin/token_reviews.sqlite3`, `collection/collection.lock`, quality evidence,
+  and raw snapshots;
+- the derived collector staging directory beside `MARKET_DATA_DIR`;
+- `ADMIN_JOB_DIR`, even when operator jobs are stored outside the market-data
+  tree.
+
+The default review database is already covered by the market-data write grant.
+If `TOKEN_REVIEW_DB_PATH` is moved elsewhere, explicitly grant its private
+parent directory in the dashboard service's `ReadWritePaths`, create that
+directory with service ownership, and verify the effective unit before startup.
+SQLite must be able to create its journal beside the database. Setting an
+environment variable alone does not change systemd's filesystem allowlist;
+do not disable `ProtectSystem=strict` or grant the repository broad write access.
+
+Verify the rendered contract before starting the service:
+
+```bash
+grep -F "MARKET_DATA_DIR=/data/market/published" \
+  /etc/cex-dex/dashboard.env
+grep -F \
+  "MARKET_CEX_INSTRUMENT_LIFECYCLE=/data/market/published/cex_instrument_lifecycle.json" \
+  /etc/cex-dex/dashboard.env
+grep -F "ReadWritePaths=/data/market/published" \
+  /etc/systemd/system/cex-dex-dashboard.service
+systemd-analyze verify /etc/systemd/system/cex-dex-dashboard.service
+systemd-analyze verify /etc/systemd/system/cex-dex-daily.service
+systemd-analyze verify /etc/systemd/system/cex-dex-depth.service
+python3 scripts/check_dashboard_health.py
+systemctl is-active cex-dex-dashboard.service
+systemctl list-timers cex-dex-daily.timer cex-dex-depth.timer
+journalctl -u cex-dex-dashboard.service --since today
+```
+
+Before calling a release current, confirm that the daily lifecycle step wrote
+fresh root evidence at the exact path read by the dashboard:
+
+```bash
+python3 scripts/run_collection_cycle.py --profile daily --publish-local \
+  --data-dir /data/market/published
+jq '{checked_at_utc,response_sha256,inventory_count,configured_market_count,review_count}' \
+  /data/market/published/cex_instrument_lifecycle.json
+```
+
+Use `journalctl --vacuum-time=30d` for an immediate cleanup. The optional
+`deploy/systemd/journald-cex-dex.conf.example` documents a compressed 30-day,
+1 GiB host-wide policy; it affects every journald service and therefore needs a
+host-level review.
+
+### Unprivileged supervisor fallback
+
+If the operator cannot install a system service yet, use
+`deploy/render_runtime_templates.py` with the same absolute project root and
+`MARKET_DATA_DIR` used by the user collection timers. The renderer pins the
+dashboard to loopback and embeds both the runtime data directory and exact CEX
+lifecycle manifest path. Install the rendered
+`cex-dex-dashboard-user.service` as
+`~/.config/systemd/user/cex-dex-dashboard.service`, then run:
+
+```bash
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now cex-dex-dashboard.service
+systemctl --user is-active cex-dex-dashboard.service
+```
+
+This fallback explicitly keeps `ADMIN_ENABLED=false`, restarts the process
+after failure, and survives logout only when linger is enabled. Use the HTTPS
+or connection-capped loopback proxy below for public access rather than
+changing the rendered bind address.
+
+### Connection-capped demo proxy
+
+When the demo host has no Nginx or TLS endpoint yet, the bounded public
+Add Token and quality-retry actions must not be enabled by weakening the
+application's loopback guard. Instead:
+
+1. run `cex-dex-dashboard.service` on `127.0.0.1:8766`;
+2. render `deploy/systemd/cex-dex-dashboard-proxy.socket.in` with the reviewed
+   private/NAT bind address and install both proxy units under the same user
+   supervisor;
+3. keep `ADMIN_ENABLED=false` and
+   `TRUST_LOOPBACK_PROXY_CLIENT_IP=false`;
+4. enable the app service, then the proxy socket, and verify both the loopback
+   health endpoint and the public endpoint.
+
+The proxy uses `/lib/systemd/systemd-socket-proxyd --connections-max=64`, so
+slow public connections cannot create an unbounded number of application
+threads. It is a raw TCP proxy: it provides no TLS and does not overwrite
+`X-Real-IP`. With proxy-header trust disabled, the application deliberately
+treats all demo users as one conservative global rate-limit bucket. Never set
+`TRUST_LOOPBACK_PROXY_CLIENT_IP=true` for this topology because a client could
+supply that header itself.
+
+For user-level collection timers, use `scripts/install_collection_timers.sh`
+with an absolute `MARKET_DATA_DIR`. It renders the dedicated
+`cex-dex-daily-user.service.in` and `cex-dex-depth-user.service.in` templates,
+embedding that path rather than attempting to read the system-only
+`/etc/cex-dex/dashboard.env`.
+
+## Configure HTTPS
+
+Render `deploy/nginx/cex-dex-dashboard.conf.in` with the real domain, install it
+under the Nginx `http` configuration, validate with `nginx -t`, and reload
+Nginx. The example:
+
+- redirects HTTP to HTTPS;
+- terminates TLS 1.2/1.3;
+- adds HSTS;
+- rate-limits public requests;
+- records access and error logs;
+- proxies to loopback only;
+- returns 404 for the administrator page and APIs.
+
+Keep port 8765 closed in the cloud firewall and host firewall. Only ports 80
+and 443 should be Internet-facing.
+
+## Administrator policy
+
+Leave `ADMIN_ENABLED=false` for the public process. If an administrator process
+is later required, create a separate reviewed service and access path:
+
+1. keep its application bind on loopback;
+2. set `ADMIN_ENABLED=true`, `ADMIN_LOGIN_REQUIRED=true`, and
+   `ADMIN_ALLOW_OPEN_LOCAL=false`;
+3. generate a real verifier with `scripts/admin_password.py`;
+4. set `ADMIN_COOKIE_SECURE=true`;
+5. restrict the route through an SSH tunnel, VPN, or IP allowlist;
+6. verify CSRF, login rate limiting, and access logs before use.
+
+`ADMIN_LOGIN_REQUIRED=false` does not enable open mode by itself. Local open
+mode additionally requires `ADMIN_ALLOW_OPEN_LOCAL=true`, and the server will
+refuse a non-loopback bind.
+
+### Token review and notification deployment
+
+Token submission creates a durable review, not an onboarding job. The sole
+configured reviewer must approve (`1/1`) and then separately Start onboarding;
+both actions require an authenticated session, CSRF, and the displayed revision.
+Start resolves exactly once and compares the full stable identity (chain,
+address, symbol, name, decimals, `coingecko_id`, source and `source_token_id`)
+with the approved snapshot. A change fails before registry, job or worker
+creation and restores `approved` for manual investigation. Dynamic pool, TVL
+and volume evidence may change; the same verified candidate goes into job
+creation without another resolution. There is no reset or automatic recovery.
+Every submission, including a duplicate, first needs successful source
+resolution and validation; only afterward does a canonical duplicate return
+the original request without another email. Source failure is not an offline
+duplicate-receipt lookup.
+Open-local mode can list reviews but cannot submit through the admin route,
+decide, retry notification, or Start. Keep the public admin-route blocks intact.
+If public intake and the reviewer use separate processes, they must share
+`TOKEN_REVIEW_DB_PATH`; separate ledgers would hide submitted requests from the
+reviewer and split deduplication/audit history.
+
+Keep `TOKEN_REVIEW_EMAIL_ENABLED=false` until the protected reviewer access
+path, sender, relay and sole recipient are configured privately. Set
+`TOKEN_REVIEWER_EMAIL` in `/etc/cex-dex/dashboard.env` (mode `0600`), never in
+tracked templates. The user service instead reads
+`%h/.config/cex-dex/dashboard.env`, also kept mode `0600`. Neither file should be
+served by the web server or printed in logs. The server otherwise automatically
+loads the repository `.env`, without shell execution and without overriding
+existing environment values. Keep the rendered `DASHBOARD_SKIP_LOCAL_ENV=true`
+so production uses only the intended EnvironmentFile/process settings.
+Restart the relevant processes after environment changes. Standalone email
+settings validation does not invoke the server loader and needs exported values.
+
+`TOKEN_REVIEW_BASE_URL` must be a protected HTTPS admin URL, optionally with a
+path prefix, without userinfo/query/fragment. The email adds
+`/admin.html#token-review=<request_id>`; it cannot approve or Start. The public
+hostname deliberately blocks admin routes, so do not configure it as the review
+URL unless it has a separately reviewed protected access path.
+
+Choose an explicit `TOKEN_REVIEW_SMTP_PORT`; no default port or SMTP_SSL mode is
+provided. `TOKEN_REVIEW_SMTP_STARTTLS=true` verifies the relay certificate and
+hostname before authentication. Credential configuration without STARTTLS is
+rejected before transport opens. An unauthenticated plaintext relay is supported
+only as an explicitly reviewed trusted local option; the message body is still
+plaintext. Do not disable TLS verification or send credentials without TLS to
+work around relay setup failures. Email can stay disabled while review and
+explicit Start remain usable.
+
+Follow the [review runbook](admin-operations.md#token-review-configuration-and-enablement)
+for the full ten-variable contract, enablement order, cooldown and attempt cap.
+Use SQLite-consistent backups of the review ledger. Before restore or recovery
+from ambiguous `sending`/`onboarding_starting`, stop every process sharing it
+and reconcile relay evidence, jobs and registry state. There is no automatic
+resend/reset; restoring an older ledger does not undo already-sent mail or
+collection and must not authorize duplicate work.
+
+## Application and data rollback
+
+Deploy immutable application directories by commit and point
+`/srv/cex-dex/app/current` at the selected release. Keep runtime data snapshots
+under a separate versioned directory and point `/srv/cex-dex/current` at the
+reviewed snapshot.
+
+Before restarting the service, run a compatibility preflight from the
+prospective release with the exact Python interpreter used by `ExecStart`:
+
+```bash
+python3 --version
+python3 -m py_compile dashboard/server.py dashboard/market_facts.py \
+  scripts/check_dashboard_release.py
+python3 -c "import dashboard.server; import dashboard.market_facts"
+export CEX_DEX_EXPECTED_APPLICATION_SHA="$(git rev-parse HEAD)"
+export CEX_DEX_EXPECTED_ASSET_SHA="$(python3 -c \
+  'from dashboard.server import static_asset_sha; print(static_asset_sha())')"
+```
+
+The supported production baseline is Python 3.8.10. The import check is
+required in addition to compilation because some newer typing expressions are
+syntactically valid on Python 3.8 but still fail while a module is imported.
+Keep the old process running during this preflight. If any command fails,
+restore the previous application target without restarting, so the failed
+release never becomes the serving process.
+
+After switching either symlink:
+
+```bash
+sudo systemctl restart cex-dex-dashboard.service
+python3 scripts/check_dashboard_health.py
+python3 scripts/check_dashboard_release.py \
+  --base-url http://127.0.0.1:8765 \
+  --expected-application-sha "$CEX_DEX_EXPECTED_APPLICATION_SHA" \
+  --expected-asset-sha "$CEX_DEX_EXPECTED_ASSET_SHA"
+```
+
+For an unprivileged user service, use the same checks but restart with:
+
+```bash
+systemctl --user restart cex-dex-dashboard.service
+systemctl --user is-active cex-dex-dashboard.service
+python3 scripts/check_dashboard_health.py
+python3 scripts/check_dashboard_release.py \
+  --base-url http://127.0.0.1:8765 \
+  --expected-application-sha "$CEX_DEX_EXPECTED_APPLICATION_SHA" \
+  --expected-asset-sha "$CEX_DEX_EXPECTED_ASSET_SHA"
+```
+
+Both expected values must be computed from the immutable prospective release
+before the restart. Do not copy either value from the post-restart `/health`
+response: that would only compare the process with its own claim. The release
+checker independently hashes the versioned CSS/JavaScript responses and rejects
+an application SHA, asset SHA, or served-byte mismatch.
+
+If `/health`, the executable release smoke, or browser smoke fails, atomically
+switch the relevant symlink back to the previous known-good release or data
+snapshot. Restart with either `sudo systemctl restart
+cex-dex-dashboard.service` or `systemctl --user restart
+cex-dex-dashboard.service`, matching the active supervisor, then rerun the full
+check set. Do not delete the previous release or data snapshot until the new
+version has passed `/health`, the Screener summary, one single-Token catalog,
+the full audit catalog, compare, quality, execution-cost, and browser smoke
+tests. The summary and Token catalog checks must also confirm a matching
+non-empty `data_generation`.
+
+## CEX depth raw-response retention
+
+`scripts/retain_cex_depth_raw.py` is non-destructive unless `--apply` is
+present. The default policy keeps seven days as individual JSON files,
+compresses older snapshot directories into verified `.tar.gz` archives, and
+expires archives after 30 days.
+
+Review the exact plan first:
+
+```bash
+python3 scripts/retain_cex_depth_raw.py
+```
+
+Then apply the same policy explicitly:
+
+```bash
+python3 scripts/retain_cex_depth_raw.py --apply
+```
+
+The script refuses `/`, the home directory, the repository root, and generic
+`data` or `data/raw` directories. Its target must be a dedicated directory
+named `cex-depth`; symlinks and special files are not archived.
+
+For automation, render and install
+`cex-dex-cex-depth-retention.service.in` and its timer only after the dry-run
+output has been reviewed. Enabling the timer is the explicit authorization for
+daily `--apply`. Adjust the 7/30-day values in the rendered unit if regulatory
+or research reproducibility requirements demand longer retention.
+The rendered retention unit passes
+`--root MARKET_DATA_DIR/raw/cex-depth` explicitly and grants write access only
+to that external directory; it no longer assumes raw snapshots live under the
+application checkout.
+
+## Cache generation behavior
+
+The process retains only the active published source generation. When SQLite,
+TVL, CEX depth, DEX depth, CEX execution cost, or DEX execution cost signatures
+change, all assembled payload, catalog, and encoded-response caches from the
+previous generation are cleared. The public generation identifier also
+includes the summary/catalog contract versions, so a schema deployment cannot
+reuse a browser catalog from an older contract. Source signatures include
+modification/change time, size, inode, and a path identity that is exposed only
+as a hash. If a publication crosses a cold response build, that response is
+discarded and retried instead of labeling old facts with a new generation. The
+encoded response cache is reset when its one-minute freshness bucket changes.
+Within one generation,
+large assembled payload caches retain at most eight date-window variants and
+the serialized-response cache retains at most 64 variants. This prevents
+repeated publications or abnormal custom-window traffic from retaining
+hundreds of complete payloads in process memory.

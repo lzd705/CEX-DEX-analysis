@@ -1,0 +1,2614 @@
+import json
+import os
+import fcntl
+import hashlib
+import sqlite3
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
+from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from dashboard import server
+from dashboard.token_reviews import TokenReviewError, TokenReviewStore
+from dashboard.token_review_email import TokenReviewEmailSettings
+from dashboard.admin import (
+    AdminService,
+    MAX_QUALITY_REPORT_BYTES,
+    QUALITY_REPORT_SCHEMA,
+    hash_password,
+    password_hash_is_configured,
+    verify_password,
+)
+from scripts.retain_cex_depth_raw import apply_retention, plan_retention
+
+
+def write_retry_database(path, import_run_id, *, cex_rows=()):
+    if path.exists():
+        path.unlink()
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "CREATE TABLE dataset_state "
+        "(singleton_id INTEGER PRIMARY KEY, import_run_id TEXT NOT NULL)"
+    )
+    connection.execute(
+        "INSERT INTO dataset_state VALUES (1, ?)",
+        (import_run_id,),
+    )
+    connection.execute(
+        """
+        CREATE TABLE cex_market_daily (
+            date TEXT, token_symbol TEXT, exchange TEXT, cex_symbol TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE dex_pool_daily (
+            date TEXT, token_symbol TEXT, chain TEXT, dex TEXT,
+            pool_address TEXT
+        )
+        """
+    )
+    connection.executemany(
+        "INSERT INTO cex_market_daily VALUES (?, ?, ?, ?)",
+        list(cex_rows),
+    )
+    connection.commit()
+    connection.close()
+
+
+class AdminServiceTest(unittest.TestCase):
+    @staticmethod
+    def review_candidate():
+        return {
+            "identity": {
+                "chain": "base", "contract_address": "0x" + "12" * 20,
+                "token_symbol": "XYZ", "token_name": "XYZ Token", "decimals": 18,
+                "coingecko_id": None, "source": "geckoterminal",
+                "source_token_id": "base_0x" + "12" * 20,
+            },
+            "discovery": {"usable_pool_count": 1, "top_pools": []},
+            "capabilities": {"dex_daily": "available"},
+            "registration": {"origin": None, "status": None,
+                             "cex_mapping_status": "requires_manual_review"},
+            "already_configured": False,
+        }
+
+    @staticmethod
+    def review_payload():
+        return {"chain": "base", "contract_address": "0x" + "12" * 20,
+                "expected_token_symbol": "XYZ", "history_days": 30}
+
+    def review_service(self, root, **kwargs):
+        options = dict(
+            username="reviewer", password_hash="hash", enabled=True,
+            login_required=True, data_dir=root, job_dir=root / "jobs",
+            registry_path=root / "registry.json", review_store_path=root / "reviews.sqlite3",
+            review_email_settings=TokenReviewEmailSettings(enabled=False),
+            review_clock=lambda: datetime(2026, 9, 9, 1, 2, 3, tzinfo=timezone.utc),
+        )
+        options.update(kwargs)
+        return AdminService(**options)
+
+    def test_review_database_is_lazy_and_honors_environment_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.dict(os.environ, {"TOKEN_REVIEW_DB_PATH": str(root / "env.sqlite3")}, clear=True):
+                service = AdminService(data_dir=root)
+                self.assertFalse((root / "env.sqlite3").exists())
+                self.assertFalse((root / "admin/token_reviews.sqlite3").exists())
+                self.assertEqual(service.list_token_reviews(), [])
+                self.assertTrue((root / "env.sqlite3").exists())
+
+    def test_review_submission_commits_before_mail_and_deduplicates_without_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deliveries = []
+            def send(review):
+                persisted = TokenReviewStore(root / "reviews.sqlite3").get(review["request_id"])
+                self.assertEqual(persisted["notification"]["status"], "sending")
+                self.assertEqual(persisted["notification"]["attempts"], 1)
+                deliveries.append(persisted)
+            service = self.review_service(root, review_mailer=SimpleNamespace(send=send),
+                                         review_email_settings=TokenReviewEmailSettings(enabled=True))
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()) as resolve, patch("dashboard.admin.threading.Thread") as thread:
+                first = service.submit_token_review(self.review_payload(), "public:add_token")
+                second = service.submit_token_review({**self.review_payload(), "history_days": 90}, "reviewer")
+            self.assertEqual(resolve.call_count, 2)
+            self.assertEqual(first["status"], "pending_review")
+            self.assertEqual(first["notification"]["status"], "sent")
+            self.assertFalse(first["deduplicated"])
+            self.assertTrue(second["deduplicated"])
+            self.assertEqual(first["request_id"], second["request_id"])
+            self.assertEqual(second["requested_history_days"], 30)
+            self.assertEqual(len(deliveries), 1)
+            self.assertEqual(service.count_token_reviews_created_on(date(2026, 9, 9)), 1)
+            self.assertEqual(service.count_token_reviews_created_on(date(2026, 9, 10)), 0)
+            self.assertEqual(service.registry.list_records(), [])
+            self.assertEqual(service.jobs, {})
+            self.assertFalse((root / "jobs").exists())
+            thread.assert_not_called()
+
+    def test_review_submission_rejects_changed_symbol_and_active_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.review_service(root)
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                with self.assertRaises(TokenReviewError) as caught:
+                    service.submit_token_review({**self.review_payload(), "expected_token_symbol": "FORGED"}, "public:add_token")
+                self.assertEqual(caught.exception.code, "identity_changed")
+                service.registry.upsert(self.runtime_record())
+                with self.assertRaises(TokenReviewError) as caught:
+                    service.submit_token_review(self.review_payload(), "public:add_token")
+                self.assertEqual(caught.exception.code, "token_already_active")
+            self.assertFalse((root / "reviews.sqlite3").exists())
+            self.assertEqual(service.jobs, {})
+
+    def test_review_email_disabled_and_invalid_settings_still_persist(self):
+        for environment, expected in [({}, "disabled"), ({"TOKEN_REVIEW_EMAIL_ENABLED": "true"}, "unconfigured")]:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mailer = Mock()
+                with patch.dict(os.environ, environment, clear=True):
+                    service = self.review_service(root, review_email_settings=None, review_mailer=mailer)
+                    with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                        review = service.submit_token_review(self.review_payload(), "public:add_token")
+                self.assertEqual(review["notification"]["status"], expected)
+                self.assertEqual(review["notification"]["attempts"], 0)
+                self.assertEqual(service.list_token_reviews()[0]["request_id"], review["request_id"])
+                mailer.send.assert_not_called()
+
+    def test_review_mail_failure_and_retries_use_persisted_cooldown_and_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = [datetime(2026, 9, 9, 1, 2, 3, tzinfo=timezone.utc)]
+            mailer = Mock()
+            mailer.send.side_effect = RuntimeError("secret-password /private/relay.conf")
+            options = dict(review_mailer=mailer, review_clock=lambda: now[0],
+                           review_email_settings=TokenReviewEmailSettings(enabled=True))
+            service = self.review_service(root, **options)
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+            self.assertEqual(review["notification"]["status"], "failed")
+            self.assertEqual(review["notification"]["error_code"], "notification_send_failed")
+            self.assertNotIn("secret-password", json.dumps(service.list_token_reviews()))
+            self.assertNotIn("/private/relay.conf", json.dumps(service.list_token_reviews()))
+            service = self.review_service(root, **options)
+            with self.assertRaises(TokenReviewError) as caught:
+                service.retry_token_review_notification(review["request_id"], {"expected_revision": review["revision"]}, "reviewer")
+            self.assertEqual(caught.exception.code, "notification_cooldown")
+            for minute in (3, 4):
+                now[0] = datetime(2026, 9, 9, 1, minute, 3, tzinfo=timezone.utc)
+                review = service.retry_token_review_notification(review["request_id"], {"expected_revision": review["revision"]}, "reviewer")
+            now[0] = datetime(2026, 9, 9, 1, 5, 3, tzinfo=timezone.utc)
+            with self.assertRaises(TokenReviewError) as caught:
+                service.retry_token_review_notification(review["request_id"], {"expected_revision": review["revision"]}, "reviewer")
+            self.assertEqual(caught.exception.code, "notification_attempt_limit")
+            self.assertEqual(mailer.send.call_count, 3)
+
+    def test_review_decisions_and_retry_start_require_configured_login_identity(self):
+        for login_required, actor in [(True, "someone_else"), (False, "reviewer")]:
+            with self.subTest(login_required=login_required, actor=actor), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                service = self.review_service(root, login_required=login_required, allow_open_local=True)
+                with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                    review = service.submit_token_review(self.review_payload(), "public:add_token")
+                for method, payload in [
+                    (service.decide_token_review, {"decision": "approve", "expected_revision": review["revision"]}),
+                    (service.decide_token_review, {"decision": "reject", "expected_revision": review["revision"]}),
+                    (service.retry_token_review_notification, {"expected_revision": review["revision"]}),
+                    (service.start_token_review_onboarding, {"expected_revision": review["revision"]}),
+                ]:
+                    with self.assertRaises(TokenReviewError) as caught:
+                        method(review["request_id"], payload, actor)
+                    self.assertEqual(caught.exception.code, "reviewer_required")
+                self.assertEqual(service.list_token_reviews()[0]["status"], "pending_review")
+                self.assertEqual(service.jobs, {})
+
+    def test_review_approval_is_revision_checked_and_has_no_onboarding_side_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.review_service(root)
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()), patch("dashboard.admin.threading.Thread") as thread:
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+                approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+                with self.assertRaises(TokenReviewError) as caught:
+                    service.decide_token_review(review["request_id"], {"decision": "reject", "expected_revision": review["revision"]}, "reviewer")
+                self.assertEqual(caught.exception.code, "stale_revision")
+            self.assertEqual(approved["status"], "approved")
+            self.assertEqual(approved["reviewer"], "reviewer")
+            self.assertEqual(service.registry.list_records(), [])
+            self.assertEqual(service.jobs, {})
+            self.assertFalse((root / "jobs").exists())
+            thread.assert_not_called()
+
+    def test_review_rejection_is_final_and_pending_cannot_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.review_service(Path(directory))
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+                with self.assertRaises(TokenReviewError) as caught:
+                    service.start_token_review_onboarding(review["request_id"], {"expected_revision": review["revision"]}, "reviewer")
+                self.assertEqual(caught.exception.code, "invalid_review_transition")
+                rejected = service.decide_token_review(review["request_id"], {"decision": "reject", "expected_revision": review["revision"]}, "reviewer")
+                duplicate = service.submit_token_review(self.review_payload(), "public:add_token")
+                self.assertEqual(duplicate["status"], "rejected")
+            with self.assertRaises(TokenReviewError) as caught:
+                service.start_token_review_onboarding(review["request_id"], {"expected_revision": rejected["revision"]}, "reviewer")
+            self.assertEqual(caught.exception.code, "invalid_review_transition")
+            self.assertEqual(service.jobs, {})
+
+    def test_review_start_reserves_state_and_uses_stored_identity_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.review_service(root)
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+                approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+                original_create = service._create_onboarding_job_from_candidate
+                def create(candidate, history_days, username):
+                    self.assertEqual(service.list_token_reviews()[0]["status"], "onboarding_starting")
+                    self.assertEqual(candidate["identity"], self.review_candidate()["identity"])
+                    self.assertEqual(history_days, 30)
+                    return original_create(candidate, history_days, username)
+                with patch.object(service, "_create_onboarding_job_from_candidate", side_effect=create), patch("dashboard.admin.threading.Thread") as thread:
+                    started = service.start_token_review_onboarding(review["request_id"], {"expected_revision": approved["revision"]}, "reviewer")
+                    for revision in (approved["revision"], started["revision"]):
+                        with self.assertRaises(TokenReviewError):
+                            service.start_token_review_onboarding(review["request_id"], {"expected_revision": revision}, "reviewer")
+                    thread.return_value.start.assert_called_once_with()
+            self.assertEqual(started["status"], "onboarding_queued")
+            self.assertEqual(len(service.jobs), 1)
+            self.assertIn(started["onboarding_job_id"], service.jobs)
+            self.assertEqual(service.registry.list_records()[0]["status"], "pending")
+
+    def test_review_start_failure_restores_approved_with_stable_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.review_service(root)
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+                approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+                with patch.object(service, "_save_job", side_effect=OSError("secret /private/jobs.json")):
+                    service.review_clock = lambda: datetime(2026, 9, 9, 2, 0, 0, tzinfo=timezone.utc)
+                    failed = service.start_token_review_onboarding(review["request_id"], {"expected_revision": approved["revision"]}, "reviewer")
+            self.assertEqual(failed["status"], "approved")
+            self.assertEqual(failed["onboarding_error_code"], "onboarding_start_failed")
+            self.assertEqual(failed["reviewed_at"], approved["reviewed_at"])
+            self.assertNotIn("secret", json.dumps(service.list_token_reviews()))
+            self.assertEqual(service.jobs, {})
+            self.assertEqual(service.registry.list_records(), [])
+
+    def test_review_start_rejects_each_changed_stable_identity_field_before_effects(self):
+        changes = {"chain": "eth", "contract_address": "0x" + "34" * 20,
+                   "token_symbol": "ABC", "token_name": "Changed Token", "decimals": 6,
+                   "coingecko_id": "different-token", "source": "different-source",
+                   "source_token_id": "different-source-token"}
+        for field, value in changes.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                service = self.review_service(root)
+                with patch.object(service, "resolve_token", return_value=self.review_candidate()):
+                    review = service.submit_token_review(self.review_payload(), "public:add_token")
+                approved = service.decide_token_review(review["request_id"],
+                    {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+                current = self.review_candidate()
+                current["identity"][field] = value
+                with patch.object(service, "resolve_token", return_value=current) as resolve, patch.object(service, "_start_job_thread") as start:
+                    failed = service.start_token_review_onboarding(review["request_id"],
+                        {"expected_revision": approved["revision"]}, "reviewer")
+                resolve.assert_called_once_with("base", "0x" + "12" * 20)
+                self.assertEqual(failed["status"], "approved")
+                self.assertEqual(failed["onboarding_error_code"], "onboarding_start_failed")
+                self.assertEqual(failed["reviewed_at"], approved["reviewed_at"])
+                self.assertEqual(service.jobs, {})
+                self.assertEqual(service.registry.list_records(), [])
+                self.assertFalse((root / "jobs").exists())
+                start.assert_not_called()
+
+    def test_review_start_uses_one_current_candidate_and_allows_market_evidence_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.review_service(Path(directory))
+            with patch.object(service, "resolve_token", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+            approved = service.decide_token_review(review["request_id"],
+                {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+            current = self.review_candidate()
+            current["discovery"] = {"usable_pool_count": 2, "top_pools": []}
+            with patch.object(service, "resolve_token", side_effect=[current, AssertionError("second resolution")]) as resolve, patch.object(service, "_start_job_thread") as start:
+                started = service.start_token_review_onboarding(review["request_id"],
+                    {"expected_revision": approved["revision"]}, "reviewer")
+            resolve.assert_called_once_with("base", "0x" + "12" * 20)
+            self.assertEqual(started["status"], "onboarding_queued")
+            self.assertEqual(len(service.jobs), 1)
+            start.assert_called_once_with(started["onboarding_job_id"])
+
+    def test_review_mutations_reject_extra_or_missing_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.review_service(Path(directory))
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+            for method, payload in [
+                (service.decide_token_review, {"decision": "onboarding_queued", "expected_revision": review["revision"]}),
+                (service.decide_token_review, {"decision": "approve", "expected_revision": review["revision"], "chain": "eth"}),
+                (service.start_token_review_onboarding, {"expected_revision": review["revision"], "history_days": 180}),
+                (service.retry_token_review_notification, {}),
+            ]:
+                with self.assertRaises(TokenReviewError) as caught:
+                    method(review["request_id"], payload, "reviewer")
+                self.assertEqual(caught.exception.code, "invalid_review_request")
+
+    def test_review_notification_completion_survives_concurrent_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def send(review):
+                other = self.review_service(root)
+                other.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+            service = self.review_service(root, review_mailer=SimpleNamespace(send=send),
+                                         review_email_settings=TokenReviewEmailSettings(enabled=True))
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+            self.assertEqual(review["status"], "approved")
+            self.assertEqual(review["notification"]["status"], "sent")
+            self.assertEqual(service.jobs, {})
+
+    def test_review_start_completion_survives_concurrent_notification_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.review_service(root)
+            other = self.review_service(root, review_clock=lambda: datetime(2026, 9, 9, 1, 3, 3, tzinfo=timezone.utc))
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+                approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+                original_create = service._create_onboarding_job_from_candidate
+                def create(candidate, history_days, username):
+                    current = other.list_token_reviews()[0]
+                    other.retry_token_review_notification(current["request_id"], {"expected_revision": current["revision"]}, "reviewer")
+                    return original_create(candidate, history_days, username)
+                with patch.object(service, "_create_onboarding_job_from_candidate", side_effect=create), patch("dashboard.admin.threading.Thread"):
+                    started = service.start_token_review_onboarding(review["request_id"], {"expected_revision": approved["revision"]}, "reviewer")
+            self.assertEqual(started["status"], "onboarding_queued")
+            self.assertEqual(len(service.jobs), 1)
+
+    def test_review_approval_cannot_undo_in_progress_start_reservation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = self.review_service(root)
+            other = self.review_service(root)
+            with patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                review = service.submit_token_review(self.review_payload(), "public:add_token")
+            approved = service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+            entered, release = Event(), Event()
+            calls = []
+            def create(candidate, history_days, username):
+                calls.append(candidate)
+                entered.set()
+                self.assertTrue(release.wait(5))
+                return {"job_id": "one-onboarding-job"}
+            with patch.object(service, "resolve_token", return_value=self.review_candidate()), patch.object(service, "_create_onboarding_job_from_candidate", side_effect=create), ThreadPoolExecutor(max_workers=1) as executor:
+                pending_start = executor.submit(service.start_token_review_onboarding, review["request_id"], {"expected_revision": approved["revision"]}, "reviewer")
+                try:
+                    self.assertTrue(entered.wait(5))
+                    reserved = other.list_token_reviews()[0]
+                    self.assertEqual(reserved["status"], "onboarding_starting")
+                    for decision in ("approve", "reject"):
+                        with self.assertRaises(TokenReviewError) as caught:
+                            other.decide_token_review(review["request_id"], {"decision": decision, "expected_revision": reserved["revision"]}, "reviewer")
+                        self.assertEqual(caught.exception.code, "invalid_review_transition")
+                    with self.assertRaises(TokenReviewError):
+                        service.start_token_review_onboarding(review["request_id"], {"expected_revision": reserved["revision"]}, "reviewer")
+                finally:
+                    release.set()
+                started = pending_start.result(timeout=5)
+            self.assertEqual(started["status"], "onboarding_queued")
+            self.assertEqual(len(calls), 1)
+
+    def test_review_initial_notification_reconciles_approval_before_claim(self):
+        for configuration, expected_status in (("enabled", "sent"), ("disabled", "disabled"), ("invalid", "unconfigured")):
+            with self.subTest(configuration=configuration), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mailer = Mock()
+                settings = None if configuration == "invalid" else TokenReviewEmailSettings(enabled=configuration == "enabled")
+                service = self.review_service(root, review_email_settings=settings, review_mailer=mailer)
+                other = self.review_service(root)
+                original_notify = service._notify_token_review
+                def notify(review, username):
+                    other.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+                    return original_notify(review, username)
+                with patch.dict(os.environ, {"TOKEN_REVIEW_EMAIL_ENABLED": "true"}, clear=True), patch.object(service, "_notify_token_review", side_effect=notify), patch("dashboard.admin.resolve_token_candidate", return_value=self.review_candidate()):
+                    review = service.submit_token_review(self.review_payload(), "public:add_token")
+                self.assertEqual(review["status"], "approved")
+                self.assertEqual(review["notification"]["status"], expected_status)
+                self.assertEqual(review["notification"]["attempts"], 1 if configuration == "enabled" else 0)
+                self.assertEqual(mailer.send.call_count, 1 if configuration == "enabled" else 0)
+                self.assertEqual(service.jobs, {})
+
+    @staticmethod
+    def runtime_record(
+        *,
+        status="active",
+        symbol="XYZ",
+        address="0x" + "12" * 20,
+    ):
+        return {
+            "token_symbol": symbol,
+            "token_name": f"{symbol} Token",
+            "chain": "base",
+            "contract_address": address,
+            "decimals": 18,
+            "coingecko_id": None,
+            "source": "geckoterminal",
+            "source_token_id": f"base_{address}",
+            "status": status,
+            "cex_mapping": {
+                "status": "requires_manual_review",
+                "cex_symbol": None,
+                "exchanges": [],
+            },
+            "created_at": "2026-07-29T00:00:00+00:00",
+            "created_by": "admin",
+            "activated_at": (
+                "2026-07-29T00:01:00+00:00"
+                if status == "active"
+                else None
+            ),
+            "last_job_id": None,
+        }
+
+    def test_quality_report_reader_rejects_oversized_file_with_stable_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "quality/daily-latest.json"
+            report_path.parent.mkdir(parents=True)
+            report_path.write_bytes(b"{" + b"x" * MAX_QUALITY_REPORT_BYTES)
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                quality_report_path=report_path,
+            )
+
+            with self.assertRaises(ValueError) as context:
+                service._read_quality_report(required=True)
+
+            self.assertEqual(
+                str(context.exception),
+                "Daily quality report exceeds the operator size limit",
+            )
+            self.assertNotIn(str(root), str(context.exception))
+
+    def test_quality_report_reader_enforces_schema_and_basic_structure(self):
+        valid_base = {
+            "schema": QUALITY_REPORT_SCHEMA,
+            "publication": {},
+            "issues": [],
+            "retry_windows_by_token": {},
+            "backfill_windows_by_token": {},
+            "manual_review_queue": [],
+        }
+        invalid_reports = [
+            {**valid_base, "schema": "fact_quality_report/v999"},
+            {**valid_base, "publication": []},
+            {**valid_base, "issues": {}},
+            {**valid_base, "issues": ["not-an-object"]},
+            {
+                **valid_base,
+                "retry_windows_by_token": {"AAVE": "not-a-window-list"},
+            },
+            {**valid_base, "manual_review_queue": ["not-an-object"]},
+        ]
+        for index, payload in enumerate(invalid_reports):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                report_path = root / "daily-latest.json"
+                report_path.write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+                service = AdminService(
+                    username="admin",
+                    password_hash="hash",
+                    job_dir=root / "jobs",
+                    quality_report_path=report_path,
+                )
+
+                with self.assertRaises(ValueError) as context:
+                    service._read_quality_report(required=True)
+
+                self.assertEqual(
+                    str(context.exception),
+                    "Daily quality report has an invalid contract",
+                )
+
+    def test_password_hash_round_trip(self):
+        encoded = hash_password("a-secure-test-password", salt=b"0123456789abcdef", iterations=10_000)
+
+        self.assertTrue(verify_password("a-secure-test-password", encoded))
+        self.assertFalse(verify_password("wrong-password-value", encoded))
+        self.assertNotIn("a-secure-test-password", encoded)
+
+    def test_login_creates_expiring_server_side_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = AdminService(
+                username="research-admin",
+                password_hash=hash_password("a-secure-test-password"),
+                job_dir=Path(directory),
+                login_required=True,
+                enabled=True,
+            )
+
+            token, public_session = service.login(
+                "127.0.0.1",
+                "research-admin",
+                "a-secure-test-password",
+            )
+
+            self.assertTrue(public_session["authenticated"])
+            self.assertNotIn(token, public_session.values())
+            self.assertEqual(service.get_session(token)["username"], "research-admin")
+            service.logout(token)
+            self.assertIsNone(service.get_session(token))
+
+    def test_admin_surface_is_disabled_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = AdminService(
+                username="research-admin",
+                password_hash=hash_password("a-secure-test-password"),
+                job_dir=Path(directory),
+                login_required=True,
+                enabled=False,
+            )
+
+            self.assertFalse(service.available)
+            self.assertFalse(service.public_session(None)["authenticated"])
+            with self.assertRaises(RuntimeError):
+                service.login("127.0.0.1", "research-admin", "a-secure-test-password")
+
+    def test_legacy_no_login_flag_cannot_reopen_admin_by_itself(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {"ADMIN_LOGIN_REQUIRED": "false"},
+                clear=True,
+            ):
+                service = AdminService(job_dir=Path(directory))
+
+            self.assertFalse(service.enabled)
+            self.assertFalse(service.open_mode)
+            self.assertFalse(service.available)
+
+    def test_open_mode_requires_two_explicit_local_development_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            unsafe_service = AdminService(
+                job_dir=Path(directory),
+                login_required=False,
+                enabled=True,
+                allow_open_local=False,
+            )
+            service = AdminService(
+                job_dir=Path(directory),
+                login_required=False,
+                enabled=True,
+                allow_open_local=True,
+            )
+
+            session = service.public_session(None)
+
+            self.assertFalse(unsafe_service.available)
+            self.assertTrue(session["authenticated"])
+            self.assertTrue(session["configured"])
+            self.assertFalse(session["login_required"])
+            self.assertEqual(session["username"], "open-admin")
+
+    def test_malformed_or_placeholder_password_hash_does_not_enable_admin(self):
+        self.assertTrue(password_hash_is_configured(hash_password("a-secure-test-password")))
+        self.assertFalse(password_hash_is_configured(""))
+        self.assertFalse(
+            password_hash_is_configured(
+                "pbkdf2_sha256$600000$replace_salt$replace_digest"
+            )
+        )
+
+    def test_admin_routes_are_recognized_and_public_binding_is_rejected(self):
+        self.assertTrue(server.is_admin_surface_path("/admin.html"))
+        self.assertTrue(server.is_admin_surface_path("/ADMIN.HTML"))
+        self.assertTrue(server.is_admin_surface_path("/%61dmin.html"))
+        self.assertTrue(server.is_admin_surface_path("/assets/../admin.html"))
+        self.assertTrue(server.is_admin_surface_path("/api/admin/session"))
+        self.assertFalse(server.is_admin_surface_path("/api/market"))
+        self.assertTrue(server.is_loopback_host("127.0.0.1"))
+        self.assertTrue(server.is_loopback_host("::1"))
+        self.assertFalse(server.is_loopback_host("0.0.0.0"))
+        self.assertFalse(server.is_loopback_host("43.156.102.166"))
+
+    def test_disabled_admin_page_and_api_return_404_but_local_open_mode_is_tested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            disabled = AdminService(
+                job_dir=Path(directory),
+                enabled=False,
+            )
+            local_open = AdminService(
+                job_dir=Path(directory),
+                enabled=True,
+                login_required=False,
+                allow_open_local=True,
+            )
+            handler = object.__new__(server.MarketMonitorHandler)
+            handler.server = SimpleNamespace(server_address=("127.0.0.1", 8765))
+            handler.send_error = Mock()
+            handler.send_json = Mock()
+            handler.admin_session_token = Mock(return_value=None)
+
+            with patch.object(server, "ADMIN_SERVICE", disabled):
+                for path in (
+                    "/admin.html",
+                    "/admin.css?v=release-fingerprint",
+                    "/admin.js?v=release-fingerprint",
+                ):
+                    with self.subTest(path=path):
+                        handler.path = path
+                        handler.do_GET()
+                        handler.send_error.assert_called_once_with(
+                            server.HTTPStatus.NOT_FOUND
+                        )
+                        handler.send_error.reset_mock()
+
+                handler.path = "/api/admin/session"
+                handler.do_GET()
+                handler.send_json.assert_called_once_with(
+                    {"error": "Not found"},
+                    server.HTTPStatus.NOT_FOUND,
+                )
+                handler.send_json.reset_mock()
+
+            with patch.object(server, "ADMIN_SERVICE", local_open):
+                self.assertTrue(handler.admin_surface_available())
+                handler.path = "/api/admin/session"
+                handler.do_GET()
+                session = handler.send_json.call_args.args[0]
+                self.assertEqual(session["username"], "open-admin")
+                handler.send_json.reset_mock()
+                with patch.object(
+                    local_open,
+                    "manual_review_items",
+                    return_value=[
+                        {
+                            "review_id": "review-hard-1",
+                            "retryable": False,
+                        }
+                    ],
+                ):
+                    handler.path = "/api/admin/quality/manual-review"
+                    handler.do_GET()
+                handler.send_json.assert_called_once_with(
+                    {
+                        "review_items": [
+                            {
+                                "review_id": "review-hard-1",
+                                "retryable": False,
+                            }
+                        ],
+                        "review_count": 1,
+                        "retryable": False,
+                    }
+                )
+
+    def test_repeated_invalid_logins_are_rate_limited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = AdminService(
+                username="admin",
+                password_hash=hash_password("a-secure-test-password"),
+                job_dir=Path(directory),
+                login_required=True,
+                enabled=True,
+            )
+            for _ in range(5):
+                with self.assertRaises(ValueError):
+                    service.login("127.0.0.1", "admin", "wrong-password-value")
+
+            with self.assertRaises(PermissionError):
+                service.login("127.0.0.1", "admin", "a-secure-test-password")
+
+    def test_job_window_is_bounded_to_latest_completed_utc_day(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = AdminService(username="admin", password_hash="hash", job_dir=Path(directory))
+
+            result = service.validate_job(
+                {
+                    "token_symbol": "aave",
+                    "start_date": "2026-07-01",
+                    "end_date": "2026-07-22",
+                },
+                today=date(2026, 7, 23),
+            )
+
+            self.assertEqual(result["token_symbol"], "AAVE")
+            with self.assertRaises(ValueError):
+                service.validate_job(
+                    {
+                        "token_symbol": "AAVE",
+                        "start_date": "2026-07-01",
+                        "end_date": "2026-07-20",
+                    },
+                    today=date(2026, 7, 23),
+                )
+
+    def test_worker_uses_argument_array_and_records_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "quality/daily-latest.json"
+            report_path.parent.mkdir(parents=True)
+            database_path = root / "market_facts.sqlite3"
+            write_retry_database(database_path, "import-before")
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "fact_quality_report/v1",
+                        "publication": {"import_run_id": "import-before"},
+                        "issues": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                data_dir=root,
+                quality_report_path=report_path,
+                database_path=database_path,
+            )
+            job_id = "test-job"
+            service.jobs[job_id] = {
+                "job_id": job_id,
+                "job_type": "refresh",
+                "token_symbol": "AAVE",
+                "start_date": "2026-07-01",
+                "end_date": "2026-07-22",
+                "requested_by": "admin",
+                "status": "queued",
+                "created_at": "2026-07-23T00:00:00+00:00",
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+            }
+
+            def publish_new_snapshot(*_args, **_kwargs):
+                write_retry_database(
+                    database_path,
+                    "import-after",
+                    cex_rows=[
+                        (
+                            "2026-07-22",
+                            "AAVE",
+                            "BINANCE",
+                            "AAVE/USDT",
+                        )
+                    ],
+                )
+                report_path.write_text(
+                    json.dumps(
+                        {
+                            "schema": "fact_quality_report/v1",
+                            "publication": {
+                                "import_run_id": "import-after"
+                            },
+                            "issues": [
+                                {
+                                    "date": "2026-07-22",
+                                    "category": "historical_gap",
+                                    "status": "source_no_observation",
+                                    "reason_code": "no_candles",
+                                    "retryable": False,
+                                    "market": {
+                                        "token_symbol": "AAVE",
+                                        "market_id": "cex:okx:AAVE/USDT",
+                                    },
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            with patch(
+                "dashboard.admin.subprocess.run",
+                side_effect=publish_new_snapshot,
+            ) as run:
+                service._run_job(job_id)
+
+            command = run.call_args.args[0]
+            self.assertIsInstance(command, list)
+            self.assertIn("--publish-local", command)
+            self.assertIn("AAVE", command)
+            self.assertNotIn("shell", run.call_args.kwargs)
+            self.assertEqual(service.jobs[job_id]["status"], "succeeded")
+            self.assertEqual(
+                service.jobs[job_id]["result"]["quality_outcomes"][
+                    "structural_non_error_count"
+                ],
+                1,
+            )
+            self.assertEqual(
+                service.jobs[job_id]["result"]["quality_outcomes"][
+                    "reason_counts"
+                ],
+                {"no_candles": 1},
+            )
+
+    def test_refresh_exit_zero_without_new_publication_is_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "quality/daily-latest.json"
+            report_path.parent.mkdir(parents=True)
+            database_path = root / "market_facts.sqlite3"
+            write_retry_database(
+                database_path,
+                "import-before",
+                cex_rows=[
+                    ("2026-07-22", "AAVE", "BINANCE", "AAVE/USDT")
+                ],
+            )
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "fact_quality_report/v1",
+                        "publication": {"import_run_id": "import-before"},
+                        "issues": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                data_dir=root,
+                quality_report_path=report_path,
+                database_path=database_path,
+            )
+            service.jobs["refresh"] = {
+                "job_id": "refresh",
+                "job_type": "refresh",
+                "token_symbol": "AAVE",
+                "start_date": "2026-07-22",
+                "end_date": "2026-07-22",
+                "requested_by": "admin",
+                "status": "queued",
+                "created_at": "2026-07-23T00:00:00+00:00",
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+            }
+
+            with patch("dashboard.admin.subprocess.run"):
+                service._run_job("refresh")
+
+            self.assertEqual(service.jobs["refresh"]["status"], "partial")
+            self.assertEqual(
+                service.jobs["refresh"]["error_code"],
+                "refresh_publication_unchanged",
+            )
+            self.assertFalse(
+                service.jobs["refresh"]["publication_committed"]
+            )
+
+    def test_refresh_new_publication_with_retryable_gap_is_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "quality/daily-latest.json"
+            report_path.parent.mkdir(parents=True)
+            database_path = root / "market_facts.sqlite3"
+            write_retry_database(database_path, "import-before")
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "fact_quality_report/v1",
+                        "publication": {"import_run_id": "import-before"},
+                        "issues": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                data_dir=root,
+                quality_report_path=report_path,
+                database_path=database_path,
+            )
+            service.jobs["refresh"] = {
+                "job_id": "refresh",
+                "job_type": "refresh",
+                "token_symbol": "AAVE",
+                "start_date": "2026-07-22",
+                "end_date": "2026-07-22",
+                "requested_by": "admin",
+                "status": "queued",
+                "created_at": "2026-07-23T00:00:00+00:00",
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+            }
+
+            def publish_with_gap(*_args, **_kwargs):
+                write_retry_database(
+                    database_path,
+                    "import-after",
+                    cex_rows=[
+                        (
+                            "2026-07-22",
+                            "AAVE",
+                            "BINANCE",
+                            "AAVE/USDT",
+                        )
+                    ],
+                )
+                report_path.write_text(
+                    json.dumps(
+                        {
+                            "schema": "fact_quality_report/v1",
+                            "publication": {
+                                "import_run_id": "import-after"
+                            },
+                            "issues": [
+                                {
+                                    "date": "2026-07-22",
+                                    "category": "d1_active_gap",
+                                    "status": "collection_failed",
+                                    "reason_code": "rate_limit",
+                                    "retryable": True,
+                                    "market": {
+                                        "token_symbol": "AAVE",
+                                        "market_id": "cex:okx:AAVE/USDT",
+                                    },
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            with patch(
+                "dashboard.admin.subprocess.run",
+                side_effect=publish_with_gap,
+            ):
+                service._run_job("refresh")
+
+            job = service.jobs["refresh"]
+            self.assertEqual(job["status"], "partial")
+            self.assertEqual(
+                job["error_code"],
+                "refresh_quality_incomplete",
+            )
+            self.assertTrue(job["publication_committed"])
+            self.assertTrue(job["retryable"])
+            self.assertEqual(
+                job["result"]["quality_outcomes"]["reason_counts"],
+                {"rate_limit": 1},
+            )
+
+    def test_create_job_rejects_when_another_job_is_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=Path(directory),
+                enabled=True,
+            )
+            service.jobs["active-job"] = {
+                "job_id": "active-job",
+                "status": "running",
+                "created_at": "2026-07-23T00:00:00+00:00",
+            }
+
+            with patch.object(
+                service,
+                "validate_job",
+                return_value={
+                    "token_symbol": "AAVE",
+                    "start_date": "2026-07-01",
+                    "end_date": "2026-07-22",
+                },
+            ):
+                with self.assertRaises(RuntimeError):
+                    service.create_job({}, "admin")
+
+    def test_job_persistence_failure_does_not_leave_a_queued_ghost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=Path(directory) / "jobs",
+            )
+            request = {
+                "token_symbol": "AAVE",
+                "start_date": "2026-07-28",
+                "end_date": "2026-07-28",
+            }
+            with patch.object(
+                service,
+                "validate_job",
+                return_value=request,
+            ), patch.object(
+                service,
+                "_save_job",
+                side_effect=OSError("disk unavailable"),
+            ), patch(
+                "dashboard.admin.threading.Thread"
+            ) as thread:
+                with self.assertRaisesRegex(OSError, "disk unavailable"):
+                    service.create_job({}, "admin")
+
+            self.assertEqual(service.jobs, {})
+            thread.assert_not_called()
+
+    def test_runtime_token_is_refreshable_only_after_activation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                registry_path=root / "token_registry.json",
+            )
+            service.registry.upsert(self.runtime_record(status="pending"))
+            self.assertNotIn("XYZ", service.configured_tokens())
+
+            active = self.runtime_record(status="active")
+            service.registry.upsert(active)
+
+            self.assertIn("XYZ", service.configured_tokens())
+            runtime = next(
+                record
+                for record in service.configured_token_records()
+                if record["token_symbol"] == "XYZ"
+            )
+            self.assertEqual(runtime["origin"], "admin_runtime")
+            self.assertEqual(
+                runtime["cex_mapping_status"],
+                "requires_manual_review",
+            )
+
+    def test_retry_job_must_match_audited_quality_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "daily-latest.json"
+            database_path = root / "market_facts.sqlite3"
+            write_retry_database(database_path, "import-before")
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "fact_quality_report/v1",
+                        "publication": {
+                            "status": "published_with_retry_queue",
+                            "dataset_snapshot_id": "snapshot-before",
+                            "import_run_id": "import-before",
+                        },
+                        "retry_windows_by_token": {
+                            "AAVE": [
+                                {
+                                    "start_date": "2026-07-28",
+                                    "end_date": "2026-07-28",
+                                    "reason_codes": ["active_market_missing_d1"],
+                                    "market_ids": ["cex:binance:AAVE/USDT"],
+                                    "issue_ids": ["issue-before"],
+                                }
+                            ]
+                        },
+                        "backfill_windows_by_token": {},
+                        "issues": [
+                            {
+                                "issue_id": "issue-before",
+                                "date": "2026-07-28",
+                                "category": "d1_active_gap",
+                                "reason_code": "active_market_missing_d1",
+                                "retryable": True,
+                                "market": {
+                                    "token_symbol": "AAVE",
+                                    "market_id": "cex:binance:AAVE/USDT",
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                quality_report_path=report_path,
+                database_path=database_path,
+            )
+
+            request = service.validate_retry_job(
+                {
+                    "token_symbol": "AAVE",
+                    "start_date": "2026-07-28",
+                    "end_date": "2026-07-28",
+                }
+            )
+            self.assertEqual(request["queue_type"], "latest_completed_day")
+            with self.assertRaisesRegex(ValueError, "current quality report"):
+                service.validate_retry_job(
+                    {
+                        "token_symbol": "AAVE",
+                        "start_date": "2026-07-27",
+                        "end_date": "2026-07-28",
+                    }
+                )
+
+    def test_historical_backfill_is_an_exact_separate_retry_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "daily-latest.json"
+            database_path = root / "market_facts.sqlite3"
+            write_retry_database(database_path, "import-before")
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "fact_quality_report/v1",
+                        "publication": {
+                            "status": "published_with_backfill",
+                            "dataset_snapshot_id": "snapshot-before",
+                            "import_run_id": "import-before",
+                        },
+                        "retry_windows_by_token": {},
+                        "backfill_windows_by_token": {
+                            "AAVE": [
+                                {
+                                    "start_date": "2026-07-01",
+                                    "end_date": "2026-07-03",
+                                    "reason_codes": ["historical_market_gap"],
+                                    "market_ids": [
+                                        "cex:binance:AAVE/USDT"
+                                    ],
+                                    "issue_ids": [
+                                        "historical-1",
+                                        "historical-2",
+                                        "historical-3",
+                                    ],
+                                }
+                            ]
+                        },
+                        "issues": [
+                            {
+                                "issue_id": f"historical-{index}",
+                                "date": f"2026-07-0{index}",
+                                "category": "historical_gap",
+                                "reason_code": "historical_market_gap",
+                                "retryable": True,
+                                "market": {
+                                    "token_symbol": "AAVE",
+                                    "market_id": "cex:binance:AAVE/USDT",
+                                },
+                            }
+                            for index in range(1, 4)
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                quality_report_path=report_path,
+                database_path=database_path,
+            )
+
+            windows = service.retryable_windows()
+            self.assertEqual(len(windows), 1)
+            self.assertEqual(windows[0]["queue_type"], "historical_gap")
+            request = service.validate_retry_job(
+                {
+                    "token_symbol": "AAVE",
+                    "start_date": "2026-07-01",
+                    "end_date": "2026-07-03",
+                    "queue_type": "historical_gap",
+                }
+            )
+            self.assertEqual(
+                request["expected_observations"],
+                [
+                    {
+                        "market_id": "cex:binance:AAVE/USDT",
+                        "date": f"2026-07-0{index}",
+                    }
+                    for index in range(1, 4)
+                ],
+            )
+            with self.assertRaisesRegex(ValueError, "current quality report"):
+                service.validate_retry_job(
+                    {
+                        "token_symbol": "AAVE",
+                        "start_date": "2026-07-01",
+                        "end_date": "2026-07-03",
+                        "queue_type": "latest_completed_day",
+                    }
+                )
+
+    def test_manual_review_items_are_sanitized_and_never_retryable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "daily-latest.json"
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "fact_quality_report/v1",
+                        "publication": {},
+                        "manual_review_queue": [
+                            {
+                                "review_id": "review-hard-1",
+                                "issue_id": "hard-1",
+                                "token_symbol": " aave ",
+                                "market_id": "cex:binance:AAVE/USDT",
+                                "date": "2026-07-28",
+                                "category": "hard_invalid",
+                                "reason_code": "invalid_positive_ohlc",
+                                "source_url_hints": [
+                                    "https://api.binance.com/api/v3/klines?symbol=AAVEUSDT#fragment",
+                                    "javascript:alert(1)",
+                                    "https://user:secret@example.com/private",
+                                ],
+                            },
+                            {
+                                "review_id": "review-gap",
+                                "issue_id": "gap-1",
+                                "token_symbol": "AAVE",
+                                "market_id": "cex:binance:AAVE/USDT",
+                                "date": "2026-07-10",
+                                "category": "historical_gap",
+                                "reason_code": "historical_market_gap",
+                                "source_url_hints": [],
+                            },
+                            {
+                                "review_id": "review-bad-date",
+                                "issue_id": "bad-date",
+                                "token_symbol": "AAVE",
+                                "market_id": "cex:binance:AAVE/USDT",
+                                "date": "not-a-date",
+                                "category": "stale_market_unknown",
+                                "reason_code": "stale_market_lifecycle_unknown",
+                                "source_url_hints": [],
+                            },
+                        ],
+                        "issues": [
+                            {
+                                "issue_id": "hard-1",
+                                "message": "  Close price must be   positive.  ",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                quality_report_path=report_path,
+            )
+
+            items = service.manual_review_items()
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["token_symbol"], "AAVE")
+            self.assertEqual(
+                items[0]["reason_message"],
+                "Close price must be positive.",
+            )
+            self.assertEqual(
+                items[0]["source_url_hints"],
+                [
+                    "https://api.binance.com/api/v3/klines?symbol=AAVEUSDT"
+                ],
+            )
+            self.assertFalse(items[0]["retryable"])
+            self.assertEqual(
+                items[0]["action"],
+                "manual_primary_source_review",
+            )
+            self.assertFalse(items[0]["candidate_rejected"])
+            self.assertIsNone(items[0]["rejection_id"])
+
+    def test_lineage_matched_source_absence_enters_manual_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "daily-latest.json"
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "fact_quality_report/v1",
+                        "publication": {},
+                        "manual_review_queue": [
+                            {
+                                "review_id": "review-range-1",
+                                "issue_id": "range-1",
+                                "token_symbol": "AAVE",
+                                "market_id": "cex:htx:AAVE/USDT",
+                                "date": "2026-01-01",
+                                "category": "historical_gap",
+                                "reason_code": "source_range_unavailable",
+                                "source_url_hints": [
+                                    "https://api.huobi.pro/market/history/kline"
+                                ],
+                            }
+                        ],
+                        "issues": [
+                            {
+                                "issue_id": "range-1",
+                                "category": "historical_gap",
+                                "status": "needs_review",
+                                "retryable": False,
+                                "message": (
+                                    "The source endpoint cannot reach the "
+                                    "requested date window."
+                                ),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                quality_report_path=report_path,
+            )
+
+            items = service.manual_review_items()
+
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["reason_code"], "source_range_unavailable")
+            self.assertEqual(items[0]["category"], "historical_gap")
+            self.assertFalse(items[0]["retryable"])
+
+    def test_latest_integrity_checked_rejection_enters_manual_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rejection_id = "20260729T000000000000Z-abcdef123456"
+            bundle = root / "quality/rejected" / rejection_id
+            bundle.mkdir(parents=True)
+            rejected_report = {
+                "schema": "fact_quality_report/v1",
+                "rejection": {
+                    "schema": "fact_quality_rejection/v1",
+                    "rejection_id": rejection_id,
+                    "status": "rejected_hard_invalid",
+                },
+                "manual_review_queue": [
+                    {
+                        "review_id": "review-hard-1",
+                        "issue_id": "hard-1",
+                        "token_symbol": "AAVE",
+                        "market_id": "cex:binance:AAVE/USDT",
+                        "date": "2026-07-28",
+                        "category": "hard_invalid",
+                        "reason_code": "invalid_positive_ohlc",
+                        "source_url_hints": [
+                            "https://api.binance.com/api/v3/klines"
+                        ],
+                    }
+                ],
+                "issues": [
+                    {
+                        "issue_id": "hard-1",
+                        "message": "Close price must be positive.",
+                    }
+                ],
+            }
+            report_path = bundle / "report.json"
+            report_path.write_text(
+                json.dumps(rejected_report),
+                encoding="utf-8",
+            )
+            pointer = {
+                "schema": "fact_quality_rejection_pointer/v1",
+                "rejection_id": rejection_id,
+                "report": f"{rejection_id}/report.json",
+                "report_sha256": hashlib.sha256(
+                    report_path.read_bytes()
+                ).hexdigest(),
+            }
+            (root / "quality/rejected/latest.json").write_text(
+                json.dumps(pointer),
+                encoding="utf-8",
+            )
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                data_dir=root,
+                quality_report_path=root / "quality/daily-latest.json",
+            )
+
+            items = service.manual_review_items()
+
+            self.assertEqual(len(items), 1)
+            self.assertTrue(items[0]["candidate_rejected"])
+            self.assertEqual(items[0]["rejection_id"], rejection_id)
+            self.assertEqual(items[0]["category"], "hard_invalid")
+
+    def test_rejected_quality_pointer_traversal_and_hash_mismatch_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rejected_root = root / "quality/rejected"
+            rejected_root.mkdir(parents=True)
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                data_dir=root,
+                quality_report_path=root / "quality/daily-latest.json",
+            )
+            pointer_path = rejected_root / "latest.json"
+            invalid_pointers = [
+                {
+                    "schema": "fact_quality_rejection_pointer/v1",
+                    "rejection_id": "bundle",
+                    "report": "../../outside.json",
+                    "report_sha256": "0" * 64,
+                },
+                {
+                    "schema": "fact_quality_rejection_pointer/v1",
+                    "rejection_id": "bundle",
+                    "report": "bundle/report.json",
+                    "report_sha256": "0" * 64,
+                },
+            ]
+            bundle = rejected_root / "bundle"
+            bundle.mkdir()
+            (bundle / "report.json").write_text("{}", encoding="utf-8")
+            for pointer in invalid_pointers:
+                with self.subTest(report=pointer["report"]):
+                    pointer_path.write_text(
+                        json.dumps(pointer),
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(service.manual_review_items(), [])
+
+    def test_retry_job_requires_new_report_and_resolved_market_dates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "quality/daily-latest.json"
+            report_path.parent.mkdir(parents=True)
+            database_path = root / "market_facts.sqlite3"
+            write_retry_database(database_path, "import-before")
+            baseline_report = {
+                "schema": "fact_quality_report/v1",
+                "publication": {
+                    "status": "published_with_retry_queue",
+                    "dataset_snapshot_id": "snapshot-before",
+                    "import_run_id": "import-before",
+                },
+                "retry_windows_by_token": {
+                    "AAVE": [
+                        {
+                            "start_date": "2026-07-28",
+                            "end_date": "2026-07-28",
+                            "reason_codes": ["d1_active_market_gap"],
+                            "market_ids": ["cex:binance:AAVE/USDT"],
+                            "issue_ids": ["issue-before"],
+                        }
+                    ]
+                },
+                "issues": [
+                    {
+                        "date": "2026-07-28",
+                        "issue_id": "issue-before",
+                        "category": "d1_active_gap",
+                        "reason_code": "d1_active_market_gap",
+                        "retryable": True,
+                        "market": {
+                            "token_symbol": "AAVE",
+                            "market_id": "cex:binance:AAVE/USDT",
+                        },
+                    }
+                ],
+            }
+            report_path.write_text(
+                json.dumps(baseline_report),
+                encoding="utf-8",
+            )
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "admin/jobs",
+                quality_report_path=report_path,
+                database_path=database_path,
+                data_dir=root,
+            )
+            request = service.validate_retry_job(
+                {
+                    "token_symbol": "AAVE",
+                    "start_date": "2026-07-28",
+                    "end_date": "2026-07-28",
+                }
+            )
+            service.jobs["retry"] = {
+                "job_id": "retry",
+                "job_type": "retry_failed",
+                **request,
+                "requested_by": "admin",
+                "status": "queued",
+                "stage": "queued",
+                "created_at": "2026-07-29T00:00:00+00:00",
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+                "error_code": None,
+                "retryable": False,
+                "publication_committed": False,
+                "result": None,
+            }
+
+            with patch("dashboard.admin.subprocess.run"):
+                service._run_job("retry")
+
+            self.assertEqual(service.jobs["retry"]["status"], "partial")
+            self.assertEqual(
+                service.jobs["retry"]["error_code"],
+                "retry_not_resolved",
+            )
+            self.assertTrue(service.jobs["retry"]["publication_committed"])
+
+            refreshed_report = {
+                **baseline_report,
+                "publication": {
+                    "dataset_snapshot_id": "snapshot-after",
+                    "import_run_id": "import-after",
+                },
+                "retry_windows_by_token": {},
+                "issues": [
+                    {
+                        "date": "2026-07-28",
+                        "category": "historical_gap",
+                        "market": {
+                            "token_symbol": "AAVE",
+                            "market_id": "cex:binance:AAVE/USDT",
+                        },
+                    }
+                ],
+            }
+            report_path.write_text(
+                json.dumps(refreshed_report),
+                encoding="utf-8",
+            )
+            write_retry_database(database_path, "import-after")
+            self.assertIn(
+                "neither observed",
+                service._verify_retry_resolution(service.jobs["retry"]),
+            )
+
+            refreshed_report["issues"] = []
+            report_path.write_text(
+                json.dumps(refreshed_report),
+                encoding="utf-8",
+            )
+            write_retry_database(
+                database_path,
+                "import-after",
+                cex_rows=[
+                    (
+                        "2026-07-28",
+                        "AAVE",
+                        "BINANCE",
+                        "aave/usdt",
+                    )
+                ],
+            )
+            self.assertIsNone(
+                service._verify_retry_resolution(service.jobs["retry"])
+            )
+            error, evidence = service._retry_resolution_evidence(
+                service.jobs["retry"]
+            )
+            self.assertIsNone(error)
+            self.assertEqual(evidence["observed_count"], 1)
+            self.assertEqual(evidence["confirmed_absence_count"], 0)
+
+            write_retry_database(database_path, "import-after")
+            refreshed_report["issues"] = [
+                    {
+                        "date": "2026-07-28",
+                        "category": "historical_gap",
+                        "status": "needs_review",
+                        "reason_code": "source_range_unavailable",
+                        "retryable": False,
+                    "market": {
+                        "token_symbol": "AAVE",
+                        "market_id": "cex:binance:AAVE/USDT",
+                    },
+                }
+            ]
+            report_path.write_text(
+                json.dumps(refreshed_report),
+                encoding="utf-8",
+            )
+
+            error, evidence = service._retry_resolution_evidence(
+                service.jobs["retry"]
+            )
+            self.assertIn("remain neither observed", error)
+            self.assertEqual(evidence["observed_count"], 0)
+            self.assertEqual(evidence["confirmed_absence_count"], 0)
+            self.assertEqual(evidence["unresolved_count"], 1)
+
+            def retry_outcome(status, reason_code, retryable):
+                return {
+                    "date": "2026-07-28",
+                    "category": "historical_gap",
+                    "status": status,
+                    "reason_code": reason_code,
+                    "retryable": retryable,
+                    "market": {
+                        "token_symbol": "AAVE",
+                        "market_id": "cex:binance:AAVE/USDT",
+                    },
+                }
+
+            outcome_cases = (
+                (
+                    "one valid terminal source absence resolves",
+                    [
+                        retry_outcome(
+                            "source_no_observation",
+                            "no_candles",
+                            False,
+                        )
+                    ],
+                    True,
+                ),
+                (
+                    "terminal source absence with collection failure remains unresolved",
+                    [
+                        retry_outcome(
+                            "source_no_observation",
+                            "no_candles",
+                            False,
+                        ),
+                        retry_outcome("collection_failed", "network", True),
+                    ],
+                    False,
+                ),
+                (
+                    "terminal source absence with needs review remains unresolved",
+                    [
+                        retry_outcome(
+                            "source_no_observation",
+                            "no_candles",
+                            False,
+                        ),
+                        retry_outcome("needs_review", "not_listed", False),
+                    ],
+                    False,
+                ),
+                (
+                    "conflicting terminal resolutions remain unresolved",
+                    [
+                        retry_outcome(
+                            "source_no_observation",
+                            "no_candles",
+                            False,
+                        ),
+                        retry_outcome(
+                            "unsupported",
+                            "source_range_unavailable",
+                            False,
+                        ),
+                    ],
+                    False,
+                ),
+                (
+                    "duplicate terminal outcomes remain unresolved",
+                    [
+                        retry_outcome(
+                            "source_no_observation",
+                            "no_candles",
+                            False,
+                        ),
+                        retry_outcome(
+                            "source_no_observation",
+                            "no_candles",
+                            False,
+                        ),
+                    ],
+                    False,
+                ),
+            )
+            for name, issues, resolves in outcome_cases:
+                with self.subTest(case=name):
+                    refreshed_report["issues"] = issues
+                    report_path.write_text(
+                        json.dumps(refreshed_report),
+                        encoding="utf-8",
+                    )
+                    write_retry_database(database_path, "import-after")
+
+                    error, evidence = service._retry_resolution_evidence(
+                        service.jobs["retry"]
+                    )
+
+                    if resolves:
+                        self.assertIsNone(error)
+                        self.assertEqual(
+                            evidence["confirmed_absence_count"], 1
+                        )
+                        self.assertEqual(evidence["unresolved_count"], 0)
+                    else:
+                        self.assertIn("remain neither observed", error)
+                        self.assertEqual(
+                            evidence["confirmed_absence_count"], 0
+                        )
+                        self.assertEqual(evidence["unresolved_count"], 1)
+
+    def test_onboarding_lock_conflict_reconciles_pending_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_path = root / "collection/collection.lock"
+            lock_path.parent.mkdir(parents=True)
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "admin/jobs",
+                registry_path=root / "admin/token_registry.json",
+                data_dir=root,
+                collection_lock_path=lock_path,
+            )
+            record = self.runtime_record(status="pending")
+            record["last_job_id"] = "onboard"
+            service.registry.upsert(record)
+            service.jobs["onboard"] = {
+                "job_id": "onboard",
+                "job_type": "token_onboarding",
+                "token_symbol": "XYZ",
+                "chain": "base",
+                "contract_address": record["contract_address"],
+                "start_date": "2026-07-01",
+                "end_date": "2026-07-28",
+                "status": "queued",
+                "stage": "queued",
+                "created_at": "2026-07-29T00:00:00+00:00",
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+                "error_code": None,
+                "retryable": False,
+                "publication_committed": False,
+                "result": None,
+            }
+
+            with lock_path.open("a+", encoding="utf-8") as lock_handle:
+                fcntl.flock(
+                    lock_handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                with patch("dashboard.admin.subprocess.run") as run:
+                    service._run_job("onboard")
+                run.assert_not_called()
+
+            self.assertEqual(
+                service.jobs["onboard"]["error_code"],
+                "collection_in_progress",
+            )
+            self.assertEqual(
+                service.registry.get("base", record["contract_address"])["status"],
+                "needs_review",
+            )
+
+    def test_onboarding_queues_pending_registry_without_cex_inference(self):
+        candidate = {
+            "identity": {
+                "token_symbol": "XYZ",
+                "token_name": "XYZ Token",
+                "chain": "base",
+                "contract_address": "0x" + "12" * 20,
+                "decimals": 18,
+                "coingecko_id": None,
+                "source": "geckoterminal",
+                "source_token_id": "base_0x" + "12" * 20,
+            },
+            "discovery": {
+                "usable_pool_count": 1,
+                "top_pools": [{"pool_address": "0x" + "34" * 20}],
+            },
+            "capabilities": {
+                "dex_daily": "available",
+                "tvl": "available_after_collection",
+                "dex_depth": "protocol_dependent",
+                "cex": "requires_manual_mapping",
+            },
+            "already_configured": False,
+            "registration": {
+                "origin": None,
+                "status": None,
+                "cex_mapping_status": "requires_manual_review",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                registry_path=root / "token_registry.json",
+            )
+            with patch.object(service, "resolve_token", return_value=candidate), patch(
+                "dashboard.admin.threading.Thread"
+            ) as thread:
+                job = service.create_onboarding_job(
+                    {
+                        "chain": "base",
+                        "contract_address": candidate["identity"]["contract_address"],
+                        "expected_token_symbol": "XYZ",
+                        "history_days": 30,
+                    },
+                    "admin",
+                )
+
+            record = service.registry.get(
+                "base",
+                candidate["identity"]["contract_address"],
+            )
+            self.assertEqual(job["job_type"], "token_onboarding")
+            self.assertEqual(record["status"], "pending")
+            self.assertEqual(
+                record["cex_mapping"]["status"],
+                "requires_manual_review",
+            )
+            thread.return_value.start.assert_called_once_with()
+
+    def test_onboarding_job_persistence_failure_precedes_registry_mutation(self):
+        candidate = {
+            "identity": {
+                "token_symbol": "XYZ",
+                "token_name": "XYZ Token",
+                "chain": "base",
+                "contract_address": "0x" + "12" * 20,
+                "decimals": 18,
+                "coingecko_id": None,
+                "source": "geckoterminal",
+                "source_token_id": "base_0x" + "12" * 20,
+            },
+            "discovery": {
+                "usable_pool_count": 1,
+                "top_pools": [{"pool_address": "0x" + "34" * 20}],
+            },
+            "capabilities": {
+                "dex_daily": "available",
+                "tvl": "available_after_collection",
+                "dex_depth": "protocol_dependent",
+                "cex": "requires_manual_mapping",
+            },
+            "already_configured": False,
+            "registration": {
+                "origin": None,
+                "status": None,
+                "cex_mapping_status": "requires_manual_review",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                registry_path=root / "token_registry.json",
+            )
+            with patch.object(
+                service,
+                "resolve_token",
+                return_value=candidate,
+            ), patch.object(
+                service,
+                "_save_job",
+                side_effect=OSError("disk unavailable"),
+            ), patch(
+                "dashboard.admin.threading.Thread"
+            ) as thread:
+                with self.assertRaisesRegex(OSError, "disk unavailable"):
+                    service.create_onboarding_job(
+                        {
+                            "chain": "base",
+                            "contract_address": candidate["identity"][
+                                "contract_address"
+                            ],
+                            "expected_token_symbol": "XYZ",
+                        },
+                        "admin",
+                    )
+
+            self.assertEqual(service.jobs, {})
+            self.assertIsNone(
+                service.registry.get(
+                    "base",
+                    candidate["identity"]["contract_address"],
+                )
+            )
+            thread.assert_not_called()
+
+    def test_onboarding_activates_only_after_published_dex_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database_path = root / "market_facts.sqlite3"
+            connection = sqlite3.connect(database_path)
+            connection.execute(
+                "CREATE TABLE dex_pool_daily (token_symbol TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO dex_pool_daily (token_symbol) VALUES ('XYZ')"
+            )
+            connection.commit()
+            connection.close()
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                registry_path=root / "token_registry.json",
+                database_path=database_path,
+            )
+            record = self.runtime_record(status="pending")
+            service.registry.upsert(record)
+            service.jobs["onboard"] = {
+                "job_id": "onboard",
+                "job_type": "token_onboarding",
+                "token_symbol": "XYZ",
+                "chain": "base",
+                "contract_address": record["contract_address"],
+                "start_date": "2026-07-01",
+                "end_date": "2026-07-28",
+                "status": "queued",
+                "stage": "resolve_identity",
+                "created_at": "2026-07-29T00:00:00+00:00",
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+                "error_code": None,
+                "retryable": False,
+                "publication_committed": False,
+                "result": None,
+            }
+
+            with patch("dashboard.admin.subprocess.run") as run:
+                service._run_job("onboard")
+
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertIn("--dex-only", commands[0])
+            self.assertEqual(
+                run.call_args_list[0].kwargs["env"]["TOKEN_ONBOARDING_JOB_ID"],
+                "onboard",
+            )
+            self.assertNotIn(
+                "TOKEN_ONBOARDING_JOB_ID",
+                run.call_args_list[1].kwargs["env"],
+            )
+            self.assertTrue(any("fetch_tvl.py" in command[1] for command in commands))
+            self.assertTrue(any("fetch_dex_depth.py" in command[1] for command in commands))
+            processed_dir = (root.parent / f".{root.name}-processed").resolve()
+            tvl_command = next(
+                command for command in commands if "fetch_tvl.py" in command[1]
+            )
+            dex_depth_command = next(
+                command for command in commands if "fetch_dex_depth.py" in command[1]
+            )
+            self.assertEqual(
+                tvl_command[tvl_command.index("--output-dir") + 1],
+                str(processed_dir),
+            )
+            self.assertEqual(
+                tvl_command[tvl_command.index("--raw-root") + 1],
+                str((root / "raw/tvl").resolve()),
+            )
+            self.assertEqual(
+                dex_depth_command[dex_depth_command.index("--output-dir") + 1],
+                str(processed_dir),
+            )
+            self.assertEqual(
+                dex_depth_command[dex_depth_command.index("--raw-root") + 1],
+                str((root / "raw/dex-depth").resolve()),
+            )
+            self.assertEqual(service.jobs["onboard"]["status"], "succeeded")
+            self.assertTrue(service.jobs["onboard"]["publication_committed"])
+            self.assertEqual(
+                service.registry.get("base", record["contract_address"])["status"],
+                "active",
+            )
+
+    def test_onboarding_verification_failure_records_committed_partial_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = AdminService(
+                username="admin",
+                password_hash="hash",
+                job_dir=root / "jobs",
+                registry_path=root / "token_registry.json",
+                database_path=root / "missing-market-facts.sqlite3",
+            )
+            record = self.runtime_record(status="pending")
+            service.registry.upsert(record)
+            service.jobs["onboard"] = {
+                "job_id": "onboard",
+                "job_type": "token_onboarding",
+                "token_symbol": "XYZ",
+                "chain": "base",
+                "contract_address": record["contract_address"],
+                "start_date": "2026-07-01",
+                "end_date": "2026-07-28",
+                "status": "queued",
+                "stage": "resolve_identity",
+                "created_at": "2026-07-29T00:00:00+00:00",
+                "started_at": None,
+                "finished_at": None,
+                "error": None,
+                "error_code": None,
+                "retryable": False,
+                "publication_committed": False,
+                "result": None,
+            }
+
+            with patch("dashboard.admin.subprocess.run"):
+                service._run_job("onboard")
+
+            job = service.jobs["onboard"]
+            self.assertEqual(job["status"], "partial")
+            self.assertEqual(
+                job["error_code"],
+                "token_onboarding_verification_failed",
+            )
+            self.assertTrue(job["publication_committed"])
+            self.assertEqual(job["result"]["dex_daily"], "published_unverified")
+            self.assertEqual(
+                service.registry.get("base", record["contract_address"])["status"],
+                "needs_review",
+            )
+
+    def test_public_response_cache_keeps_only_active_generation_and_minute(self):
+        server.clear_runtime_caches()
+        self.assertEqual(
+            server._build_public_api_response_cached.cache_info().maxsize,
+            server.SERIALIZED_RESPONSE_CACHE_SIZE,
+        )
+        self.assertEqual(
+            server._build_enriched_payload_cached.cache_info().maxsize,
+            server.LARGE_PAYLOAD_CACHE_SIZE,
+        )
+        first_signature = (("facts.sqlite3", 1, 100),)
+        second_signature = (("facts.sqlite3", 2, 100),)
+        payload = {"metadata": {}, "markets": []}
+
+        with patch.object(server, "build_market_catalog", return_value=payload):
+            with patch.object(server, "api_source_signature", return_value=first_signature):
+                with patch.object(server, "api_freshness_bucket", return_value=100):
+                    server.build_public_api_response("catalog", (), True)
+            self.assertEqual(server._build_public_api_response_cached.cache_info().currsize, 1)
+
+            with patch.object(server, "api_source_signature", return_value=second_signature):
+                with patch.object(server, "api_freshness_bucket", return_value=100):
+                    server.build_public_api_response("catalog", (), True)
+            self.assertEqual(server._build_public_api_response_cached.cache_info().currsize, 1)
+
+            with patch.object(server, "api_source_signature", return_value=second_signature):
+                with patch.object(server, "api_freshness_bucket", return_value=101):
+                    server.build_public_api_response("catalog", (), True)
+            self.assertEqual(server._build_public_api_response_cached.cache_info().currsize, 1)
+
+    def test_source_generation_change_clears_large_assembled_payloads(self):
+        server.clear_runtime_caches()
+        first_signature = (("facts.sqlite3", 1, 100),)
+        second_signature = (("facts.sqlite3", 2, 100),)
+        cache_key = (
+            None,
+            None,
+            "",
+            "cex.csv",
+            "dex.csv",
+            first_signature,
+            "",
+            (),
+            "",
+            (),
+            "",
+            (),
+            "",
+            (),
+        )
+        payload = {"metadata": {}, "cex_markets": [], "dex_pools": []}
+
+        with patch.object(
+            server,
+            "_build_market_payload_cached",
+            return_value=payload,
+        ):
+            with patch.object(server, "overlay_tvl_snapshot", side_effect=lambda value, _: value):
+                with patch.object(
+                    server,
+                    "overlay_cex_depth_snapshot",
+                    side_effect=lambda value, _, __: value,
+                ):
+                    with patch.object(
+                        server,
+                        "overlay_dex_depth_snapshot",
+                        side_effect=lambda value, _: value,
+                    ):
+                        server._build_enriched_payload_cached(cache_key)
+
+        self.assertEqual(server._build_enriched_payload_cached.cache_info().currsize, 1)
+        server.ensure_source_cache_generation(first_signature)
+        self.assertEqual(server._build_enriched_payload_cached.cache_info().currsize, 1)
+        server.ensure_source_cache_generation(second_signature)
+        self.assertEqual(server._build_enriched_payload_cached.cache_info().currsize, 0)
+
+    def test_source_generation_clear_does_not_wait_for_old_payload_build(self):
+        server.clear_runtime_caches()
+        first_signature = (("facts.sqlite3", 1, 100),)
+        second_signature = (("facts.sqlite3", 2, 100),)
+        current_signature = [first_signature]
+        build_started = Event()
+        release_build = Event()
+        generation_change_started = Event()
+        generation_change_finished = Event()
+        old_payload = {
+            "metadata": {"generation": "old"},
+            "cex_markets": [],
+            "dex_pools": [],
+        }
+        new_payload = {
+            "metadata": {"generation": "new"},
+            "cex_markets": [],
+            "dex_pools": [],
+        }
+
+        def slow_build(_cache_key, source_signature, _freshness_bucket):
+            if source_signature == first_signature:
+                build_started.set()
+                if not release_build.wait(timeout=2):
+                    raise TimeoutError("test did not release the payload build")
+                return old_payload
+            return new_payload
+
+        def change_generation():
+            generation_change_started.set()
+            current_signature[0] = second_signature
+            server.ensure_source_cache_generation(second_signature)
+            generation_change_finished.set()
+
+        with patch.object(
+            server,
+            "api_source_signature",
+            side_effect=lambda: current_signature[0],
+        ), patch.object(
+            server,
+            "market_payload_cache_key",
+            return_value=("first-generation",),
+        ), patch.object(
+            server,
+            "_build_lifecycle_payload_cached",
+            side_effect=slow_build,
+        ), patch.object(
+            server,
+            "attach_freshness_metadata",
+            side_effect=lambda value: value,
+        ):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                build_future = executor.submit(server.build_market_payload)
+                self.assertTrue(build_started.wait(timeout=1))
+                generation_future = executor.submit(change_generation)
+                self.assertTrue(generation_change_started.wait(timeout=1))
+                try:
+                    self.assertTrue(generation_change_finished.wait(timeout=1))
+                finally:
+                    release_build.set()
+                self.assertEqual(build_future.result(timeout=1), new_payload)
+                generation_future.result(timeout=1)
+
+        self.assertEqual(server._SOURCE_CACHE_GENERATION, second_signature)
+
+    def test_cex_depth_retention_plan_is_dry_until_explicitly_applied(self):
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            raw_root = Path(directory) / "cex-depth"
+            old_snapshot = raw_root / "20260718T120000Z-old"
+            recent_snapshot = raw_root / "20260726T120000Z-recent"
+            old_snapshot.mkdir(parents=True)
+            recent_snapshot.mkdir(parents=True)
+            (old_snapshot / "manifest.json").write_text('{"snapshot":"old"}\n', encoding="utf-8")
+            (recent_snapshot / "manifest.json").write_text(
+                '{"snapshot":"recent"}\n',
+                encoding="utf-8",
+            )
+
+            actions = plan_retention(
+                raw_root,
+                now=now,
+                keep_raw_days=7,
+                keep_archive_days=30,
+            )
+
+            self.assertEqual([action.action for action in actions], ["compress"])
+            self.assertTrue(old_snapshot.exists())
+            self.assertTrue(recent_snapshot.exists())
+
+            apply_retention(actions)
+
+            self.assertFalse(old_snapshot.exists())
+            self.assertTrue(recent_snapshot.exists())
+            self.assertTrue(
+                (raw_root / "archives/20260718T120000Z-old.tar.gz").is_file()
+            )
+
+    def test_cex_depth_retention_rejects_broad_targets_and_expires_archives(self):
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        with self.assertRaises(ValueError):
+            plan_retention(
+                Path("/"),
+                now=now,
+                keep_raw_days=7,
+                keep_archive_days=30,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            raw_root = Path(directory) / "cex-depth"
+            archive_root = raw_root / "archives"
+            archive_root.mkdir(parents=True)
+            expired = archive_root / "20260601T120000Z-expired.tar.gz"
+            expired.write_bytes(b"already-reviewed-archive")
+
+            actions = plan_retention(
+                raw_root,
+                now=now,
+                keep_raw_days=7,
+                keep_archive_days=30,
+            )
+            self.assertEqual([action.action for action in actions], ["delete_archive"])
+            apply_retention(actions)
+            self.assertFalse(expired.exists())
+
+    def test_cex_depth_retention_rejects_symlink_root_before_resolving_it(self):
+        now = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            real_root = base / "real/cex-depth"
+            real_root.mkdir(parents=True)
+            symlink_root = base / "cex-depth"
+            symlink_root.symlink_to(real_root, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "not a symlink"):
+                plan_retention(
+                    symlink_root,
+                    now=now,
+                    keep_raw_days=7,
+                    keep_archive_days=30,
+                )
+
+    def test_production_templates_enforce_loopback_restart_https_and_retention(self):
+        project_root = Path(__file__).resolve().parents[1]
+        service = (
+            project_root / "deploy/systemd/cex-dex-dashboard.service.in"
+        ).read_text(encoding="utf-8")
+        user_service = (
+            project_root / "deploy/systemd/cex-dex-dashboard-user.service.in"
+        ).read_text(encoding="utf-8")
+        nginx = (
+            project_root / "deploy/nginx/cex-dex-dashboard.conf.in"
+        ).read_text(encoding="utf-8")
+        retention = (
+            project_root / "deploy/systemd/cex-dex-cex-depth-retention.service.in"
+        ).read_text(encoding="utf-8")
+        daily_collection = (
+            project_root / "deploy/systemd/cex-dex-daily.service.in"
+        ).read_text(encoding="utf-8")
+        depth_collection = (
+            project_root / "deploy/systemd/cex-dex-depth.service.in"
+        ).read_text(encoding="utf-8")
+        daily_user_collection = (
+            project_root / "deploy/systemd/cex-dex-daily-user.service.in"
+        ).read_text(encoding="utf-8")
+        depth_user_collection = (
+            project_root / "deploy/systemd/cex-dex-depth-user.service.in"
+        ).read_text(encoding="utf-8")
+        runbook = (
+            project_root / "docs/production-hardening.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("--host 127.0.0.1", service)
+        self.assertIn("Restart=on-failure", service)
+        self.assertIn("EnvironmentFile=-/etc/cex-dex/dashboard.env", service)
+        self.assertIn("ReadWritePaths=@MARKET_DATA_DIR@", service)
+        self.assertIn("ReadWritePaths=@MARKET_WORK_DIR@", service)
+        self.assertIn("ReadWritePaths=@ADMIN_JOB_DIR@", service)
+        self.assertNotIn("ReadWritePaths=-@PROJECT_ROOT@/data/", service)
+        self.assertIn("Environment=ADMIN_ENABLED=false", user_service)
+        self.assertIn(
+            "Environment=MARKET_DATA_DIR=@MARKET_DATA_DIR@",
+            user_service,
+        )
+        self.assertIn(
+            "Environment=MARKET_CEX_INSTRUMENT_LIFECYCLE="
+            "@MARKET_DATA_DIR@/cex_instrument_lifecycle.json",
+            user_service,
+        )
+        self.assertIn("--host @BIND_HOST@", user_service)
+        self.assertIn("Restart=on-failure", user_service)
+        self.assertIn("WantedBy=default.target", user_service)
+        self.assertNotIn("CapabilityBoundingSet=", user_service)
+        self.assertIn("listen 443 ssl", nginx)
+        self.assertIn("return 301 https://@DOMAIN@$request_uri;", nginx)
+        self.assertNotIn("https://$host$request_uri", nginx)
+        self.assertIn("proxy_pass http://127.0.0.1:8765", nginx)
+        self.assertIn("location ^~ /api/admin/ { return 404; }", nginx)
+        self.assertIn("retain_cex_depth_raw.py", retention)
+        self.assertIn("--root @MARKET_DATA_DIR@/raw/cex-depth", retention)
+        self.assertIn(
+            "ReadWritePaths=@MARKET_DATA_DIR@/raw/cex-depth",
+            retention,
+        )
+        self.assertIn("--apply", retention)
+        self.assertIn(
+            "EnvironmentFile=-/etc/cex-dex/dashboard.env",
+            daily_collection,
+        )
+        self.assertIn(
+            "EnvironmentFile=-/etc/cex-dex/dashboard.env",
+            depth_collection,
+        )
+        for collection in (daily_collection, depth_collection):
+            self.assertIn("User=@SERVICE_USER@", collection)
+            self.assertIn("Group=@SERVICE_GROUP@", collection)
+            self.assertIn("--data-dir @MARKET_DATA_DIR@", collection)
+            self.assertIn("ReadOnlyPaths=@PROJECT_ROOT@", collection)
+            self.assertIn("ReadWritePaths=@MARKET_DATA_DIR@", collection)
+            self.assertIn("ReadWritePaths=@MARKET_WORK_DIR@", collection)
+            self.assertIn("ProtectSystem=strict", collection)
+        for collection in (daily_user_collection, depth_user_collection):
+            self.assertIn("Environment=MARKET_DATA_DIR=@MARKET_DATA_DIR@", collection)
+            self.assertIn("--data-dir @MARKET_DATA_DIR@", collection)
+            self.assertNotIn("/etc/cex-dex", collection)
+            self.assertNotIn("User=root", collection)
+        self.assertIn("non-destructive unless `--apply`", runbook)
+        self.assertIn("systemctl --user enable --now", runbook)
+
+
+class TokenReviewHandlerTest(unittest.TestCase):
+    request_id = "a" * 32
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.service = AdminServiceTest().review_service(root, password_hash=hash_password("test-password"), allow_open_local=True)
+        self.service.sessions["session"] = {
+            "username": "reviewer", "csrf_token": "csrf",
+            "expires_at": datetime(2099, 1, 1, tzinfo=timezone.utc),
+        }
+        self.patch = patch.object(server, "ADMIN_SERVICE", self.service)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        for method, value in [("resolve_token", AdminServiceTest.review_candidate()),
+                              ("create_onboarding_job", {"status": "queued"})]:
+            boundary = patch.object(self.service, method, return_value=value)
+            boundary.start()
+            self.addCleanup(boundary.stop)
+
+    def handler(self, path, payload=None, *, authenticated=True, csrf=True):
+        handler = object.__new__(server.MarketMonitorHandler)
+        handler.path = path
+        handler.server = SimpleNamespace(server_address=("127.0.0.1", 8765))
+        handler.client_address = ("127.0.0.1", 40000)
+        handler.headers = {"Content-Type": "application/json"}
+        if authenticated:
+            handler.headers["Cookie"] = "admin_session=session"
+        if csrf:
+            handler.headers["X-CSRF-Token"] = "csrf"
+        handler.read_json = Mock(return_value=payload or {})
+        handler.send_json = Mock()
+        handler.send_error = Mock()
+        handler.directory = self.temp.name
+        return handler
+
+    def submit(self):
+        handler = self.handler("/api/admin/tokens", AdminServiceTest.review_payload())
+        with patch.object(self.service, "resolve_token", return_value=AdminServiceTest.review_candidate()), patch.object(self.service, "create_onboarding_job", return_value={"status": "queued"}) as onboarding:
+            handler.do_POST()
+            onboarding.assert_not_called()
+        response, status = handler.send_json.call_args.args[:2]
+        self.assertIn(status, {200, 202})
+        self.assertIn("request_id", response)
+        return response, status
+
+    def test_admin_submit_persists_review_with_selected_history_and_dedupes(self):
+        first, status = self.submit()
+        self.assertEqual(status, 202)
+        self.assertEqual(first["status"], "pending_review")
+        self.assertEqual(first["requested_history_days"], 30)
+        self.assertEqual(first["submitter"], "reviewer")
+        second, status = self.submit()
+        self.assertEqual(status, 200)
+        self.assertEqual(first["request_id"], second["request_id"])
+        self.assertTrue(second["deduplicated"])
+
+    def test_all_review_mutations_require_session_csrf_and_configured_reviewer(self):
+        routes = [("/api/admin/tokens", AdminServiceTest.review_payload())] + [
+            (f"/api/admin/token-reviews/{self.request_id}/{action}", payload)
+            for action, payload in [("decision", {"decision": "approve", "expected_revision": 1}),
+                                    ("notification/retry", {"expected_revision": 1}),
+                                    ("start", {"expected_revision": 1})]
+        ]
+        for path, payload in routes:
+            for authenticated, csrf, status in [(False, True, 401), (True, False, 403)]:
+                with self.subTest(path=path, authenticated=authenticated, csrf=csrf):
+                    handler = self.handler(path, payload, authenticated=authenticated, csrf=csrf)
+                    handler.do_POST()
+                    self.assertEqual(handler.send_json.call_args.args[1], status)
+            with self.subTest(path=path, mode="open"), patch.object(self.service, "login_required", False), patch.object(self.service, "submit_token_review") as submit:
+                handler = self.handler(path, payload)
+                handler.do_POST()
+                self.assertEqual(handler.send_json.call_args.args[1], 403)
+                self.assertEqual(handler.send_json.call_args.args[0]["error_code"], "reviewer_required")
+                submit.assert_not_called()
+            with self.subTest(path=path, mode="wrong_actor"):
+                self.service.sessions["session"]["username"] = "someone_else"
+                handler = self.handler(path, payload)
+                handler.do_POST()
+                self.assertEqual(handler.send_json.call_args.args[1], 403)
+                self.service.sessions["session"]["username"] = "reviewer"
+        self.assertFalse(self.service.review_store_path.exists())
+
+    def test_review_routes_reject_malformed_paths_query_and_exact_payload_before_service(self):
+        prefix = f"/api/admin/token-reviews/{self.request_id}"
+        cases = [(prefix + "/start?x=1", {"expected_revision": 1}),
+                 (prefix + "/start?", {"expected_revision": 1}),
+                 (prefix + "/start/", {"expected_revision": 1}),
+                 (prefix.replace(self.request_id, "A" * 32) + "/start", {"expected_revision": 1}),
+                 (prefix.replace(self.request_id, "abc") + "/start", {"expected_revision": 1}),
+                 (prefix + "/decision", {"decision": "APPROVE", "expected_revision": 1})]
+        for action in ["decision", "notification/retry", "start"]:
+            base = {"decision": "approve"} if action == "decision" else {}
+            for revision in [True, False, 0, -1, 1.5, "1", None]:
+                cases.append((prefix + "/" + action, {**base, "expected_revision": revision}))
+            cases.extend([(prefix + "/" + action, base),
+                          (prefix + "/" + action, {**base, "expected_revision": 1, "username": "reviewer"})])
+        payload = AdminServiceTest.review_payload()
+        for extra in [{"username": "reviewer"}, {"history_days": True}, {"history_days": "30"},
+                      {"history_days": 0}, {"history_days": 181}, {"chain": 1}]:
+            cases.append(("/api/admin/tokens", {**payload, **extra}))
+        cases.extend([("/api/admin/tokens?x=1", payload), ("/api/admin/tokens", {k: v for k, v in payload.items() if k != "history_days"})])
+        with patch.object(self.service, "submit_token_review") as submit, patch.object(self.service, "decide_token_review") as decide, patch.object(self.service, "retry_token_review_notification") as retry, patch.object(self.service, "start_token_review_onboarding") as start:
+            for path, body in cases:
+                with self.subTest(path=path, body=body):
+                    handler = self.handler(path, body)
+                    handler.do_POST()
+                    self.assertEqual(handler.send_json.call_args.args[1], 400)
+            for service_call in [submit, decide, retry, start]:
+                service_call.assert_not_called()
+
+    def test_admin_list_is_bounded_authenticated_and_open_read_only(self):
+        handler = self.handler("/api/admin/token-reviews", authenticated=False)
+        handler.do_GET()
+        self.assertEqual(handler.send_json.call_args.args[1], 401)
+        for suffix in ["?limit=1000", "?"]:
+            handler = self.handler("/api/admin/token-reviews" + suffix)
+            handler.do_GET()
+            self.assertEqual(handler.send_json.call_args.args[1], 400)
+        with patch.object(self.service, "list_token_reviews", return_value=[]) as listing:
+            for open_mode in [False, True]:
+                with patch.object(self.service, "login_required", not open_mode):
+                    handler = self.handler("/api/admin/token-reviews")
+                    handler.do_GET()
+                    self.assertEqual(handler.send_json.call_args.args[0], {"reviews": [], "count": 0})
+                    listing.assert_called_with(limit=50)
+
+    def test_exact_review_get_reaches_an_item_outside_the_recent_list(self):
+        review, _ = self.submit()
+        path = f"/api/admin/token-reviews/{review['request_id']}"
+
+        handler = self.handler(path, authenticated=False)
+        handler.do_GET()
+        self.assertEqual(handler.send_json.call_args.args[1], 401)
+
+        with patch.object(self.service, "list_token_reviews", return_value=[]):
+            for open_mode in [False, True]:
+                with self.subTest(open_mode=open_mode), patch.object(
+                    self.service, "login_required", not open_mode
+                ):
+                    handler = self.handler(path)
+                    handler.do_GET()
+                    self.assertEqual(
+                        handler.send_json.call_args.args[0],
+                        {key: value for key, value in review.items() if key != "deduplicated"},
+                    )
+
+    def test_exact_review_get_rejects_noncanonical_routes_and_sanitizes_errors(self):
+        path = f"/api/admin/token-reviews/{self.request_id}"
+        for suffix in ["?x=1", "?", "/"]:
+            with self.subTest(suffix=suffix):
+                handler = self.handler(path + suffix)
+                handler.do_GET()
+                self.assertEqual(handler.send_json.call_args.args[1], 400)
+        for invalid_id in ["A" * 32, "a" * 31, "../" + self.request_id]:
+            with self.subTest(invalid_id=invalid_id):
+                handler = self.handler(f"/api/admin/token-reviews/{invalid_id}")
+                handler.do_GET()
+                self.assertEqual(handler.send_json.call_args.args[1], 400)
+
+        for error, expected_status in [
+            (TokenReviewError("review_not_found", "/private/review.sqlite3"), 404),
+            (OSError("SMTP private@example.test /private/review.sqlite3"), 503),
+        ]:
+            with self.subTest(error=type(error).__name__), patch.object(
+                self.service, "get_token_review", side_effect=error, create=True
+            ):
+                handler = self.handler(path)
+                handler.do_GET()
+                response, status = handler.send_json.call_args.args[:2]
+                self.assertEqual(status, expected_status)
+                self.assertNotIn("private", str(response))
+
+    def test_decision_retry_and_explicit_start_use_revisions_and_stored_identity(self):
+        review, _ = self.submit()
+        prefix = f"/api/admin/token-reviews/{review['request_id']}"
+        with patch.object(self.service, "resolve_token", return_value=AdminServiceTest.review_candidate()), patch.object(self.service, "_create_onboarding_job_from_candidate", return_value={"job_id": "job-approved"}) as onboarding:
+            handler = self.handler(prefix + "/start", {"expected_revision": review["revision"]})
+            handler.do_POST()
+            self.assertEqual(handler.send_json.call_args.args[1], 409)
+            handler = self.handler(prefix + "/decision", {"decision": "approve", "expected_revision": review["revision"]})
+            handler.do_POST()
+            approved = handler.send_json.call_args.args[0]
+            self.assertEqual(approved["status"], "approved")
+            onboarding.assert_not_called()
+            handler.do_POST()
+            self.assertEqual(handler.send_json.call_args.args[1], 409)
+            handler = self.handler(prefix + "/notification/retry", {"expected_revision": approved["revision"]})
+            handler.do_POST()
+            self.assertEqual(handler.send_json.call_args.args[1], 429)
+            handler = self.handler(prefix + "/start", {"expected_revision": approved["revision"]})
+            handler.do_POST()
+            result = handler.send_json.call_args.args[0]
+            self.assertEqual(result["status"], "onboarding_queued")
+            self.assertEqual(result["onboarding_job_id"], "job-approved")
+            onboarding.assert_called_once_with(AdminServiceTest.review_candidate(), 30, "reviewer")
+            handler.do_POST()
+            self.assertEqual(handler.send_json.call_args.args[1], 409)
+            self.assertEqual(onboarding.call_count, 1)
+
+    def test_review_error_mapping_and_failed_start_are_sanitized(self):
+        path = f"/api/admin/token-reviews/{self.request_id}/start"
+        cases = [("invalid_revision", 400), ("reviewer_required", 403), ("review_not_found", 404),
+                 ("stale_revision", 409), ("invalid_review_transition", 409),
+                 ("invalid_notification_transition", 409), ("notification_attempt_limit", 429),
+                 ("notification_cooldown", 429), ("invalid_review_database", 503), ("unknown", 503)]
+        for code, status in cases:
+            with self.subTest(code=code), patch.object(self.service, "start_token_review_onboarding", side_effect=TokenReviewError(code, "SMTP private@example.test /private/db")):
+                handler = self.handler(path, {"expected_revision": 1})
+                handler.do_POST()
+                response, actual = handler.send_json.call_args.args[:2]
+                self.assertEqual(actual, status)
+                self.assertNotIn("private", str(response))
+                self.assertEqual(response["retryable"], status in {429, 503})
+        for error in [OSError("/private/db"), ValueError("SMTP secret"), RuntimeError("SMTP secret")]:
+            with patch.object(self.service, "start_token_review_onboarding", side_effect=error):
+                handler = self.handler(path, {"expected_revision": 1})
+                handler.do_POST()
+                self.assertEqual(handler.send_json.call_args.args[1], 503)
+                self.assertNotIn("secret", str(handler.send_json.call_args.args[0]))
+        review, _ = self.submit()
+        approved = self.service.decide_token_review(review["request_id"], {"decision": "approve", "expected_revision": review["revision"]}, "reviewer")
+        with patch.object(self.service, "resolve_token", return_value=AdminServiceTest.review_candidate()), patch.object(self.service, "_create_onboarding_job_from_candidate", side_effect=OSError("/private/worker")):
+            handler = self.handler(f"/api/admin/token-reviews/{review['request_id']}/start", {"expected_revision": approved["revision"]})
+            handler.do_POST()
+            result, status = handler.send_json.call_args.args[:2]
+            self.assertEqual(status, 503)
+            self.assertEqual(result["status"], "approved")
+            self.assertEqual(result["onboarding_error_code"], "onboarding_start_failed")
+            self.assertNotIn("/private", str(result))
+
+
+if __name__ == "__main__":
+    unittest.main()

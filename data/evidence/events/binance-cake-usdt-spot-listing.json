@@ -1,0 +1,20 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.binance.com/en/support/announcement/detail/b769e0e2da5d46bb96c50f8e4fb03f23",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "Binance Adds FRONT/BTC, EASY/BTC, CAKE/BTC, CAKE/USDT & BAKE/BUSD Trading Pairs",
+  "publisher": "Binance",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "Binance announced that CAKE/USDT spot trading was scheduled to open at 06:00 UTC on 2021-02-19.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Announcement body"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "This is the CAKE/USDT pair start, not CAKE's earlier first listing against other quote assets.",
+    "The displayed publication clock has no stated timezone, so only its calendar date is stored."
+  ]
+}

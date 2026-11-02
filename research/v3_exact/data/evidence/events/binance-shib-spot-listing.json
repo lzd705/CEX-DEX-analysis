@@ -1,0 +1,20 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.binance.com/en/support/announcement/detail/f1fe616e688b452f9d736753cb2d947a",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "Binance Will List SHIBA INU (SHIB) in the Innovation Zone",
+  "publisher": "Binance",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "Binance announced that SHIB/USDT spot trading was scheduled to open at 11:00 UTC on 2021-05-10.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Announcement body"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "The displayed publication clock has no stated timezone, so only its calendar date is stored.",
+    "The SHIB/BUSD pair and risk-warning wallet concentrations are outside this Event Fact."
+  ]
+}

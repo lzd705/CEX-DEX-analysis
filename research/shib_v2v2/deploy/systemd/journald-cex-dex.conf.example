@@ -1,0 +1,6 @@
+# Optional host-wide journald policy. Review with the host administrator before
+# installing as /etc/systemd/journald.conf.d/cex-dex-retention.conf.
+[Journal]
+Compress=yes
+SystemMaxUse=1G
+MaxRetentionSec=30day

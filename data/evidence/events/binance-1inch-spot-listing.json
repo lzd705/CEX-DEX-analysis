@@ -1,0 +1,19 @@
+{
+  "record_schema": "source_check/v1",
+  "source_url": "https://www.binance.com/en/support/announcement/detail/8d933ae3ce814c2181e1ea84b2fde723",
+  "checked_at_utc": "2026-07-29T09:37:30Z",
+  "source_title": "Binance Will List 1inch (1INCH) in the Innovation Zone, Deposits Are Now Open",
+  "publisher": "Binance",
+  "facts": {
+    "spot_trading_start": {
+      "statement": "Binance announced that 1INCH/USDT spot trading was scheduled to open at 05:00 UTC on 2020-12-25.",
+      "supported_lifecycle": "scheduled",
+      "time_precision": "minute",
+      "source_section": "Announcement body"
+    }
+  },
+  "limitations": [
+    "This record authenticates the project's source check, not an immutable copy of the third-party webpage.",
+    "The displayed publication clock has no stated timezone, so only its calendar date is stored."
+  ]
+}
