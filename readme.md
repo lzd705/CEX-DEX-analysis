@@ -1,5 +1,9 @@
 # CEX–DEX Market Research
 
+English | [简体中文](README.zh-CN.md)
+
+**Website:** [Open the market dashboard](http://43.156.102.166:8765)
+
 A cross-market research platform for comparing prices, measuring liquidity, estimating execution costs, and evaluating arbitrage across centralized exchanges and on-chain liquidity pools.
 
 The project connects a market-data dashboard with quantity-aware quote engines and reproducible opportunity workflows. Its central question is: **how does an observed price difference change after trade size, market depth, fees, and timing are taken into account?**
