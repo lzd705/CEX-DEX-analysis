@@ -50,6 +50,12 @@ def mark_repeated_heads(records):
 
 def verify_capture(root):
     manifest=json.loads((root/'manifest.json').read_text())
+    identity={'schema':'uni_cex_v3_research/v1','chain_id':1,'pool':POOL,
+              'quoter':QUOTER,'pool_fee_pips':3000,'strict_eligible':False}
+    for field,expected in identity.items():
+        actual=manifest.get(field)
+        if type(actual) is not type(expected) or actual!=expected:
+            raise ValueError('capture identity mismatch: '+field)
     samples=(root/'samples.jsonl').read_bytes()
     if not manifest.get('completed_at') or digest(samples)!=manifest.get('samples_sha256'):
         raise ValueError('capture incomplete or samples hash differs')
@@ -79,6 +85,12 @@ def verify_capture(root):
     rpc=[]
     for member in manifest['rpc_records']:
         rpc.append(None if 'path' not in member else rpc_results(member['request'],json.loads(raw(member))))
+    chain_proofs=[(request.get('params'),value)
+                  for member,values in zip(manifest['rpc_records'],rpc) if values is not None
+                  for request,value in zip(member['request'],values)
+                  if request['method']=='eth_chainId']
+    if not chain_proofs or any(params!=[] or value!='0x1' for params,value in chain_proofs):
+        raise ValueError('Ethereum chain identity evidence missing or conflicting')
     for role in ('authority_start','authority_end'):
         authority=manifest[role]; validate_authority(authority)
         if not any(values==authority and member['request'][0]['params'][0].get('to')==POOL

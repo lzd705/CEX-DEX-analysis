@@ -68,3 +68,13 @@ class ResearchSourcesTests(unittest.TestCase):
             target.rename(root/'saved.py'); target.symlink_to(root/'saved.py')
             with self.assertRaisesRegex(ValueError, 'symlink'):
                 self.verify(root, manifest)
+
+    def test_declared_additions_must_exist_and_be_unique(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);manifest=self.fixture(root)
+            manifest['additions']=['missing.md']
+            with self.assertRaisesRegex(ValueError,'addition'):
+                self.verify(root,manifest)
+            manifest['additions']=['scripts/original.py']
+            with self.assertRaisesRegex(ValueError,'duplicate'):
+                self.verify(root,manifest)

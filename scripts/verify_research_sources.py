@@ -41,13 +41,21 @@ def verify_sources(root, manifest):
             raise ValueError('source mode mismatch: ' + name)
         if not re.fullmatch('[0-9a-f]{40}', row['source_commit']):
             raise ValueError('invalid source commit: ' + name)
+    additions=set()
+    for name in manifest.get('additions', []):
+        if name in seen or name in additions:
+            raise ValueError('duplicate addition path: '+name)
+        if not _safe_path(root,name).is_file():
+            raise ValueError('missing addition file: '+name)
+        additions.add(name)
     for row in manifest.get('gitlinks', []):
         _safe_path(root, row['published_path'])
         output = subprocess.check_output(['git', 'ls-files', '--stage', '--', row['published_path']], cwd=root, text=True)
         fields = output.strip().split()
         if len(fields) != 4 or fields[:2] != ['160000', row['oid']]:
             raise ValueError('Gitlink mismatch: ' + row['published_path'])
-    return {'files_verified': len(seen), 'gitlinks_verified': len(manifest.get('gitlinks', []))}
+    return {'files_verified': len(seen), 'gitlinks_verified': len(manifest.get('gitlinks', [])),
+            'additions_verified':len(additions)}
 
 
 def main():

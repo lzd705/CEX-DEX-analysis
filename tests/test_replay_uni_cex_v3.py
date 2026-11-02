@@ -91,3 +91,49 @@ class ReplayUniCexV3Tests(unittest.TestCase):
             (reference/'summary.json').write_text(json.dumps(summary))
             with self.assertRaisesRegex(ValueError,'reference'):
                 self.replay(CAPTURE,reference,Path(folder)/'result')
+
+    def test_contradictory_declared_identity_is_rejected_without_output(self):
+        with tempfile.TemporaryDirectory() as folder:
+            capture=Path(folder)/'capture';shutil.copytree(CAPTURE,capture)
+            path=capture/'manifest.json';manifest=json.loads(path.read_text())
+            manifest.update(chain_id=137,quoter='0x'+'0'*40)
+            path.write_text(json.dumps(manifest));output=Path(folder)/'result'
+            with self.assertRaisesRegex(ValueError,'identity'):
+                self.replay(capture,REFERENCE,output)
+            self.assertFalse(output.exists())
+
+    def test_schema_pool_fee_and_boolean_chain_id_are_rejected(self):
+        from scripts.analyze_uni_cex_v3_experiment import verify_capture
+        with tempfile.TemporaryDirectory() as folder:
+            capture=Path(folder)/'capture';shutil.copytree(CAPTURE,capture)
+            path=capture/'manifest.json';original=json.loads(path.read_text())
+            for field,value in (('schema','other/v1'),('pool','0x'+'0'*40),
+                                ('pool_fee_pips',500),('chain_id',True),('strict_eligible',True)):
+                with self.subTest(field=field):
+                    path.write_text(json.dumps({**original,field:value}))
+                    with self.assertRaisesRegex(ValueError,'identity'):
+                        verify_capture(capture)
+
+    def test_wrong_or_missing_retained_chain_proof_is_rejected(self):
+        from scripts.analyze_uni_cex_v3_experiment import verify_capture
+        with tempfile.TemporaryDirectory() as folder:
+            capture=Path(folder)/'capture';shutil.copytree(CAPTURE,capture)
+            path=capture/'manifest.json';original=json.loads(path.read_text())
+            index=next(i for i,m in enumerate(original['rpc_records'])
+                       if any(r['method']=='eth_chainId' for r in m['request']))
+            member=original['rpc_records'][index];raw_path=capture/member['path']
+            raw=raw_path.read_bytes();response=json.loads(raw)
+            chain_request=next(r for r in member['request'] if r['method']=='eth_chainId')
+            for value in response:
+                if value['id']==chain_request['id']: value['result']='0x89'
+            mutated=json.dumps(response).encode();raw_path.write_bytes(mutated)
+            manifest=json.loads(json.dumps(original));manifest['rpc_records'][index]['sha256']=hashlib.sha256(mutated).hexdigest()
+            path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError,'chain'):
+                verify_capture(capture)
+            raw_path.write_bytes(raw);manifest=json.loads(json.dumps(original))
+            for request in manifest['rpc_records'][index]['request']:
+                if request['method']=='eth_chainId': request['method']='eth_blockNumber'
+            path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError,'chain'):
+                verify_capture(capture)

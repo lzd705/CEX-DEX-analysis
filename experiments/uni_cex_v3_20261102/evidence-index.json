@@ -33,7 +33,9 @@
       "kind": "working_tree_code",
       "source_path": "scripts/analyze_uni_cex_v3_experiment.py",
       "published_path": "scripts/analyze_uni_cex_v3_experiment.py",
-      "sha256": "b19aeb05e7390cae3e77a26aaecdfccf02990f60b8c706adb5bfffe807529db7"
+      "source_sha256": "b19aeb05e7390cae3e77a26aaecdfccf02990f60b8c706adb5bfffe807529db7",
+      "sha256": "3e355018fd4cb5a392de3eeed20e43d18a1261d1bfc3e26fa3f95f449f7aa9f1",
+      "transformation": "Review fix: validate manifest schema, chain, pool, quoter, pool fee, eligibility flag and retained eth_chainId proof before replay; raw evidence and reference results unchanged."
     },
     {
       "kind": "working_tree_code",
