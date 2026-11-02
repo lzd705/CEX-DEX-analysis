@@ -8,6 +8,19 @@ legacy Foundry test status below. Production services, timers, and data are
 unchanged. Existing research branches and the originating dirty checkout are
 preserved.
 
+## GitHub publication verification — 2026-11-03 HKT
+
+The assembled research hub was published to `main` at
+[`f9ed27938dd7c6377c09fdeb6d1be7157ebb38ad`](https://github.com/lzd705/CEX-DEX-analysis/commit/f9ed27938dd7c6377c09fdeb6d1be7157ebb38ad)
+by a normal non-force fast-forward from `7f1cae5`. The research branch
+`codex/research-hub` retains the same publication history.
+
+The GitHub recursive tree was read back: **all 1,220 file/Gitlink entries**
+matched local Git blob identities and modes. Both homepages, V3 and SHIB
+implementations, Foundry executor, experiment capture/results, and provenance
+inventory were present. The subsequent documentation-only completion commit
+records this check and completes the plan checklist.
+
 ## Source identity
 
 | Component | Pinned source |

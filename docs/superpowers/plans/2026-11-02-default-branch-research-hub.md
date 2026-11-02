@@ -128,9 +128,9 @@
 - [x] Request one independent whole-branch review covering module boundaries, publication privacy, reproducibility, README accuracy, and unexpected files. Resolve actionable findings and rerun affected verification.
 - [x] Inspect `git diff --check`, final file inventory, per-file size, source modes/Gitlinks, and credential scan. Ensure the publication contains only the approved repository organization and evidence.
 - [x] Refresh remote `main`. If it advanced, preserve and integrate the concurrent changes and repeat affected tests; never force-push over them.
-- [ ] Push the integration branch and merge/fast-forward the tested result into `main` using normal GitHub workflow under the user's publication authorization.
-- [ ] Read the final default-branch tree and selected file hashes through GitHub; confirm both READMEs, module entry points, experiment capture/results, and provenance files are present.
-- [ ] Report main commit, website/source links, reproduction commands, and actual verification counts.
+- [x] Push the integration branch and merge/fast-forward the tested result into `main` using normal GitHub workflow under the user's publication authorization.
+- [x] Read the final default-branch tree and selected file hashes through GitHub; confirm both READMEs, module entry points, experiment capture/results, and provenance files are present.
+- [x] Report main commit, website/source links, reproduction commands, and actual verification counts.
 
 ## Self-review
 
