@@ -1,0 +1,2055 @@
+{
+  "schema": "uni_cex_v3_public_evidence/v1",
+  "date_hkt": "2026-11-02",
+  "observations": {
+    "polls": 60,
+    "distinct_accepted_blocks": 51,
+    "dex_quotes": 510,
+    "fee_gas_rows": 21420,
+    "delay_rows": 13770
+  },
+  "collection_window_hkt": [
+    "2026-11-02T13:10:45+08:00",
+    "2026-11-02T13:20:41+08:00"
+  ],
+  "privacy_review": {
+    "files_scanned": 329,
+    "credential_or_machine_path_findings": 0,
+    "raw_payload_transformations": []
+  },
+  "older_two_pool_canary": {
+    "scenario_count": 20,
+    "raw_receipt_availability": "not_located_in_inspected_local_workspaces"
+  },
+  "source_worktree_base_sha": "6b7803bcd2d617503687b930e4ca42a796226625",
+  "files": [
+    {
+      "kind": "working_tree_code",
+      "source_path": "scripts/uni_cex_v3_experiment.py",
+      "published_path": "scripts/uni_cex_v3_experiment.py",
+      "sha256": "be1f73cf642de9144daf79bc27708d71a53e1000fbe607ac9748f38cab707fb8"
+    },
+    {
+      "kind": "working_tree_code",
+      "source_path": "scripts/analyze_uni_cex_v3_experiment.py",
+      "published_path": "scripts/analyze_uni_cex_v3_experiment.py",
+      "sha256": "b19aeb05e7390cae3e77a26aaecdfccf02990f60b8c706adb5bfffe807529db7"
+    },
+    {
+      "kind": "working_tree_code",
+      "source_path": "scripts/uni_experiments.py",
+      "published_path": "scripts/uni_experiments.py",
+      "sha256": "f1a63d7c2dc33e08f44cc17b3bafc2b7c41ec2d7f89b7fbd77a76e34ce3b6a10"
+    },
+    {
+      "kind": "working_tree_code",
+      "source_path": "scripts/analyze_uni_experiments.py",
+      "published_path": "scripts/analyze_uni_experiments.py",
+      "sha256": "fb860c8aebae73c37ee75c13d163e1356de664281ed76eb2931aa542ba6048d9"
+    },
+    {
+      "kind": "working_tree_code",
+      "source_path": "tests/test_uni_cex_v3_experiment.py",
+      "published_path": "tests/test_uni_cex_v3_experiment.py",
+      "sha256": "997794dd2bab2d85b85fff7ba60bc16f36d1cd142964f969bb36689e8b47eec2"
+    },
+    {
+      "kind": "working_tree_code",
+      "source_path": "tests/test_analyze_uni_cex_v3_experiment.py",
+      "published_path": "tests/test_analyze_uni_cex_v3_experiment.py",
+      "sha256": "3916603d3ff244887b4a9f2a5a64a16c8fd0759b306fc0eeff855361e28990ba"
+    },
+    {
+      "kind": "working_tree_code",
+      "source_path": "tests/test_uni_experiments.py",
+      "published_path": "tests/test_uni_experiments.py",
+      "sha256": "b3bf6be8f54d425d59d0a3ae97295eb745aaaf9a0218ed23a17cca9f9b193b06"
+    },
+    {
+      "kind": "working_tree_code",
+      "source_path": "docs/uni-cex-v3-experiment-2026-11-02.md",
+      "published_path": "docs/uni-cex-v3-experiment-2026-11-02.md",
+      "sha256": "30cc43ee79893eaf11acdbf89ed6bf823786a0d68a9b6600d46cf1cfd4db13be"
+    },
+    {
+      "kind": "working_tree_code",
+      "source_path": "config/cex_public_fee_schedules_interview_2026-11-01.csv",
+      "published_path": "config/cex_public_fee_schedules_interview_2026-11-01.csv",
+      "sha256": "16ecf6a98b47f0b3ba79ed5eda5db0238e3f51b110dcfbbb176315faa33a13d7"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "analysis/delay_pairs.csv",
+      "published_path": "results/delay_pairs.csv",
+      "sha256": "ac6cb6ffbe7cddd6df26f839fa627adeabea0fc830c0d3c33647d9d557c15f50"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "analysis/fee_gas_timeseries.csv",
+      "published_path": "results/fee_gas_timeseries.csv",
+      "sha256": "2bc42848e65939037e23468e9c8e2f92570af9daf3b47923b4faeca35493386c"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "analysis/network_gas_scenarios.csv",
+      "published_path": "results/network_gas_scenarios.csv",
+      "sha256": "3263221e494541fcd7bbde0e323c60c8f9a30cf5e78d1d2530d2d6afa8431a8e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "analysis/summary.json",
+      "published_path": "results/summary.json",
+      "sha256": "416c9a05a44caa3c0a21d929dee115b944ce37ff9f1cb53be1ac4ed8ff12c567"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "manifest.json",
+      "published_path": "capture/manifest.json",
+      "sha256": "4331e74ca64936514ccfe84e9e1b7adc258e0b28f207ed891f5aad96abdbe4d3"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "public-fees.csv",
+      "published_path": "capture/public-fees.csv",
+      "sha256": "16ecf6a98b47f0b3ba79ed5eda5db0238e3f51b110dcfbbb176315faa33a13d7"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0000-binance.json",
+      "published_path": "capture/raw/0000-binance.json",
+      "sha256": "3ff32eeaea2eda747a79a565f74b02912ea34786cfe7e7fdc4befbc341c906ab"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0000-eth.json",
+      "published_path": "capture/raw/0000-eth.json",
+      "sha256": "d9f573fb12ec8189beee8316d3bdd622f444fa9d7e75d894f1441d13519f548b"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0001-binance.json",
+      "published_path": "capture/raw/0001-binance.json",
+      "sha256": "b652ff73c58d4be1acb8563a4f5a0f7663b4daa67321be10e5589a86346b2562"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0001-eth.json",
+      "published_path": "capture/raw/0001-eth.json",
+      "sha256": "61f3def1f0a555bf0957d29dd6e0918a49e36de434029541686df3f714c04b2f"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0002-binance.json",
+      "published_path": "capture/raw/0002-binance.json",
+      "sha256": "02377ef51ddcdd08a0be1c730c10d47cb0535f11fad36116242252d5bcd6128e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0002-eth.json",
+      "published_path": "capture/raw/0002-eth.json",
+      "sha256": "a0adcd3c5f499bba951e30c663e0f6e5c4929b5ada818b9aff81ca9c14fea788"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0003-binance.json",
+      "published_path": "capture/raw/0003-binance.json",
+      "sha256": "b4647f50d87c63a539eb765f39b2bb2f2baa3cd7c7379a7c9fa19a34e1b21aa9"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0003-eth.json",
+      "published_path": "capture/raw/0003-eth.json",
+      "sha256": "946c08c36ada75f13d7973351dccbcc59233b5cb7174eb39e196378fc8e96e15"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0004-binance.json",
+      "published_path": "capture/raw/0004-binance.json",
+      "sha256": "2e6090cf2278d07e75c4c8a5663c55611ec59a6851ff78410750ba2aae74435b"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0004-eth.json",
+      "published_path": "capture/raw/0004-eth.json",
+      "sha256": "dc47cceb670fec8b4eae1d36875707b460c22c27576f33e72e738fbdc2eb4da6"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0006-binance.json",
+      "published_path": "capture/raw/0006-binance.json",
+      "sha256": "0c4e9005a63cf1a9d6a703430e90bdacd2ea34fae62fd91045e7d010de4aa67d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0006-eth.json",
+      "published_path": "capture/raw/0006-eth.json",
+      "sha256": "c94851c84a8c07b03590aa0a304cf2709f1294b7c1579002e0696f61e613a94d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0007-binance.json",
+      "published_path": "capture/raw/0007-binance.json",
+      "sha256": "5f998df266b9af47f4670f173975b2a6a59634bdf816bfbad54640f420577244"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0007-eth.json",
+      "published_path": "capture/raw/0007-eth.json",
+      "sha256": "a994c5bba198bb1b23343b1d328e94a1af5e2a19bef45d6384a987fca343d53c"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0008-binance.json",
+      "published_path": "capture/raw/0008-binance.json",
+      "sha256": "3198276eca8e54791e10f254ca8c8b2d2ae5052672f9188aaf55e5349db83ba9"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0008-eth.json",
+      "published_path": "capture/raw/0008-eth.json",
+      "sha256": "aedb7cb74a46e396a730a7ee2737dee49d7fa3c991cf2b8ea9d43f9fa00c6bd9"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0009-binance.json",
+      "published_path": "capture/raw/0009-binance.json",
+      "sha256": "159d56cd480245b3f9d37fad47ef3667fd2b8991a2dcc4da0bd2cefce37ea5df"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0009-eth.json",
+      "published_path": "capture/raw/0009-eth.json",
+      "sha256": "f8f969fc0412229d7fe5a80bf5da3f6ab6f2a195b18ad5eeca047b2767b17d11"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0010-binance.json",
+      "published_path": "capture/raw/0010-binance.json",
+      "sha256": "575a6cb67743c3fc8b8d436d58ba4445186c3e337aeb9ef4f8514b276ecf541a"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0010-eth.json",
+      "published_path": "capture/raw/0010-eth.json",
+      "sha256": "b014cb4aa4229eaf3d0d8b15614795193cff503f791a6131685ebbe97fe0532e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0012-binance.json",
+      "published_path": "capture/raw/0012-binance.json",
+      "sha256": "2aabb0551f615d7cec8d868ae995da9234d3c056ecdf580de082c88586f9e377"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0012-eth.json",
+      "published_path": "capture/raw/0012-eth.json",
+      "sha256": "f93898c6093be3e71ebe3e54c3f901ea1997d70c292eb50f3f58cc1549bbb006"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0013-binance.json",
+      "published_path": "capture/raw/0013-binance.json",
+      "sha256": "c51796995670eae6c3cdcaa89036b647bf475374b4415fce7ff8e444f0f899e9"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0013-eth.json",
+      "published_path": "capture/raw/0013-eth.json",
+      "sha256": "4147c6439400d4160f701c593f689e154aea02b3f03fb51a9009e8755ab967b9"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0014-binance.json",
+      "published_path": "capture/raw/0014-binance.json",
+      "sha256": "867bb7b8b0433ed2dabce1120f524fc1c1ce21f28ff6bce5f52fbdf2a1fdf1f5"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0014-eth.json",
+      "published_path": "capture/raw/0014-eth.json",
+      "sha256": "7380ff07713571fe5fa3726bd7b1a59f50861f8d49433c9481e1e69de2056db5"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0015-binance.json",
+      "published_path": "capture/raw/0015-binance.json",
+      "sha256": "0ca2426f398b5364dc96537cfc5841318703548b46ec1f5182e27817b827432a"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0015-eth.json",
+      "published_path": "capture/raw/0015-eth.json",
+      "sha256": "e76a592122b29bd06f59e230b0584180d49d5bf63199bc4c0fd0a7d09ee0ad9a"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0016-binance.json",
+      "published_path": "capture/raw/0016-binance.json",
+      "sha256": "690074ef3a19d9301e20dc3ff7adb66115636c159c51b0bb2d4fef4df584c4dc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0016-eth.json",
+      "published_path": "capture/raw/0016-eth.json",
+      "sha256": "f369c08d39433f238c57a0196864a0caaf8db9b948745965ac3067a7dd4c600a"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0017-binance.json",
+      "published_path": "capture/raw/0017-binance.json",
+      "sha256": "4d4b4f77fc8c5920302f333690adbf7968baaee635a96ebbde13f1e4e4699a4a"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0017-eth.json",
+      "published_path": "capture/raw/0017-eth.json",
+      "sha256": "65c298220cb06ea4464c4d0974249e6c4ebf80994cf2b77b9479f5460b181722"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0019-binance.json",
+      "published_path": "capture/raw/0019-binance.json",
+      "sha256": "42cb617183bc16ba6e43a3599fc789c3fd6d382c5c839c1437a57e280133fa81"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0019-eth.json",
+      "published_path": "capture/raw/0019-eth.json",
+      "sha256": "7f3873f7623fdbb784ace56f179886f8a4b97c430050105c8f8444f6a13a9297"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0020-binance.json",
+      "published_path": "capture/raw/0020-binance.json",
+      "sha256": "0f7c36528505026a6fb6907d870f4a2d315325999a5da09e9f0508b5ab32fee5"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0020-eth.json",
+      "published_path": "capture/raw/0020-eth.json",
+      "sha256": "132cf2db258b6af3eefe537f73c8cc00d71e03005595c8d2161b56535eff2998"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0021-binance.json",
+      "published_path": "capture/raw/0021-binance.json",
+      "sha256": "79a92cc17a88123d0890cb28de3592a18f15b08539ff510031585cd15276cee2"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0021-eth.json",
+      "published_path": "capture/raw/0021-eth.json",
+      "sha256": "675efd49a5588bf871157a562e71f91a783d9531a643b23bc221cd10a4d135bf"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0022-binance.json",
+      "published_path": "capture/raw/0022-binance.json",
+      "sha256": "d8e64f861d4e7d6653d67a02ebedfebb4ad92161fd6aa3ba1b49e51b30f5985e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0022-eth.json",
+      "published_path": "capture/raw/0022-eth.json",
+      "sha256": "19caf4242fdb9bb41a430513d81d4b7606dc531a6324f0bacd737796c5abbd17"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0023-binance.json",
+      "published_path": "capture/raw/0023-binance.json",
+      "sha256": "1f1bee23a189cbad70bf5fa8f9f33b73dfb389ea272b2a61f63b92112cb471bf"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0023-eth.json",
+      "published_path": "capture/raw/0023-eth.json",
+      "sha256": "dbad180abeae5cfe526f75c64a1d2fb34362dccd020677293d7b7972b32125fa"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0025-binance.json",
+      "published_path": "capture/raw/0025-binance.json",
+      "sha256": "7c18f97c590d2207f8ccd828ddc3ae67c70ac00d7c52162daa5823d99e18b448"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0025-eth.json",
+      "published_path": "capture/raw/0025-eth.json",
+      "sha256": "f5be6a1f966f34d75ab0724d31c467f2c430474cf0cf7d31654321144ecc3dba"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0026-binance.json",
+      "published_path": "capture/raw/0026-binance.json",
+      "sha256": "bd1f507b2b3c3127d72d16596b3ee4c28af9a0a5a5d17bd3c9ffa1883821d41d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0026-eth.json",
+      "published_path": "capture/raw/0026-eth.json",
+      "sha256": "8b5e622410f12203a62f0b0756b426280289b249e80033ac2456bf29856a0393"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0027-binance.json",
+      "published_path": "capture/raw/0027-binance.json",
+      "sha256": "eab7931160a26f7f8c104b2cfcf2a7546ac12894e24e8fbaa7562d644f4a764b"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0027-eth.json",
+      "published_path": "capture/raw/0027-eth.json",
+      "sha256": "cfddf165936d8cbd09377bea508c9c174a8371365885e23a2106ba1111d684b0"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0028-binance.json",
+      "published_path": "capture/raw/0028-binance.json",
+      "sha256": "d2b29e201aba5d1fae62f41724f4f00ab15ba0a9c1dee07b45b816a3da688211"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0028-eth.json",
+      "published_path": "capture/raw/0028-eth.json",
+      "sha256": "56e66f3cb0c9bc52e09f7f9d68240a83b440ed31d3ad72ba71e9ca1297dc6671"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0030-binance.json",
+      "published_path": "capture/raw/0030-binance.json",
+      "sha256": "ec0d65855bcd4e8c44506ca1107ac8b396e0694a1859019bd12d5c872876ca6f"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0030-eth.json",
+      "published_path": "capture/raw/0030-eth.json",
+      "sha256": "389a24bd9a6266bb10b856323b6abb0ebaa0befcefb371333b1596e777678e08"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0031-binance.json",
+      "published_path": "capture/raw/0031-binance.json",
+      "sha256": "2d38007dc253c6fc67982b1b627a23ba1c8dd633fd75a53df2b73cfca72ad745"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0031-eth.json",
+      "published_path": "capture/raw/0031-eth.json",
+      "sha256": "349dc127c85d1ae6fe8808f3c21619fe841f886c13490041ce7eed044dadad88"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0032-binance.json",
+      "published_path": "capture/raw/0032-binance.json",
+      "sha256": "87042a59c4ea68edcfa718b36b3f2e35931a329b2ca4b13d65ed86b089047be6"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0032-eth.json",
+      "published_path": "capture/raw/0032-eth.json",
+      "sha256": "493d7d31d67a9a7df8d3ba5869b0d6f63548e7733c3f489443105474df779fa0"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0033-binance.json",
+      "published_path": "capture/raw/0033-binance.json",
+      "sha256": "37429ce2d77a56058aabaf5046b5fc96f6c7153b244ca60d0b7ad5085ef66406"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0033-eth.json",
+      "published_path": "capture/raw/0033-eth.json",
+      "sha256": "4efacbe71e4217b82ebe3e09be12cb4a20c66e2d43d87f639e317f1c189fd1b1"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0034-binance.json",
+      "published_path": "capture/raw/0034-binance.json",
+      "sha256": "d03fea0643f7087993cb1a39ae4c406a4b93b0cbc4e314651ca0e35e08242d9d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0034-eth.json",
+      "published_path": "capture/raw/0034-eth.json",
+      "sha256": "ac4533fe2aa21e88351d66202140958ba9ccf0ddb993f302fe9d2b423f278bfb"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0035-binance.json",
+      "published_path": "capture/raw/0035-binance.json",
+      "sha256": "1f70add8d26c6d18aa21841b2306672a2d9aa5a8073764f7116793f63c076a49"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0035-eth.json",
+      "published_path": "capture/raw/0035-eth.json",
+      "sha256": "2e15c6cba9839d9e61d6e8fb036505ff5c7fbf2b7e8468c6563bb8cfa8bab6af"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0037-binance.json",
+      "published_path": "capture/raw/0037-binance.json",
+      "sha256": "9fcdd70e299507ad21849b629aa9c6133582a9fb15547db3a04e18d4f5b4fe44"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0037-eth.json",
+      "published_path": "capture/raw/0037-eth.json",
+      "sha256": "f029a4e8ef78a277e82114769c9f2da0b00730193ba0f765857d5a8ea04944d7"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0038-binance.json",
+      "published_path": "capture/raw/0038-binance.json",
+      "sha256": "93304808643f51daffea6d29b3ab9444f23cabda0d8017bb3fb7538b28198770"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0038-eth.json",
+      "published_path": "capture/raw/0038-eth.json",
+      "sha256": "826e903109415aed68767f6a633eccdb314d555d8404ff49abdf148ee0b86f25"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0039-binance.json",
+      "published_path": "capture/raw/0039-binance.json",
+      "sha256": "ce2fa8d272c60904dec981626028d661645c628d7bb0608ab77090df9159b9a3"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0039-eth.json",
+      "published_path": "capture/raw/0039-eth.json",
+      "sha256": "6493ac9c4ab1010ee718ba24c5d5eabe8276691019e7cbc47f578027df440fee"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0040-binance.json",
+      "published_path": "capture/raw/0040-binance.json",
+      "sha256": "26c2c56e8b629602b80c6286d8efeb90d81965006067ffb5452827817a62c2ee"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0040-eth.json",
+      "published_path": "capture/raw/0040-eth.json",
+      "sha256": "7abb0d439e42d82625c1911b3bd365763ec5c395fee41b92a424b4e4fb4af206"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0041-binance.json",
+      "published_path": "capture/raw/0041-binance.json",
+      "sha256": "bb1e2faf9ba0ff8dc023a929c2539cffb921c5ea8a7d47fba436299fa26a9c7e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0041-eth.json",
+      "published_path": "capture/raw/0041-eth.json",
+      "sha256": "5e436620852320fa3007a4d9f5c09ff571e0b145659dc0e75ebac880c5689b22"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0043-binance.json",
+      "published_path": "capture/raw/0043-binance.json",
+      "sha256": "980025d1ffd65232df93f190d7fd2e9f4047eda3789083e8d92c40b9a16547a4"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0043-eth.json",
+      "published_path": "capture/raw/0043-eth.json",
+      "sha256": "5031c0e331a89a434cac5c10e2dc5117ca44e4b012969e874cc89114620d0491"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0044-binance.json",
+      "published_path": "capture/raw/0044-binance.json",
+      "sha256": "1985fb09b780011420fed7c8b41225c6cdf1c247bcc49aeb6915831247db0ea5"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0044-eth.json",
+      "published_path": "capture/raw/0044-eth.json",
+      "sha256": "a420341c286752029828f234ef4c58fb305bdc520c281d519813fee6b87779d3"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0045-binance.json",
+      "published_path": "capture/raw/0045-binance.json",
+      "sha256": "fcbb611ed08d0429f4bbb3ece7da16eb7c7a0ef646d12aaedfe14136c8d6f71d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0045-eth.json",
+      "published_path": "capture/raw/0045-eth.json",
+      "sha256": "5fc5f629d981001a12b52150a2330876308fad25ed0dd1219e27aa8cd980add6"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0046-binance.json",
+      "published_path": "capture/raw/0046-binance.json",
+      "sha256": "c2343c43b1604954883bbebd1e0656272e5fb525c81f2d5324c7d964e7d1f149"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0046-eth.json",
+      "published_path": "capture/raw/0046-eth.json",
+      "sha256": "21bc2d31cc8f3ce54fbd3ea31cb3ce801601d81a8e82968483fe90a89879372f"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0047-binance.json",
+      "published_path": "capture/raw/0047-binance.json",
+      "sha256": "fe6d75ef4d6f8f5c33f8e0c818a1489e250f9814f5911bdc78abae90de034c79"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0047-eth.json",
+      "published_path": "capture/raw/0047-eth.json",
+      "sha256": "359a8806d36b7e870deeb22a7873e04ac4e9cc0015584942839753f3ab782df3"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0049-binance.json",
+      "published_path": "capture/raw/0049-binance.json",
+      "sha256": "1fe35c547a65ffa87b5cbcff661b9ff3f10eede9f0da787be9d06dd4a0a55580"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0049-eth.json",
+      "published_path": "capture/raw/0049-eth.json",
+      "sha256": "b0ab5b8e2ad4edd92b919e57e2151c1c5c010f73e4af4133c57b85f79a86f2d9"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0050-binance.json",
+      "published_path": "capture/raw/0050-binance.json",
+      "sha256": "976703d102d7f9ad96d98be68f3c942fb48454a1761cf6dfee6993dcde7fda58"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0050-eth.json",
+      "published_path": "capture/raw/0050-eth.json",
+      "sha256": "22ecef633c97c34058cbd4b35b3460cf702007d6729fc31ba571fd9173ad7526"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0051-binance.json",
+      "published_path": "capture/raw/0051-binance.json",
+      "sha256": "bbb4ab2645e9edb61161598f1da25e46e76f6cb71c8dc164537f47b62878f3a1"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0051-eth.json",
+      "published_path": "capture/raw/0051-eth.json",
+      "sha256": "b032808c977a1a76057f2106db72ad7ee1b39c99b6d30a01724f5e312ebbbfbc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0052-binance.json",
+      "published_path": "capture/raw/0052-binance.json",
+      "sha256": "903ec93259e466d5e584d66eb95b076efb47c53c2556ba5b61a0485d2684f7ca"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0052-eth.json",
+      "published_path": "capture/raw/0052-eth.json",
+      "sha256": "d81c60b7994f5a10ba4abc8eab82ec5bf24913df0603b6c6dfb1d1928501c674"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0053-binance.json",
+      "published_path": "capture/raw/0053-binance.json",
+      "sha256": "b5a1e3833057cd6c651850a0ecf258fd2f004499d7df1461103dbf43a1807cd9"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0053-eth.json",
+      "published_path": "capture/raw/0053-eth.json",
+      "sha256": "3530e97f7c1df429e1c9d2e01476ef4e8e4e18c6575f1b24ce8a4e94fea9ed86"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0055-binance.json",
+      "published_path": "capture/raw/0055-binance.json",
+      "sha256": "2950848b49506b7d7b07d063da8ae3a4001c9f0cc5dcfad45492545bb16a887f"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0055-eth.json",
+      "published_path": "capture/raw/0055-eth.json",
+      "sha256": "19413f2b36391737011995b0ea2367ad6be46f9b2e53fb688e7871265f6ab8e3"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0056-binance.json",
+      "published_path": "capture/raw/0056-binance.json",
+      "sha256": "4999993f7fb308860ecae40a6271749b52ec105a72cbcd003e62a1f86015c08d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0056-eth.json",
+      "published_path": "capture/raw/0056-eth.json",
+      "sha256": "e04e454990f27b1040fd11512c1b9af020da9b5d15a578c88e6bfd4b77229eff"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0057-binance.json",
+      "published_path": "capture/raw/0057-binance.json",
+      "sha256": "6066a918ab6c0530d1d585b57ef2be92d9ed84c3f24372ac038872073a59519c"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0057-eth.json",
+      "published_path": "capture/raw/0057-eth.json",
+      "sha256": "2539e12881ba9695bf33d8915f8f960ec9cedba4e3b877596c7cbece272c805c"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0058-binance.json",
+      "published_path": "capture/raw/0058-binance.json",
+      "sha256": "3e39f78756af16dfcf4bdfd576825c1dbab8c4479e828715ee58008027b95116"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0058-eth.json",
+      "published_path": "capture/raw/0058-eth.json",
+      "sha256": "651f803e1fce867aeec0cf6994f28db449971113bf8a764567feaadce88468ab"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0059-binance.json",
+      "published_path": "capture/raw/0059-binance.json",
+      "sha256": "8563152a3c5363f1cd0b226498dcebe63d46faa436f46a06140d3b2612c97b8e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/0059-eth.json",
+      "published_path": "capture/raw/0059-eth.json",
+      "sha256": "cfb04e3b92562da18d17c3e1a52e923050b9227c808fe4f5d7ddf07afb0901a7"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/end-binance-rules.json",
+      "published_path": "capture/raw/end-binance-rules.json",
+      "sha256": "8eeb73e68bc09a26f3107214acaa57e6a1689f63be70c6566cb429cecd286fd4"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0000.json",
+      "published_path": "capture/raw/rpc-0000.json",
+      "sha256": "44e8c8f1e8c6a9deed61b0374c84feb7abf46fc78fd33842643de63d3c500c1e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0001.json",
+      "published_path": "capture/raw/rpc-0001.json",
+      "sha256": "8723dcee0f42fae2a312010c41b1ddf0670b6defed27c8d3b5b651289db94a46"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0002.json",
+      "published_path": "capture/raw/rpc-0002.json",
+      "sha256": "31e20db8abbdf655dec844f518da0f330d27ca23e34e2edc7207c9ae59ede144"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0003.json",
+      "published_path": "capture/raw/rpc-0003.json",
+      "sha256": "8723dcee0f42fae2a312010c41b1ddf0670b6defed27c8d3b5b651289db94a46"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0004.json",
+      "published_path": "capture/raw/rpc-0004.json",
+      "sha256": "36e9d6685bbcb5ebed6432205e80f90ef682e4226d7d81f591f68f4887a9b8fc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0005.json",
+      "published_path": "capture/raw/rpc-0005.json",
+      "sha256": "a4aa61f8a09b4df9957ee7fda07959789b16b233e905fe28537abf42abd5a6b4"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0006.json",
+      "published_path": "capture/raw/rpc-0006.json",
+      "sha256": "8723dcee0f42fae2a312010c41b1ddf0670b6defed27c8d3b5b651289db94a46"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0007.json",
+      "published_path": "capture/raw/rpc-0007.json",
+      "sha256": "e2dba2b2b4d57030af9816bcda0696452d0b7a15c68e46f01101245d957b583d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0008.json",
+      "published_path": "capture/raw/rpc-0008.json",
+      "sha256": "36e9d6685bbcb5ebed6432205e80f90ef682e4226d7d81f591f68f4887a9b8fc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0009.json",
+      "published_path": "capture/raw/rpc-0009.json",
+      "sha256": "9a9e21c2e52ece5ea8a6c487ecff4682cf299f9572055431b91a5b20acfa06cc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0010.json",
+      "published_path": "capture/raw/rpc-0010.json",
+      "sha256": "95e3165c6835a55adf003754ec31be491558a1545f6e37072aacb4f77ecb741e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0011.json",
+      "published_path": "capture/raw/rpc-0011.json",
+      "sha256": "dbda3abec421583ec63343c9e600861f322b7dff5d1cea9662dc556418ef5380"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0012.json",
+      "published_path": "capture/raw/rpc-0012.json",
+      "sha256": "36e9d6685bbcb5ebed6432205e80f90ef682e4226d7d81f591f68f4887a9b8fc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0013.json",
+      "published_path": "capture/raw/rpc-0013.json",
+      "sha256": "017479a085e6caba9479f266f01ae024c0c6d607341283179fe464d08028ce98"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0014.json",
+      "published_path": "capture/raw/rpc-0014.json",
+      "sha256": "89f6677ad2ab2506930f882ce12175c3c1b04bf6e207d0c36c944653b8527043"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0015.json",
+      "published_path": "capture/raw/rpc-0015.json",
+      "sha256": "b11317cfd7de80c2fc473a1de486f22ddf9252e7e3e668162b024c188ea98b56"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0016.json",
+      "published_path": "capture/raw/rpc-0016.json",
+      "sha256": "36e9d6685bbcb5ebed6432205e80f90ef682e4226d7d81f591f68f4887a9b8fc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0017.json",
+      "published_path": "capture/raw/rpc-0017.json",
+      "sha256": "3599efff8a93433173833b1b8e054641adbcf71d9dfba9b720b355c05a9039d4"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0018.json",
+      "published_path": "capture/raw/rpc-0018.json",
+      "sha256": "b11317cfd7de80c2fc473a1de486f22ddf9252e7e3e668162b024c188ea98b56"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0019.json",
+      "published_path": "capture/raw/rpc-0019.json",
+      "sha256": "ce93e91f5fafa63f4cc76cbf267d119239a2cbb54b3d06edce818aac4573b583"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0020.json",
+      "published_path": "capture/raw/rpc-0020.json",
+      "sha256": "36e9d6685bbcb5ebed6432205e80f90ef682e4226d7d81f591f68f4887a9b8fc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0021.json",
+      "published_path": "capture/raw/rpc-0021.json",
+      "sha256": "1bdc2957f565872b72303720470e24d5ab067eec33397363876c96e5b13ccd55"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0022.json",
+      "published_path": "capture/raw/rpc-0022.json",
+      "sha256": "ce93e91f5fafa63f4cc76cbf267d119239a2cbb54b3d06edce818aac4573b583"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0023.json",
+      "published_path": "capture/raw/rpc-0023.json",
+      "sha256": "ce93e91f5fafa63f4cc76cbf267d119239a2cbb54b3d06edce818aac4573b583"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0024.json",
+      "published_path": "capture/raw/rpc-0024.json",
+      "sha256": "2175d3330fe60dc9d65df6036dcdface20515cce149cbe35f09da82129d4b060"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0025.json",
+      "published_path": "capture/raw/rpc-0025.json",
+      "sha256": "36e9d6685bbcb5ebed6432205e80f90ef682e4226d7d81f591f68f4887a9b8fc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0026.json",
+      "published_path": "capture/raw/rpc-0026.json",
+      "sha256": "175ee5fa41da7d8094642cf8449ddcd36011020e1d696c5112d64ded800d3b81"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0027.json",
+      "published_path": "capture/raw/rpc-0027.json",
+      "sha256": "2175d3330fe60dc9d65df6036dcdface20515cce149cbe35f09da82129d4b060"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0028.json",
+      "published_path": "capture/raw/rpc-0028.json",
+      "sha256": "52f503015298c5884102f7533d54e6b14a9b301a045c3d9618b7e70996f27fb1"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0029.json",
+      "published_path": "capture/raw/rpc-0029.json",
+      "sha256": "36e9d6685bbcb5ebed6432205e80f90ef682e4226d7d81f591f68f4887a9b8fc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0030.json",
+      "published_path": "capture/raw/rpc-0030.json",
+      "sha256": "6db1af05b055664e65134166271b08b5062b25ec335fc7487e6895a477d10735"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0031.json",
+      "published_path": "capture/raw/rpc-0031.json",
+      "sha256": "52f503015298c5884102f7533d54e6b14a9b301a045c3d9618b7e70996f27fb1"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0032.json",
+      "published_path": "capture/raw/rpc-0032.json",
+      "sha256": "3676b9f84430392ca02b00ce0ca9bf29f1ad8536be08ba3bc3e52f6d8bc5f755"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0033.json",
+      "published_path": "capture/raw/rpc-0033.json",
+      "sha256": "36e9d6685bbcb5ebed6432205e80f90ef682e4226d7d81f591f68f4887a9b8fc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0034.json",
+      "published_path": "capture/raw/rpc-0034.json",
+      "sha256": "63738d7f2f47c834c34e5829a6297683fd0202afb760fc6642b0ddf1b9ca01f1"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0035.json",
+      "published_path": "capture/raw/rpc-0035.json",
+      "sha256": "6fd94ba2e6c460e49e03573af9d68b78e5083a52621eb566f3c1ea6e4b82dbf6"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0036.json",
+      "published_path": "capture/raw/rpc-0036.json",
+      "sha256": "b9fc531f08f577fc15a1dd3a598ec89727f715c4f72a8586054cabf0ddac47de"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0037.json",
+      "published_path": "capture/raw/rpc-0037.json",
+      "sha256": "36e9d6685bbcb5ebed6432205e80f90ef682e4226d7d81f591f68f4887a9b8fc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0038.json",
+      "published_path": "capture/raw/rpc-0038.json",
+      "sha256": "941ada1faff00c95fda3a18559e316170013ad137a1282744f6c51db28745081"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0039.json",
+      "published_path": "capture/raw/rpc-0039.json",
+      "sha256": "e87eb6f5c7361082e33c6a346c9fceff8e3da5e92abe7a12d350317ecba8b68c"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0040.json",
+      "published_path": "capture/raw/rpc-0040.json",
+      "sha256": "e79896c945c0e511b9d168b764ee237a4debaac426c5c3f7fd9ef8c1b545aa41"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0041.json",
+      "published_path": "capture/raw/rpc-0041.json",
+      "sha256": "36e9d6685bbcb5ebed6432205e80f90ef682e4226d7d81f591f68f4887a9b8fc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0042.json",
+      "published_path": "capture/raw/rpc-0042.json",
+      "sha256": "408e94ed10af1c0bbf7352705340e9e3a8ea07e6703a993f34dd67139bb7e009"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0043.json",
+      "published_path": "capture/raw/rpc-0043.json",
+      "sha256": "e79896c945c0e511b9d168b764ee237a4debaac426c5c3f7fd9ef8c1b545aa41"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0044.json",
+      "published_path": "capture/raw/rpc-0044.json",
+      "sha256": "e79896c945c0e511b9d168b764ee237a4debaac426c5c3f7fd9ef8c1b545aa41"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0045.json",
+      "published_path": "capture/raw/rpc-0045.json",
+      "sha256": "0e14818cc03555813bb387741bb04a63787c24510675531be3073dcbd661699b"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0046.json",
+      "published_path": "capture/raw/rpc-0046.json",
+      "sha256": "36e9d6685bbcb5ebed6432205e80f90ef682e4226d7d81f591f68f4887a9b8fc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0047.json",
+      "published_path": "capture/raw/rpc-0047.json",
+      "sha256": "fa1ab2b1ec996c354d3ddf58eb9d25a781e65128f9b8bbf68062009e928c0b0e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0048.json",
+      "published_path": "capture/raw/rpc-0048.json",
+      "sha256": "0e14818cc03555813bb387741bb04a63787c24510675531be3073dcbd661699b"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0049.json",
+      "published_path": "capture/raw/rpc-0049.json",
+      "sha256": "948a7679e8264e648fdb1d2bfac1ea9cf32cb016dbe7061823766edc628c1941"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0050.json",
+      "published_path": "capture/raw/rpc-0050.json",
+      "sha256": "36e9d6685bbcb5ebed6432205e80f90ef682e4226d7d81f591f68f4887a9b8fc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0051.json",
+      "published_path": "capture/raw/rpc-0051.json",
+      "sha256": "20c11a137313481a7adad3716a2ce653299367f8d88d93b29ff04fc400061255"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0052.json",
+      "published_path": "capture/raw/rpc-0052.json",
+      "sha256": "773d5609aa8521a4045156702b4227269c0841f69a938baf09d3ca9cd57d83e8"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0053.json",
+      "published_path": "capture/raw/rpc-0053.json",
+      "sha256": "79332b11b9b742254e9c9a99ece01411e599322d5174339a6d7f98b581ba897e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0054.json",
+      "published_path": "capture/raw/rpc-0054.json",
+      "sha256": "1b6def8cb84e7037d44b82d3555badfef877204a19730a89bb5fd21574932b86"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0055.json",
+      "published_path": "capture/raw/rpc-0055.json",
+      "sha256": "d42e88c90ef5ef99dba340e098ed51c92ad2115afeb3c06f5cd88c25dff1ee6f"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0056.json",
+      "published_path": "capture/raw/rpc-0056.json",
+      "sha256": "79332b11b9b742254e9c9a99ece01411e599322d5174339a6d7f98b581ba897e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0057.json",
+      "published_path": "capture/raw/rpc-0057.json",
+      "sha256": "42cba6a1900728e7acf4dce68e42288b8abe1c1fea76167c1cbdeb5def81d679"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0058.json",
+      "published_path": "capture/raw/rpc-0058.json",
+      "sha256": "0dab5855abbab0e153ce6027ceaac6a2de4d7234089be77598d0fda352cf2c07"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0059.json",
+      "published_path": "capture/raw/rpc-0059.json",
+      "sha256": "53accbeb2af785dbb94fdd6c7618d1c78a8b37aacc9de9a0c9c2817df837b252"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0060.json",
+      "published_path": "capture/raw/rpc-0060.json",
+      "sha256": "42cba6a1900728e7acf4dce68e42288b8abe1c1fea76167c1cbdeb5def81d679"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0061.json",
+      "published_path": "capture/raw/rpc-0061.json",
+      "sha256": "bec77b7d992327625d85399dfc0525de130911d9d62237fa05043ee3822f4628"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0062.json",
+      "published_path": "capture/raw/rpc-0062.json",
+      "sha256": "5a93b1533a53e5fd44a1f60661eb7b13a4f9ee74a35aeec28d613890062c29eb"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0063.json",
+      "published_path": "capture/raw/rpc-0063.json",
+      "sha256": "bf9804983c7c0561fe9e6e3ba01aebd731e769a8650c1b38eeaaf9a2aca06584"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0064.json",
+      "published_path": "capture/raw/rpc-0064.json",
+      "sha256": "bec77b7d992327625d85399dfc0525de130911d9d62237fa05043ee3822f4628"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0065.json",
+      "published_path": "capture/raw/rpc-0065.json",
+      "sha256": "0723e3d297f051cdfdd61cd470ad69ec453ca489534544d20b8c2a89a9704ea4"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0066.json",
+      "published_path": "capture/raw/rpc-0066.json",
+      "sha256": "cf4cf44991f22a8de2094687fdc51568b70e7ae388656877392de45ff7d8efc9"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0067.json",
+      "published_path": "capture/raw/rpc-0067.json",
+      "sha256": "64a97057d38e25f3a5284241dec2ccd573bd3195fbce97d62c404cfbf4e45203"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0068.json",
+      "published_path": "capture/raw/rpc-0068.json",
+      "sha256": "0723e3d297f051cdfdd61cd470ad69ec453ca489534544d20b8c2a89a9704ea4"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0069.json",
+      "published_path": "capture/raw/rpc-0069.json",
+      "sha256": "0723e3d297f051cdfdd61cd470ad69ec453ca489534544d20b8c2a89a9704ea4"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0070.json",
+      "published_path": "capture/raw/rpc-0070.json",
+      "sha256": "529579b4bcc72b4295b65c0f43ee40d57d4d9cac0e995f5fb580915059c8de76"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0071.json",
+      "published_path": "capture/raw/rpc-0071.json",
+      "sha256": "1efb506d1e23d4bf3842b872e50250f295b26845361acca1b2ff15585391d613"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0072.json",
+      "published_path": "capture/raw/rpc-0072.json",
+      "sha256": "8cc919bb26ebcdc513deb0f29b4f6882bfe917cd35a042b1e8cfd8ee0e3bbc2f"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0073.json",
+      "published_path": "capture/raw/rpc-0073.json",
+      "sha256": "529579b4bcc72b4295b65c0f43ee40d57d4d9cac0e995f5fb580915059c8de76"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0074.json",
+      "published_path": "capture/raw/rpc-0074.json",
+      "sha256": "de3bdb14e05f7e78649551bbeff7a45359b8a8a0a40616dd53afd9815154b4e3"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0075.json",
+      "published_path": "capture/raw/rpc-0075.json",
+      "sha256": "c3a6a4378899b311babd3edb6df220ca71e7bc28c6b3ccb41e409fe9c2c3916d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0076.json",
+      "published_path": "capture/raw/rpc-0076.json",
+      "sha256": "1cff7beb75234d52995afca380c157d0caf283a453be58309116d428f0cae2ec"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0077.json",
+      "published_path": "capture/raw/rpc-0077.json",
+      "sha256": "a77ca6a0340c66efa6c6f8719f96f14b460618346d3ecb6d3b0d863cde4a4c08"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0078.json",
+      "published_path": "capture/raw/rpc-0078.json",
+      "sha256": "fbdf3584f93ea2e798de585242d22660e1e2ab19e3ce4cc7b8c619d9b69012a0"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0079.json",
+      "published_path": "capture/raw/rpc-0079.json",
+      "sha256": "e05f1e838a358fbc9834bdf6ca3deca33b33cab81fe78675c6d10a543412aa5d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0080.json",
+      "published_path": "capture/raw/rpc-0080.json",
+      "sha256": "ceb7f8f2d0f012b0621e7543c2355c8e8ec4bee851c17acd4dd08c39bb4404ee"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0081.json",
+      "published_path": "capture/raw/rpc-0081.json",
+      "sha256": "fbdf3584f93ea2e798de585242d22660e1e2ab19e3ce4cc7b8c619d9b69012a0"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0082.json",
+      "published_path": "capture/raw/rpc-0082.json",
+      "sha256": "40071a56b20906a8ec2f44d69606660adc6830f58485035e6d6ec724e21b8380"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0083.json",
+      "published_path": "capture/raw/rpc-0083.json",
+      "sha256": "02c53e681242ced458c22ad1ec98a585a6a8f552dea539085c8f0eef479bba57"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0084.json",
+      "published_path": "capture/raw/rpc-0084.json",
+      "sha256": "5046b553ba646d6f72e20cb435b39d07ecdcdd24ab65ced78ab71e509cb9d15c"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0085.json",
+      "published_path": "capture/raw/rpc-0085.json",
+      "sha256": "7a43184cc6ffaa93071109a5ca2aba7d8c16db4ac1f68382b629044719ee06c6"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0086.json",
+      "published_path": "capture/raw/rpc-0086.json",
+      "sha256": "00ec71b0497f54bdf44fc379f43975a8574f27a23cbee0ce2ff4a8afcf44e15a"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0087.json",
+      "published_path": "capture/raw/rpc-0087.json",
+      "sha256": "09cb8988e5134462a183f8b46759292830eca451b66cda29252095e76d32f649"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0088.json",
+      "published_path": "capture/raw/rpc-0088.json",
+      "sha256": "05cacafb922fa0c1be05b9e2ad589167f1b32ad5477e2ebcac2b68cae1a3c0db"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0089.json",
+      "published_path": "capture/raw/rpc-0089.json",
+      "sha256": "00ec71b0497f54bdf44fc379f43975a8574f27a23cbee0ce2ff4a8afcf44e15a"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0090.json",
+      "published_path": "capture/raw/rpc-0090.json",
+      "sha256": "00ec71b0497f54bdf44fc379f43975a8574f27a23cbee0ce2ff4a8afcf44e15a"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0091.json",
+      "published_path": "capture/raw/rpc-0091.json",
+      "sha256": "9d0d5a644b4fa6af78aae74ccabda55480be31a2df11769c4811de63a0fab264"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0092.json",
+      "published_path": "capture/raw/rpc-0092.json",
+      "sha256": "21bb00446fd38b09456fee79e7f2c3973874cdca65a98a31ce23513a2f50c007"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0093.json",
+      "published_path": "capture/raw/rpc-0093.json",
+      "sha256": "4507a2e1e566eb08be55cca604025276b513716c74d32fc9976a413e7860d2d7"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0094.json",
+      "published_path": "capture/raw/rpc-0094.json",
+      "sha256": "9d0d5a644b4fa6af78aae74ccabda55480be31a2df11769c4811de63a0fab264"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0095.json",
+      "published_path": "capture/raw/rpc-0095.json",
+      "sha256": "978fdcbdfe44fdd991c171457b828ecc9250b126ac622c684baed8ecb48813b2"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0096.json",
+      "published_path": "capture/raw/rpc-0096.json",
+      "sha256": "21bb00446fd38b09456fee79e7f2c3973874cdca65a98a31ce23513a2f50c007"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0097.json",
+      "published_path": "capture/raw/rpc-0097.json",
+      "sha256": "101f1b98349413efaa5d8521dc06d03eda54784534b9b2265586e9ff6836b5e9"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0098.json",
+      "published_path": "capture/raw/rpc-0098.json",
+      "sha256": "978fdcbdfe44fdd991c171457b828ecc9250b126ac622c684baed8ecb48813b2"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0099.json",
+      "published_path": "capture/raw/rpc-0099.json",
+      "sha256": "e47760b889d5461bfec48eb40d7eb6607d013bfdc2bad20cca84ea477e7f5fce"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0100.json",
+      "published_path": "capture/raw/rpc-0100.json",
+      "sha256": "9a5fe20356564692405d26f83f2a7244f1e5b38ed5c2b0f74b77295b5fe37305"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0101.json",
+      "published_path": "capture/raw/rpc-0101.json",
+      "sha256": "4eda8331b64ff0b517adb3e88877af281758058205e862a8d844047b8491085e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0102.json",
+      "published_path": "capture/raw/rpc-0102.json",
+      "sha256": "e47760b889d5461bfec48eb40d7eb6607d013bfdc2bad20cca84ea477e7f5fce"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0103.json",
+      "published_path": "capture/raw/rpc-0103.json",
+      "sha256": "f3255edbfdab67167760329a00d0b11ce8cb9d8889f138dcf3bc3489fd93509b"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0104.json",
+      "published_path": "capture/raw/rpc-0104.json",
+      "sha256": "d2e5f612f150d5c3d9c9a77fddd5211add8fa457ddab0b76e7ddf43abbf5c891"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0105.json",
+      "published_path": "capture/raw/rpc-0105.json",
+      "sha256": "50c42d008685fc0666ff3b33b36768e5ccde42a49ae0df4887904f08cd683258"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0106.json",
+      "published_path": "capture/raw/rpc-0106.json",
+      "sha256": "f3255edbfdab67167760329a00d0b11ce8cb9d8889f138dcf3bc3489fd93509b"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0107.json",
+      "published_path": "capture/raw/rpc-0107.json",
+      "sha256": "1c8a1c7e9cb77c4bbf5db3c3af739e7911da8c1710802940f81e6305603f54c4"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0108.json",
+      "published_path": "capture/raw/rpc-0108.json",
+      "sha256": "542024f85154753ea748310bf511c25d69e02976651c3f2d66faf7e02d2b5178"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0109.json",
+      "published_path": "capture/raw/rpc-0109.json",
+      "sha256": "d2e5f612f150d5c3d9c9a77fddd5211add8fa457ddab0b76e7ddf43abbf5c891"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0110.json",
+      "published_path": "capture/raw/rpc-0110.json",
+      "sha256": "dd94eac26f86cb6a4473f0fde0e191a0135c7235c2e69a5230daf605607efb62"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0111.json",
+      "published_path": "capture/raw/rpc-0111.json",
+      "sha256": "542024f85154753ea748310bf511c25d69e02976651c3f2d66faf7e02d2b5178"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0112.json",
+      "published_path": "capture/raw/rpc-0112.json",
+      "sha256": "e6de0be56dc9b9dc41fc2107117497afdb7f3fcf994e8941b2b6847a6d5b0b9d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0113.json",
+      "published_path": "capture/raw/rpc-0113.json",
+      "sha256": "d2e5f612f150d5c3d9c9a77fddd5211add8fa457ddab0b76e7ddf43abbf5c891"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0114.json",
+      "published_path": "capture/raw/rpc-0114.json",
+      "sha256": "1e108fd15e4d1dca329e1a1d0b9fc202befcd1bac930a870aaca37391768de91"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0115.json",
+      "published_path": "capture/raw/rpc-0115.json",
+      "sha256": "e6de0be56dc9b9dc41fc2107117497afdb7f3fcf994e8941b2b6847a6d5b0b9d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0116.json",
+      "published_path": "capture/raw/rpc-0116.json",
+      "sha256": "9eeb30f105d1a11da31bde52f9a61841deb6de7ff237e7f44721d6f0fdb35abe"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0117.json",
+      "published_path": "capture/raw/rpc-0117.json",
+      "sha256": "d2e5f612f150d5c3d9c9a77fddd5211add8fa457ddab0b76e7ddf43abbf5c891"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0118.json",
+      "published_path": "capture/raw/rpc-0118.json",
+      "sha256": "b33eb5724e275b8dc96aeb30c0cdbf92e2593934b8cc2de241fc9aac5ffefe1b"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0119.json",
+      "published_path": "capture/raw/rpc-0119.json",
+      "sha256": "9eeb30f105d1a11da31bde52f9a61841deb6de7ff237e7f44721d6f0fdb35abe"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0120.json",
+      "published_path": "capture/raw/rpc-0120.json",
+      "sha256": "d79d904774f6524ac9521ef590efd264d75551667e6bbf7191ffea41e42f148e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0121.json",
+      "published_path": "capture/raw/rpc-0121.json",
+      "sha256": "915b0c3b625061201366b08fc812c682cb1905bf58163c5f616be8e059382691"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0122.json",
+      "published_path": "capture/raw/rpc-0122.json",
+      "sha256": "2c5918462f9fe37feb3f0146fef9c139bf24f2c738f5b8e7216b9928af11fead"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0123.json",
+      "published_path": "capture/raw/rpc-0123.json",
+      "sha256": "683f3cb3a0690d7e8116e9ba28295f9061fb5c62275f0edd4c05d7b99138fd10"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0124.json",
+      "published_path": "capture/raw/rpc-0124.json",
+      "sha256": "dc5c860feca55f3cbda1ddcd0186dce38a0a3d4ca1979e1e598923b3a396934d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0125.json",
+      "published_path": "capture/raw/rpc-0125.json",
+      "sha256": "ba4e85c6973b434fa569d3609411f10eadfbc606faa9902287c38833d36ee931"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0126.json",
+      "published_path": "capture/raw/rpc-0126.json",
+      "sha256": "2f5b628d10180f12dc2af1bcc26d327bcd9480ff832f107442f26db9ee6fa51d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0127.json",
+      "published_path": "capture/raw/rpc-0127.json",
+      "sha256": "dc5c860feca55f3cbda1ddcd0186dce38a0a3d4ca1979e1e598923b3a396934d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0128.json",
+      "published_path": "capture/raw/rpc-0128.json",
+      "sha256": "36ead31429eddaf663bda64e3363dedbb7052a64a6c6d4a9980af5983139cf5f"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0129.json",
+      "published_path": "capture/raw/rpc-0129.json",
+      "sha256": "ba4e85c6973b434fa569d3609411f10eadfbc606faa9902287c38833d36ee931"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0130.json",
+      "published_path": "capture/raw/rpc-0130.json",
+      "sha256": "9c039018a203254164a7290500b6ad5dba4f35b22ccf9eafce2febd129754825"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0131.json",
+      "published_path": "capture/raw/rpc-0131.json",
+      "sha256": "36ead31429eddaf663bda64e3363dedbb7052a64a6c6d4a9980af5983139cf5f"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0132.json",
+      "published_path": "capture/raw/rpc-0132.json",
+      "sha256": "2db06323da6bc4df72113c9bf1e21fe709aab599779d892ef8f51dff820c4d10"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0133.json",
+      "published_path": "capture/raw/rpc-0133.json",
+      "sha256": "81c84c96dd4b99cf3876006192691c23e3b6fd1fc6ed47eccb8b4972dc84eadd"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0134.json",
+      "published_path": "capture/raw/rpc-0134.json",
+      "sha256": "ba4e85c6973b434fa569d3609411f10eadfbc606faa9902287c38833d36ee931"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0135.json",
+      "published_path": "capture/raw/rpc-0135.json",
+      "sha256": "4e016bf801057db9d0d73177a65cc4e20503a26822af1d129e13af1ee53a0110"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0136.json",
+      "published_path": "capture/raw/rpc-0136.json",
+      "sha256": "e310f1b40bb8869d95c64be63ef64dad3e1a6c8a6a1c9fd7896dadb03f34094c"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0137.json",
+      "published_path": "capture/raw/rpc-0137.json",
+      "sha256": "17943e08fbb680f7b8b90f8df6cd9c2d7260ac828056e4dead33cc19fb4f91cf"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0138.json",
+      "published_path": "capture/raw/rpc-0138.json",
+      "sha256": "be0e90f8be5e30793e7d7551a11edda04abddc67d2e2b05070904502d1bef463"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0139.json",
+      "published_path": "capture/raw/rpc-0139.json",
+      "sha256": "ae2dd9acf23fa59b8377e8160813d646659bfc7473f80cf86b6220793667d938"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0140.json",
+      "published_path": "capture/raw/rpc-0140.json",
+      "sha256": "17943e08fbb680f7b8b90f8df6cd9c2d7260ac828056e4dead33cc19fb4f91cf"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0141.json",
+      "published_path": "capture/raw/rpc-0141.json",
+      "sha256": "ca03d4c646634f7740e78127830a0a84bc291309930689b30e6095bbc5052914"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0142.json",
+      "published_path": "capture/raw/rpc-0142.json",
+      "sha256": "27ecc752b26b7b93a06ea230929ed416a35cc7b8eff5d2b979bab07b4f629249"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0143.json",
+      "published_path": "capture/raw/rpc-0143.json",
+      "sha256": "47da3b1dcccffb7870c68cfab08eb34eb116a8bca34a9d4cff60ceeab25d097b"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0144.json",
+      "published_path": "capture/raw/rpc-0144.json",
+      "sha256": "ca03d4c646634f7740e78127830a0a84bc291309930689b30e6095bbc5052914"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0145.json",
+      "published_path": "capture/raw/rpc-0145.json",
+      "sha256": "c5d4175c93ffd98cd16c73f8ce91daf25c21ebcea4fa0c1c770ad77ca82b0035"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0146.json",
+      "published_path": "capture/raw/rpc-0146.json",
+      "sha256": "27ecc752b26b7b93a06ea230929ed416a35cc7b8eff5d2b979bab07b4f629249"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0147.json",
+      "published_path": "capture/raw/rpc-0147.json",
+      "sha256": "374cb080a52bc9ec37bc4c32f5a59b68509dfb495cfc76e6682febc0e046f695"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0148.json",
+      "published_path": "capture/raw/rpc-0148.json",
+      "sha256": "c5d4175c93ffd98cd16c73f8ce91daf25c21ebcea4fa0c1c770ad77ca82b0035"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0149.json",
+      "published_path": "capture/raw/rpc-0149.json",
+      "sha256": "6871d768c8fcfa8818e17feb459f8b912eb299b13388de140342da11e59927f4"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0150.json",
+      "published_path": "capture/raw/rpc-0150.json",
+      "sha256": "307e7078de5fd76db8af8831e55c11f5af1b16c4fa6559ddbef6db8d86b2985e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0151.json",
+      "published_path": "capture/raw/rpc-0151.json",
+      "sha256": "b596178b0d52cda7966034d46010acdfe88996f7a4b36018b31c1b3e23ea76a8"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0152.json",
+      "published_path": "capture/raw/rpc-0152.json",
+      "sha256": "6871d768c8fcfa8818e17feb459f8b912eb299b13388de140342da11e59927f4"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0153.json",
+      "published_path": "capture/raw/rpc-0153.json",
+      "sha256": "7ea2ae77bca4ab20fd78d9d4cd3e0eb4207fcad296d921dca4e6b8535fc5c624"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0154.json",
+      "published_path": "capture/raw/rpc-0154.json",
+      "sha256": "db13cd445875815cd2c9f33ece35ca7c0ed184c0ddc7c6a4cd4a13c820e91286"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0155.json",
+      "published_path": "capture/raw/rpc-0155.json",
+      "sha256": "4a1fd4f761ed8cce7ab7a4da5e98b5afe3e38f7f9fab7a2cb1041e951254b6b7"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0156.json",
+      "published_path": "capture/raw/rpc-0156.json",
+      "sha256": "ea294eb2eae6080e572b0d5976971dee420d6006678b38d928222ff96c9f1773"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0157.json",
+      "published_path": "capture/raw/rpc-0157.json",
+      "sha256": "db13cd445875815cd2c9f33ece35ca7c0ed184c0ddc7c6a4cd4a13c820e91286"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0158.json",
+      "published_path": "capture/raw/rpc-0158.json",
+      "sha256": "c646212922c9a449e4747a5cc364618bbc830533daa00e9d28a36cf8b243e42c"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0159.json",
+      "published_path": "capture/raw/rpc-0159.json",
+      "sha256": "9a12148d8590b682dff8a392d6ad1fad8fbc25ef6b9f5438a46262663ed2ef41"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0160.json",
+      "published_path": "capture/raw/rpc-0160.json",
+      "sha256": "34f62471c61b9369eb3121edafda3762df9e80bd8b5af7587c0989f1f926c105"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0161.json",
+      "published_path": "capture/raw/rpc-0161.json",
+      "sha256": "c646212922c9a449e4747a5cc364618bbc830533daa00e9d28a36cf8b243e42c"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0162.json",
+      "published_path": "capture/raw/rpc-0162.json",
+      "sha256": "bc26583a567fbed530667dfb09e771817a7ad51b32d55919ca90a0e7d3405483"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0163.json",
+      "published_path": "capture/raw/rpc-0163.json",
+      "sha256": "9a12148d8590b682dff8a392d6ad1fad8fbc25ef6b9f5438a46262663ed2ef41"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0164.json",
+      "published_path": "capture/raw/rpc-0164.json",
+      "sha256": "0b058f6a397706ce30664994c76365ebdf134d5437b65bb98e271f3d8acc1411"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0165.json",
+      "published_path": "capture/raw/rpc-0165.json",
+      "sha256": "db333f8565fe25a85d621677475ef118b3c68b3573f97d6fbce76f23d44e9db5"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0166.json",
+      "published_path": "capture/raw/rpc-0166.json",
+      "sha256": "71f97c6a7a7c7147e87ed1f761fde90e5939900a0dcfcadddb51e4a0dc1f1c36"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0167.json",
+      "published_path": "capture/raw/rpc-0167.json",
+      "sha256": "9a12148d8590b682dff8a392d6ad1fad8fbc25ef6b9f5438a46262663ed2ef41"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0168.json",
+      "published_path": "capture/raw/rpc-0168.json",
+      "sha256": "798638098ffdff2ad0ceba58e3e70e92dba1a1a1c2791445d1627119d91a5709"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0169.json",
+      "published_path": "capture/raw/rpc-0169.json",
+      "sha256": "71f97c6a7a7c7147e87ed1f761fde90e5939900a0dcfcadddb51e4a0dc1f1c36"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0170.json",
+      "published_path": "capture/raw/rpc-0170.json",
+      "sha256": "34bf889bfb5d0a6a3187a165d76236cbde93e8a1ad3fe1706d73ce2b15ef8a79"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0171.json",
+      "published_path": "capture/raw/rpc-0171.json",
+      "sha256": "9a12148d8590b682dff8a392d6ad1fad8fbc25ef6b9f5438a46262663ed2ef41"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0172.json",
+      "published_path": "capture/raw/rpc-0172.json",
+      "sha256": "cee9eabf0e8c92708f40a1af02433425a37cf27e8638aa62c0720f406193ad45"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0173.json",
+      "published_path": "capture/raw/rpc-0173.json",
+      "sha256": "34bf889bfb5d0a6a3187a165d76236cbde93e8a1ad3fe1706d73ce2b15ef8a79"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0174.json",
+      "published_path": "capture/raw/rpc-0174.json",
+      "sha256": "0ee5235411435676f2af52fa9ceadd28c50cd1cdf87ea5cd0be992d8f3b7e95a"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0175.json",
+      "published_path": "capture/raw/rpc-0175.json",
+      "sha256": "1500dee7a3d3a871a6f750d685d5593f2babb32c1a5b1e90cc43de1cbdff14ed"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0176.json",
+      "published_path": "capture/raw/rpc-0176.json",
+      "sha256": "9a12148d8590b682dff8a392d6ad1fad8fbc25ef6b9f5438a46262663ed2ef41"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0177.json",
+      "published_path": "capture/raw/rpc-0177.json",
+      "sha256": "35154e0ec374d9d8ae9679b5209a9eb5de3b87d9c3e5a0d31703b57829613a35"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0178.json",
+      "published_path": "capture/raw/rpc-0178.json",
+      "sha256": "89042d793a7e92be1c86fec282f784e61085e4136f64b281af0699a5d3db74e8"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0179.json",
+      "published_path": "capture/raw/rpc-0179.json",
+      "sha256": "6a69051b5db5637b7ee993995e87407f1f24ec1760301b1bb64a97e9e889fcb7"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0180.json",
+      "published_path": "capture/raw/rpc-0180.json",
+      "sha256": "9a12148d8590b682dff8a392d6ad1fad8fbc25ef6b9f5438a46262663ed2ef41"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0181.json",
+      "published_path": "capture/raw/rpc-0181.json",
+      "sha256": "f98a95eba75378b8f9915a3ac69060527ca2b6b6292477793475c9c456c1cc95"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0182.json",
+      "published_path": "capture/raw/rpc-0182.json",
+      "sha256": "6a69051b5db5637b7ee993995e87407f1f24ec1760301b1bb64a97e9e889fcb7"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0183.json",
+      "published_path": "capture/raw/rpc-0183.json",
+      "sha256": "cb50f8225954e4aed0293880b708c6d00b9299694306d29719063fea84f15d07"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0184.json",
+      "published_path": "capture/raw/rpc-0184.json",
+      "sha256": "ba8f6d377cbb53729e58907e6fd4e588f088f6308f1da303def690f73014183f"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0185.json",
+      "published_path": "capture/raw/rpc-0185.json",
+      "sha256": "0149a096cd1205a19dcc42a43f7e2bc2cfcfcbb420858e9365b3d3654ca27d57"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0186.json",
+      "published_path": "capture/raw/rpc-0186.json",
+      "sha256": "e0658c04129c63383536b05ad14ed51801b0c155c837d0c05a05a9e8bb4530f7"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0187.json",
+      "published_path": "capture/raw/rpc-0187.json",
+      "sha256": "f32072c44bc8f646a2be343e9ed40761c416f90073e53181b4d35749cab1fdc1"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0188.json",
+      "published_path": "capture/raw/rpc-0188.json",
+      "sha256": "5261e602b793fe24d8b2eb758bf695499e68b96cd30a3efbe168623fcf95e336"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0189.json",
+      "published_path": "capture/raw/rpc-0189.json",
+      "sha256": "f72e3e5896f699d2b521794446de500ccac77f6953e156b4ac9761377a96f504"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0190.json",
+      "published_path": "capture/raw/rpc-0190.json",
+      "sha256": "f32072c44bc8f646a2be343e9ed40761c416f90073e53181b4d35749cab1fdc1"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0191.json",
+      "published_path": "capture/raw/rpc-0191.json",
+      "sha256": "89ab052a4ce5a7d7ac924034a1231be8abe663f2b3f1e94d11e21dac2ee52c16"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0192.json",
+      "published_path": "capture/raw/rpc-0192.json",
+      "sha256": "9a9fb9cdf88130e5afcdf2dfa9d5c4918489ebf02999b04295730456fec9e74d"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0193.json",
+      "published_path": "capture/raw/rpc-0193.json",
+      "sha256": "e4de0b9fc246652b6b2357600e974c3e2c9c46bbc1f67a3f4a806867e724d82b"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0194.json",
+      "published_path": "capture/raw/rpc-0194.json",
+      "sha256": "89ab052a4ce5a7d7ac924034a1231be8abe663f2b3f1e94d11e21dac2ee52c16"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0195.json",
+      "published_path": "capture/raw/rpc-0195.json",
+      "sha256": "89ab052a4ce5a7d7ac924034a1231be8abe663f2b3f1e94d11e21dac2ee52c16"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0196.json",
+      "published_path": "capture/raw/rpc-0196.json",
+      "sha256": "48cd5a59e289d3b91887d62d81033a09f7238d4c0e05d169ed949c8e8e35ff85"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0197.json",
+      "published_path": "capture/raw/rpc-0197.json",
+      "sha256": "eee95fac54ca247b455154ce90f3b1ad5bdcd51ffe7646309f79034b662f7dd8"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0198.json",
+      "published_path": "capture/raw/rpc-0198.json",
+      "sha256": "057a414944b92361f1d7ecf0d5f829023ca3abf69ac95e4a0772cb556ab50af1"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0199.json",
+      "published_path": "capture/raw/rpc-0199.json",
+      "sha256": "3b68740d815518d60179f40962fc92649c8f1444900b01d5e63c9028e19ab085"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0200.json",
+      "published_path": "capture/raw/rpc-0200.json",
+      "sha256": "19250e5164460aa530f06dd880cd33d60aecea6b1fd4de25976608c5766a50b4"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0201.json",
+      "published_path": "capture/raw/rpc-0201.json",
+      "sha256": "eee95fac54ca247b455154ce90f3b1ad5bdcd51ffe7646309f79034b662f7dd8"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0202.json",
+      "published_path": "capture/raw/rpc-0202.json",
+      "sha256": "0f8eebb83c4260e097019e47726d2085043595fc803a71702eef31d60d68a27e"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0203.json",
+      "published_path": "capture/raw/rpc-0203.json",
+      "sha256": "19250e5164460aa530f06dd880cd33d60aecea6b1fd4de25976608c5766a50b4"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0204.json",
+      "published_path": "capture/raw/rpc-0204.json",
+      "sha256": "5024544eacd7a181e00097d4b9f8923d2049c04da2bec944f09d6f4807127564"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0205.json",
+      "published_path": "capture/raw/rpc-0205.json",
+      "sha256": "eee95fac54ca247b455154ce90f3b1ad5bdcd51ffe7646309f79034b662f7dd8"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0206.json",
+      "published_path": "capture/raw/rpc-0206.json",
+      "sha256": "edfe75bfeac5a9c9f2aa59d596d8314c9f3f91fb5c31415c7c306636f57eba88"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0207.json",
+      "published_path": "capture/raw/rpc-0207.json",
+      "sha256": "5024544eacd7a181e00097d4b9f8923d2049c04da2bec944f09d6f4807127564"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0208.json",
+      "published_path": "capture/raw/rpc-0208.json",
+      "sha256": "91fd047398e4cd305016effe2f8dec5167a16af9dca593789f16094ac221f0b0"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0209.json",
+      "published_path": "capture/raw/rpc-0209.json",
+      "sha256": "eee95fac54ca247b455154ce90f3b1ad5bdcd51ffe7646309f79034b662f7dd8"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0210.json",
+      "published_path": "capture/raw/rpc-0210.json",
+      "sha256": "f66d4a3c0fda4e9a494ed7f4754ed8d5210548a5c281ec714db3bd220d931f47"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0211.json",
+      "published_path": "capture/raw/rpc-0211.json",
+      "sha256": "91fd047398e4cd305016effe2f8dec5167a16af9dca593789f16094ac221f0b0"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0212.json",
+      "published_path": "capture/raw/rpc-0212.json",
+      "sha256": "679ae9228a8ff0a09571cf2bbf315d5e3b8a646d6225bf040d0545db18fe9f07"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0213.json",
+      "published_path": "capture/raw/rpc-0213.json",
+      "sha256": "eee95fac54ca247b455154ce90f3b1ad5bdcd51ffe7646309f79034b662f7dd8"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0214.json",
+      "published_path": "capture/raw/rpc-0214.json",
+      "sha256": "4bf6fcbaab342f513f8dc81769a3296875c3d61a3ebb91ffd873930ee958e2bc"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0215.json",
+      "published_path": "capture/raw/rpc-0215.json",
+      "sha256": "35098b4615cef01435c36bdb5bef00bbeb65f338d74cb24ef86a032a23feca5c"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0216.json",
+      "published_path": "capture/raw/rpc-0216.json",
+      "sha256": "679ae9228a8ff0a09571cf2bbf315d5e3b8a646d6225bf040d0545db18fe9f07"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/rpc-0217.json",
+      "published_path": "capture/raw/rpc-0217.json",
+      "sha256": "d3689d4fc5262751aee0c1ce049ec71e5718553507d11673a43111ae6b2dc8d8"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "raw/start-binance-rules.json",
+      "published_path": "capture/raw/start-binance-rules.json",
+      "sha256": "9a6ee205ef5b5d48710741bd9ab1134b86c8e5c7de90bd1ba78aaeb48552bc16"
+    },
+    {
+      "kind": "retained_market_evidence",
+      "source_path": "samples.jsonl",
+      "published_path": "capture/samples.jsonl",
+      "sha256": "92e4337b4c4e77dc71c6b13c6ad246886f87a0746bfd51529d3284e61ba2c60f"
+    }
+  ]
+}
