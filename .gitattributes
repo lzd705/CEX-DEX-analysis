@@ -1,0 +1,4 @@
+# Preserve source/evidence byte identities across Git checkouts.
+* -text
+# csv.writer retains standard CRLF records in the reference analysis.
+*.csv whitespace=cr-at-eol

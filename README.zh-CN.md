@@ -1,273 +1,226 @@
-# CEX–DEX 跨市场研究平台
+# CEX–DEX 市场结构与执行研究
 
 [English](readme.md) | 简体中文
 
-**网站：**[打开市场研究看板](http://43.156.102.166:8765)
+**[打开市场研究看板](http://43.156.102.166:8765)** · [实现导航](#实现导航) · [复现研究](#复现研究)
 
-一个面向中心化交易所与链上流动性池的跨市场研究平台，用于比较价格、测量流动性、估算执行成本和验证套利机会。
+**基于来源证据的市场数据、协议级精确 AMM 报价，以及考虑执行成本的跨市场研究。**
 
-项目将市场数据看板、基于交易数量的报价引擎和可复现的机会研究流程连接起来，围绕一个核心问题展开：**观察到的价格差异，在考虑交易规模、市场深度、费用和时间因素后，还剩下多少？**
+## 项目概览
 
-[浏览应用代码](https://github.com/lzd705/CEX-DEX-analysis/tree/codex/historical-foundry-opportunity) · [数据契约](#文档导航) · [运行演示](#快速开始) · [研究工作线](#仓库导航)
+项目研究跨市场价差如何随着交易规模、流动性分布、手续费、Token 精度和市场状态时间而变化。
+它把 CEX/DEX 对比平台、订单簿执行模型、固定区块池状态、整数交换模拟和可复现现金流实验连接起来。
 
-## 平台功能
+| 模块 | 规模 | 观测依据 |
+| --- | --- | --- |
+| 市场数据平台 | 30 个 Token、12 家 CEX、493 条市场序列 | 2026-07-29 发布快照：345 条 CEX 序列，148 条 DEX 序列，对应 147 个物理池 |
+| 历史每日观测 | 94,778 行 | 7 月快照：66,015 行 CEX 与 28,763 行 DEX 日度观测 |
+| 流动性区间 | 10 / 25 / 50 / 100 bp | 双向订单簿深度和支持的池状态深度 |
+| 交易规模网格 | 1千 / 5千 / 1万 / 5万 / 10万美元 | 使用相同目标 Token 数量的买卖报价 |
+| V3 整数引擎 | 两个 Ethereum UNI 池 | UNI/USDT、UNI/WETH；exact-input、exact-output 与同区块 QuoterV2 校验 |
+| SHIB V2 池间研究 | 10 个方向与规模场景 | 固定区块下的 Uniswap V2、ShibaSwap V1 对比 |
+| 11 月 UNI CEX/V3 实验 | 51 个不同区块、510 个 DEX 报价 | 21,420 个费率/Gas 现金流场景，附公开输入与离线复现 |
 
-| 方向 | 功能 |
-| --- | --- |
-| 市场对比 | 选择一个 Token 和两个明确的市场，对比 CEX/CEX、CEX/DEX 或 DEX/DEX 的每日价格、收益率、波动率、成交额和价差。 |
-| 流动性分析 | 基于 CEX 订单簿和支持的 DEX 池状态，计算 10、25、50、100 bp 的双向深度，并展示池子 TVL。 |
-| 执行成本研究 | 在五档交易规模下逐档消耗盘口或模拟池内交换，记录数量、成交均价、费用范围和来源状态。 |
-| 机会评估 | 用相同净 Token 数量匹配买卖两腿，附加成本证据、执行时间检查，并发布路由级研究结果。 |
-| 历史回放 | 保留区块身份和采集证据，通过独立的回放与校验流程重建固定状态下的交易场景。 |
-| 数据运维 | 支持增量采集、质量审计、快照发布、健康检查，以及经过身份验证的 Token 审核流程。 |
+[7 月发布报告](docs/senior-report.md)和[11 月实验](experiments/uni_cex_v3_20261102/README.md)
+提供上述数字对应的日期、数据和计算背景。
 
-应用工作线配置了 **30 个 Token** 和 **12 个公共 CEX 订单簿适配器**。每份采集快照分别报告市场可用情况与有效覆盖率。
-
-## 整体架构
+## 系统架构
 
 ```text
-公共 CEX API                       DEX API + EVM JSON-RPC
-      │                                      │
-      └───────────────── 采集器 ──────────────┘
-                           │
-                   原始响应 + 采集清单
-                           │
-                 市场身份、结构与时间校验
-                           │
-          ┌────────────────┼──────────────────┐
-          │                │                  │
-       每日指标        深度与交易报价        路由评估
-          │                │                  │
-       SQLite           最新快照          不可变数据包
-          └────────────────┼──────────────────┘
-                           │
-                   Python API + 看板
+CEX 现货 API               GeckoTerminal             EVM JSON-RPC
+      └────────────────────── 采集器 ─────────────────────┘
+                                  │
+                       市场身份与单位标准化
+                                  │
+                     结构、覆盖率与时间校验
+                                  │
+          ┌───────────────────────┼─────────────────────────┐
+       每日 OHLCV          TVL、深度与交易报价          研究采集批次
+         SQLite               最新快照                固定状态输入
+          └───────────────────────┼─────────────────────────┘
+                          Python API 与看板
+
+研究模块：CEX 逐档吃单、V2 整数储备模型、V3 整数 SwapMath
+          Quoter 对照、同数量现金流、费用/Gas/延迟分析
 ```
 
-**技术栈：**Python、SQLite、Decimal/整数运算、JSON-RPC、JavaScript、HTML/CSS、Docker、Nginx 和 systemd；历史回放工作线还集成了 Foundry/Anvil。
-
-每日时间序列、时点流动性和路由采集批次具有独立的存储与发布流程。看板通过明确的市场身份和来源关联将它们组合起来。
+**技术栈：**Python、SQLite、Decimal/整数运算、JSON-RPC、JavaScript、HTML/CSS、
+Docker、Nginx、systemd，以及独立的 Foundry/Anvil 回放工具链。
 
 ## 数据质量
 
-质量检查贯穿采集、计算、发布和 API 交付各个阶段。
+- **身份：**CEX 保留交易所与交易对；DEX 保留链、协议、池和 Token 地址。
+- **单位：**保留基础/计价资产、Token decimals、原始整数数量和明确的美元换算方法。
+- **完整性：**校验市场与场景清单、盘口边界；截断深度按已观测下界记录。
+- **状态：**区分 `observed`、`partial`、`unsupported` 和 `failed`；缺失数值保留为 `null`。
+- **时间：**保留来源提供的事件时间、请求与接收时间、采集跨度、区块时间和换算价格观测时间。
+- **证据：**保存原始响应、采集清单、来源哈希和计算关联；发布门槛检查有效覆盖率及原有可用市场的保留比例。
 
-### 市场身份与单位
+日度 OHLCV、时点流动性和路由采集批次分别保留自己的存储与发布流程。
+详见[数据管理](data/README.md)与[采集运维](docs/collection-operations.md)。
 
-- CEX 观测保留交易所、现货交易对、基础资产和计价资产。
-- DEX 观测保留链、协议、池地址、Token 地址、Token 顺序和 decimals。
-- 计价资产转换为美元时，记录换算来源和方法；以 USDT 为基础的流程明确标注美元平价代理假设。
+## 定量方法
 
-### 有效性与完整性
+### CEX：逐档订单簿执行
 
-- 校验数据结构、盘口正值、买卖价格顺序、完整场景清单和来源哈希。
-- 缺失数值保存为 `null`，区分实测零值、部分覆盖、未支持模型和采集失败。
-- 检查订单簿截断情况，为各深度区间保留完整性标记；覆盖不足的实测深度作为已观测下界展示。
-- 以明确的市场清单计算覆盖率；发布检查同时评估本轮有效覆盖率和此前可用市场的保留比例。
+给定目标数量 `q`，买入按卖价从低到高消耗 asks，卖出按买价从高到低消耗 bids。
+最后一档仅取完成目标所需的数量。总计价资产支出或收入除以成交数量，得到 VWAP。
 
-### 时间与可复现性
-
-- 保留来源时间、观测时间、采集跨度，以及适用场景中的区块身份。
-- 在固定区块读取一个 DEX 池所需的状态；精确执行和回放工作线进一步绑定区块哈希并检查规范链状态。
-- 保留原始响应、采集清单、标准化数据和 SHA-256 来源关联，便于检查与回放。
-- 每日图表保留缺口，日收益率仅在相邻且有效的日期之间计算。
-
-详见[采集操作手册](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/collection-operations.md)和[数据生命周期](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/data/README.md)。
-
-## Depth 计算
-
-深度衡量参考价格指定范围内可交易的计价资产金额，分别保留买入和卖出方向。
-
-### CEX 订单簿
-
-设最优买价为 `b`、最优卖价为 `a`，价格区间为 `k` 个基点：
-
-```text
-中间价 = (b + a) / 2
-买盘深度 = Σ(价格 × 数量 × 计价资产美元价格)，价格 ≥ 中间价 × (1 − k / 10,000)
-卖盘深度 = Σ(价格 × 数量 × 计价资产美元价格)，价格 ≤ 中间价 × (1 + k / 10,000)
+```math
+C_{buy}(q)=\sum_i p_i\Delta q_i,\qquad
+R_{sell}(q)=\sum_j b_j\Delta q_j
 ```
 
-采集器检查返回档位是否覆盖目标价格边界，从而区分完整区间深度和受 API 档位数量限制的深度。
+参考价取同一份盘口的中间价。买入报价成本为“买入支出 − q × 参考价”，
+卖出报价成本为“q × 参考价 − 卖出收入”；账户费率场景作为独立成本层加入。
 
-### DEX 池状态
+### V2：带手续费的整数储备模型
 
-- **V2 类型池：**读取储备量、Token 元数据和实际池费率，使用恒定乘积模型计算价格移动到各边界所需的交易量。
-- **V3 类型池：**读取 `slot0`、活跃流动性、费率、tick spacing、tick bitmap 和已初始化 tick；逐段累积交易量，并在跨越 tick 时更新活跃流动性。
-- **V3 精确交换工作线：**独立整数引擎支持 UNI/USDT 和 UNI/WETH 的 exact-input、exact-output、协议式取整和限定范围的 tick 遍历，并提供 QuoterV2 对照校验工具。
+设输入储备为 `x`、输出储备为 `y`、总输入为 `a`、手续费比例为 `f`，exact-input 输出为：
 
-TVL 描述池子的总资产价值，depth 描述沿特定价格方向可使用的流动性。在集中流动性池中，两者的关系取决于流动性在各 tick 间的分布。
-
-## Execution Cost 计算
-
-标准报价清单采用 **1,000、5,000、10,000、50,000 和 100,000 美元**五档规模，每档分别计算买入和卖出场景。
-
-设参考金额为 `N`，参考价格为 `P`：
-
-```text
-目标数量 q = N / P，并按适用数量精度调整
-参考金额 = q × P
-
-买入执行成本 = 实际报价支出 − 参考金额
-卖出执行成本 = 参考金额 − 实际报价收入
-报价成本 bp = 执行成本 / 参考金额 × 10,000
+```math
+amountOut=\left\lfloor\frac{y(1-f)a}{x+(1-f)a}\right\rfloor
 ```
 
-CEX 报价按顺序消耗原始盘口档位；V2 执行使用整数交换运算；V3 精确执行工作线遍历已初始化 tick。各方法均直接针对目标交易数量计算。
+Exact-output 反求储备方程，并采用协议的整数除法与 `+1` 规则。
+计算使用 Token 原始单位、池实际费率和采集到的储备状态；池深度沿曲线计算至目标价格边界。
 
-### 成本分层
+### V3：集中流动性与精确整数交换
 
-| 成本层 | 处理方式 |
+[V3 模块](research/v3_exact/README.md)读取 `slot0`、活跃 `liquidity`、`fee`、
+`tickSpacing`、`tickBitmap`、已初始化 tick 和 `liquidityNet`。
+`sqrtPriceX96` 以 Q64.96 表示原始单位 token1/token0 价格的平方根；
+转换成人类单位价格时，进一步应用 Token decimals 调整。
+
+在一个活跃流动性固定的区间内，卖出 token0 使平方根价格从 `s0` 降到 `s1`。
+令 `s = sqrtPriceX96 / 2^96`，区间关系为：
+
+```math
+amount0_{effective}=L(1/s_1-1/s_0),\qquad
+amount1_{out}=L(s_0-s_1)
+```
+
+引擎使用整数定点运算和与方向相关的取整规则实现这些关系：
+
+1. `compute_swap_step` 处理单个区间的输入、输出、手续费与下一价格。
+2. `simulate_swap` 寻找下一个已初始化 tick 或价格限制。
+3. 跨越 tick 时按 `liquidityNet` 更新活跃流动性；`zeroForOne` 方向反转其符号。
+4. 持续计算，直到目标数量完成或达到限定价格边界。
+
+卖出使用 exact-input，买入使用 exact-output，保持目标 Token 数量一致。
+两个注册 UNI 池使用同一整数引擎计算深度边界和固定数量报价；
+其他 V3 类型深度适配器保留各自的协议计算路径。
+
+### 同区块 QuoterV2 校验
+
+两池 canary 将状态绑定在同一个 finalized 区块，并校验池、factory、Token 顺序、
+decimals 和费率。它以原始整数金额、`sqrtPriceX96After` 和符合 Quoter 语义的
+`initializedTicksCrossed` 对照本地计算，receipt 记录共享区块与来源关联。
+
+11 月实验采用绑定区块哈希的 latest 区块报价，并在采集结束时复查规范区块哈希。
+各样本保留区块年龄与 CEX 观测年龄。
+
+### 跨市场现金流
+
+路由模型从相同的**净 Token 数量**出发。CEX 现金流按选定的手续费资产、数量
+gross-up、步长和费用取整计算；DEX 交换报价包含池费，路由层补充其余适用成本。
+
+```math
+\Pi_{CEX\to DEX}=DEX_{sell}(q)-CEX_{buy}(q)-G
+```
+
+```math
+\Pi_{DEX\to CEX}=CEX_{sell}(q)-DEX_{buy}(q)-G
+```
+
+`G` 为选定的 Gas 情景。结果同时记录费率、库存和时间假设。
+详见[执行成本契约](docs/execution-cost-data-contract.md)。
+
+## 已公开研究结果
+
+### UNI：Binance ↔ Uniswap V3，2026-11-02
+
+约十分钟采集包含 60 次轮询、51 个不同的有效区块和 510 个 QuoterV2 报价。
+网格组合两个方向、五档规模、六档 CEX 费率和七档 Gas。
+
+| 指标 | 结果 |
 | --- | --- |
-| 买卖价差和价格冲击 | 体现在逐档盘口计算或池内交换报价中。 |
-| 池内交换手续费 | 已包含在池内交换计算中。 |
-| CEX 交易手续费 | 由机会成本层加入，并保留费率来源、具体费率和证据有效期。 |
-| Gas、路由费、转账税和再平衡 | 作为独立路由成本项，记录数值、适用性与证据状态。 |
-| 时间因素 | 记录报价年龄、来源时间跨度、路由截止时间和采集批次新鲜度。 |
+| 池 | Ethereum UNI/USDT，30 bp 池费 |
+| 费率/Gas 现金流行数 | 21,420 |
+| 采样网格中的正收益行数 | 0 |
+| 零 CEX 手续费、零 Gas 诊断情景 | 两个方向、全部规模均为负 |
+| 1,000 美元初始规模，CEX fee=10 bp、Gas=1 USDT 的最佳场景 | Binance 买 → V3 卖：−2.578299 USDT |
+| 延迟实验 | 精确 +1/+2/+3 区块重报价，包含条件式 CEX-first 现金流 |
 
-常规市场报价页面计算 CEX 可见盘口的执行成本，以及支持的 V2 池中包含池费的交换成本。独立机会层补充具体路由的成本和假设；V3 精确执行由专门工作线提供。
+[采集与复现指南](experiments/uni_cex_v3_20261102/README.md) ·
+[原始样本索引](experiments/uni_cex_v3_20261102/capture/manifest.json) ·
+[结果](experiments/uni_cex_v3_20261102/results/summary.json) ·
+[详细报告](docs/uni-cex-v3-experiment-2026-11-02.md)
 
-## 如何验证套利机会
+离线复现校验原始响应、数量与状态绑定、费率证据和现金流，
+再逐字节重建全部四份参考分析文件。
 
-1. **选择明确市场。**确定 Token、买入市场、卖出市场、计价资产、方向和目标规模。
-2. **采集同一研究批次。**保存两腿的盘口或池状态、交易规则、时间戳和原始证据。
-3. **确定相同净 Token 数量。**结合数量步长和手续费扣除资产，使买卖两腿对应相同的库存变动。
-4. **分别计算两腿报价。**根据采集到的流动性，计算总买入支出和卖出收入。
-5. **附加成本证据。**记录各项费用，并标明是否已包含在报价中。
-6. **评估路由。**计算场景净价差，检查时间、完整性和必需证据。
-7. **发布与检查。**保存完整路由数据包，通过 API 展示结果，并保留场景不可用的原因。
+### SHIB：Uniswap V2 ↔ ShibaSwap V1
 
-```text
-场景净收益 = 扣除卖出手续费后的收入
-           − 包含买入手续费的支出
-           − 额外适用的路由成本
-```
+两个 RPC 供应商在同一 finalized 区块交叉核对 35 项逻辑读取，形成 70 条供应商观测。
+研究以同一原始 SHIB 数量计算两个方向、五档规模。
+留存的十个场景，其池费调整后价差均非正。
+仓库包含[公共快照](research/shib_v2v2/data/public/research/shib-v2v2/latest.json)
+和[计算实现](research/shib_v2v2/scripts/shib_v2_research.py)。
 
-每项成本只计入一次。当前公共 CEX 流程采用明确的双边预置库存场景，并返回 `research_estimate` 或 `unavailable` 分类及相应成本记录。
+### Foundry：历史双市场执行工具
 
-### 参考工作流
+[UNI/WETH 执行器](foundry/src/TwoVenueV2Executor.sol)通过 Uniswap 和 SushiSwap
+完成 WETH → UNI → WETH，校验 router 身份、调用者、库存和残留余额。
+当前交换参数使用 `amountOutMin=0`，截止时间为 `block.timestamp + 60`。
+[单元/fork 测试及工具链入口](foundry/README.md)介绍了回放流程。
 
-| 工作流 | 市场与场景清单 | 实现内容 |
-| --- | --- | --- |
-| 公共 CEX 机会研究 | Binance 与 Bybit；UNI/USDT、CAKE/USDT；四个有向路由 × 五档规模 | 实时采集、数量匹配、公共费率证据、完整数据包发布、API 和看板。 |
-| V3 精确执行 | Ethereum UNI/USDT 与 UNI/WETH；两个池 × 两个方向 × 五档规模 | 共享整数交换引擎、固定状态采集、QuoterV2 校验和两池 canary 工具。 |
-| SHIB 池间对比 | Ethereum Uniswap V2 与 ShibaSwap V1 的 SHIB/WETH；两个路由 × 五档规模 | 最终确认区块采集、两个供应商交叉核对 35 项逻辑读取，以及确定性的池费调整后价差计算。 |
-| 历史机会研究 | 固定状态下的路由场景 | Foundry/RPC 回放、扫描、证据校验和历史结果展示工具。 |
+## 实现导航
 
-### 已记录的 CEX 观测
+| 模块 | 默认分支源码 |
+| --- | --- |
+| 市场数据应用 | [dashboard/](dashboard/)、[采集脚本](scripts/run_collection_cycle.py) |
+| V3 整数引擎 | [uniswap_v3_math.py](research/v3_exact/scripts/uniswap_v3_math.py) |
+| V3 状态、深度与 Quoter 对照 | [fetch_dex_depth.py](research/v3_exact/scripts/fetch_dex_depth.py) |
+| V3 两池注册表 | [uniswap_v3_execution_markets.json](research/v3_exact/config/uniswap_v3_execution_markets.json) |
+| SHIB V2 研究 | [shib_v2_research.py](research/shib_v2v2/scripts/shib_v2_research.py) |
+| Foundry 回放 | [TwoVenueV2Executor.sol](foundry/src/TwoVenueV2Executor.sol) |
+| UNI 采集与校验 | [采集器](scripts/uni_cex_v3_experiment.py)、[分析器](scripts/analyze_uni_cex_v3_experiment.py)、[离线复现](scripts/replay_uni_cex_v3.py) |
+| 来源版本 | [固定提交与文件哈希](research/sources.json) |
 
-[2026-09-05 公共采集记录](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/live-cex-multi-token-acceptance-2026-09-05.md)覆盖了全部四个配置的 CEX 市场，并发布 20 行场景。在 1,000 美元规模下，UNI 的研究净收益为：Bybit → Binance **−3.5735828 美元**，Binance → Bybit **−4.35663 美元**。CAKE 场景记录了缺少精确交易对费率证据的原因。验收记录包含采集时间、来源哈希、费用处理和新鲜度检查。
+根目录应用和 Foundry 来源为 `83e66079`；独立 V3、SHIB 模块分别保留 `401eaad1`、
+`b16ee24d`。[研究索引](docs/research-index.md)串联命令、测试、证据和来源版本。
 
-## 快速开始
+## 复现研究
 
-### 1. 获取应用与研究演示
-
-默认 `main` 分支提供项目介绍和导航。以下分支包含看板、市场采集器、实时 CEX 工作流和历史演示：
+克隆默认分支，使用 Python 3.10+ 运行离线工作流：
 
 ```bash
-git clone --branch codex/historical-foundry-opportunity \
-  https://github.com/lzd705/CEX-DEX-analysis.git
+git clone https://github.com/lzd705/CEX-DEX-analysis.git
 cd CEX-DEX-analysis
+python3 scripts/run_research.py list
+python3 scripts/run_research.py v3-math
+python3 scripts/run_research.py shib-replay
+python3 scripts/run_research.py uni-v3-replay
 ```
 
-演示程序使用 Python 标准库。应用和演示使用 Python 3.8 或更新版本；Foundry 回放工具链使用独立的固定运行环境配置。
+V3 命令运行 23 项数学测试；SHIB 回放检查与留存快照的字节一致性；UNI 回放输出
+观测数量、结果哈希和新建的本地输出路径。这三项使用仓库附带证据与 Python 标准库。
 
-### 2. 打开离线工作流演示
+检查源码版本和双语导航：
 
 ```bash
-python3 scripts/run_historical_opportunity_demo.py --port 0
+python3 scripts/verify_research_sources.py
+python3 scripts/check_research_docs.py
 ```
 
-打开程序输出的 URL。该演示生成十个确定性合成场景，展示校验、API 交付、筛选和历史结果呈现流程。
+应用采集与看板运行见[看板操作文档](dashboard/README.md)；
+Foundry 回放使用[固定工具链](config/historical_foundry_replay_toolchain.json)。
 
-运行封装的 Current Opportunity 工作流演示：
+## 后续研究
 
-```bash
-python3 scripts/run_current_opportunity_demo.py --port 0
-```
-
-该演示使用两个合成 AAA/WETH V2 池和五档交易规模。打开程序输出的完整 URL，进入 fixture 视图。两个程序均管理临时本地数据，按 `Ctrl-C` 结束。
-
-### 3. 采集当前公共 CEX 报价
-
-核对[公共费率配置](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/config/cex_public_fee_schedules.csv)中的官方来源、精确交易对、审核时间与到期时间，然后选择绝对路径作为输出目录：
-
-```bash
-python3 scripts/run_live_cex_opportunity.py \
-  --data-dir /absolute/path/to/market-data \
-  --public-fee-schedule config/cex_public_fee_schedules.csv \
-  --serve --port 8765
-```
-
-程序采集公共盘口与交易规则、发布新数据包、验证冷加载，并输出看板 URL。每个批次的报价有效期为 120 秒；重新采集生成新的批次。
-
-### 4. 使用采集数据运行市场看板
-
-```bash
-python3 scripts/run_collection_cycle.py --profile full --publish-local
-npm --prefix dashboard install
-./scripts/run_dashboard.sh
-```
-
-打开 `http://127.0.0.1:8765`。`daily` 和 `depth` 采集配置分别支持不同更新周期；已有审核 CSV 可通过 `scripts/import_local_snapshot.py` 导入。
-
-## 仓库导航
-
-| 分支 | 定位 | 入口 |
-| --- | --- | --- |
-| [`main`](https://github.com/lzd705/CEX-DEX-analysis/tree/main) | 项目介绍与导航 | 本 README |
-| [`codex/historical-foundry-opportunity`](https://github.com/lzd705/CEX-DEX-analysis/tree/codex/historical-foundry-opportunity) | 应用、当前 CEX 研究、历史回放与演示 | 推荐快速启动分支 |
-| [`codex/executable-opportunity-pipeline`](https://github.com/lzd705/CEX-DEX-analysis/tree/codex/executable-opportunity-pipeline) | 路由采集批次、数量匹配、成本项和发布流程 | [路由契约](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/executable-opportunity-pipeline/docs/route-cohort-data-contract.md) |
-| [`codex/v3-exact-swap-mvp`](https://github.com/lzd705/CEX-DEX-analysis/tree/codex/v3-exact-swap-mvp) | V3 整数数学与两池精确执行 | [交换引擎](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/v3-exact-swap-mvp/scripts/uniswap_v3_math.py) |
-| [`codex/v3-production-resilience`](https://github.com/lzd705/CEX-DEX-analysis/tree/codex/v3-production-resilience) | V3 采集与运行改进 | [采集运维](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/v3-production-resilience/docs/collection-operations.md) |
-| [`codex/shib-v2v2-research-loop`](https://github.com/lzd705/CEX-DEX-analysis/tree/codex/shib-v2v2-research-loop) | 固定区块下的 SHIB 池间对比与回放 | [研究契约](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/shib-v2v2-research-loop/docs/shib-v2v2-research-contract.md) |
-| [`website-v1`](https://github.com/lzd705/CEX-DEX-analysis/tree/website-v1) | 原始网站框架 | [看板代码](https://github.com/lzd705/CEX-DEX-analysis/tree/website-v1/dashboard) |
-
-早期功能分支保留了市场指标、采集质量、流动性和页面导航的迭代历史，见[完整分支目录](https://github.com/lzd705/CEX-DEX-analysis/branches)。
-
-快速启动分支的应用目录：
-
-```text
-config/                 Token 配置、路由注册表、费率证据与回放策略
-dashboard/              Python API、SQLite 查询和浏览器界面
-scripts/                采集、数学计算、质量检查、发布和演示程序
-data/schema/            版本化数据库结构
-data/curated/           审核后的事件和市场生命周期证据
-docs/                   数据契约、设计说明、验收记录与操作手册
-tests/                  计算、采集、发布、API 和前端测试
-deploy/                 服务和反向代理模板
-foundry/                Foundry 回放工具
-```
-
-采集响应和生成的数据库存储在 Git 忽略的运行目录中。[数据生命周期文档](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/data/README.md)介绍了目录结构和发布顺序。
-
-## 文档导航
-
-- [市场指标与对比](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/market-facts-contract.md)
-- [CEX 深度](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/cex-depth-data-contract.md)
-- [DEX 深度](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/dex-depth-data-contract.md)
-- [执行成本与路由成本项](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/execution-cost-data-contract.md)
-- [路由采集批次与机会发布](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/route-cohort-data-contract.md)
-- [采集周期与质量门槛](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/collection-operations.md)
-- [事件指标](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/event-facts-contract.md)
-- [管理与 Token 审核](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/admin-operations.md)
-- [部署运维](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/production-hardening.md)
-
-## 验证
-
-在应用分支目录下运行：
-
-```bash
-python3 -m unittest discover -s tests -v
-git diff --check
-```
-
-测试涵盖盘口标准化、池计算、数量规则、缺失值处理、来源关联、发布行为、API 契约和前端状态。验收记录保存带日期的真实来源观测及对应代码与证据。
-
-## 后续方向
-
-- 维护带序列号校验的 WebSocket 订单簿，开展更细粒度的机会观测。
-- 接入账户认证费率和交易所特定的费用结算精度。
-- 将交易级 Gas、区块包含延迟和 MEV 场景纳入路由研究。
-- 加入库存约束、再平衡成本和执行反馈测量。
-- 扩展协议适配器，以及连续、多时间窗口的机会实验。
+1. 加入事件时间、接收时间模型，以及实测报价到提交的延迟分布。
+2. 维护带序列校验的 WebSocket 盘口，扩展连续观测窗口。
+3. 接入账户费率、费用结算精度、库存约束、部分成交和对冲恢复。
+4. 使用 fork 执行和交易回执校准 Gas 与交易排序。
+5. 按统一的身份、证据和复现契约扩展路由及协议覆盖。
