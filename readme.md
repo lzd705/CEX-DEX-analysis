@@ -1,117 +1,269 @@
-‘’‘
-一. 网站总目的：用户可以选择token，对比cex和dex两个市场中的价格、成交量、回报率等事实，发现异常或结构性机会。
+# CEX–DEX Market Research
 
-需求1：用户可以针对某个token选择一个交易所或者一个pool去观察差异
-需求2：用户可以了解到这个token的一些基础事实例如价格，
-cex-dex价差，
-成交量，
-回报率，
-波动性，
-需求3：用户可以了解到这个token的流动性和交易成本例如TVL，
-depth，
-滑点，
-交易费率
-需求4：用户可以清晰观察到这个token在两个市场之间的差异，标注出异常值
-需求5：用户可以选择一个时间窗口查看这个token发生的event
-需求6：用户可以了解到数据来源，数据更新时间，数据缺失等问题
+A cross-market research platform for comparing prices, measuring liquidity, estimating execution costs, and evaluating arbitrage across centralized exchanges and on-chain liquidity pools.
 
-。。。
-需求10: 管理员可以直接在网站内部通过输入或选择token，来实现更新数据，且该功能对用户有权限限制
-’‘’
+The project connects a market-data dashboard with quantity-aware quote engines and reproducible opportunity workflows. Its central question is: **how does an observed price difference change after trade size, market depth, fees, and timing are taken into account?**
 
-一. 网站总目的：帮助具备一定市场经验的用户，选择特定 Token、CEX 交易对和 DEX 流动性池，对比其价格、交易活动、收益与流动性状况，识别两个市场之间值得进一步研究的异常差异。网站提供事实与异常信号，不直接把异常解释为可执行的交易或套利机会。
+[Explore the application](https://github.com/lzd705/CEX-DEX-analysis/tree/codex/historical-foundry-opportunity) · [Data contracts](#documentation) · [Run a demo](#quick-start) · [Research workstreams](#repository-map)
 
-需求1:
-选择明确的比较对象
-用户可以选择一个 Token，并分别指定：
-一个 CEX 及其交易对；
-一个 DEX 及其流动性池；
-一个观察时间范围。
-系统应清楚展示交易所、交易对、链、DEX 和 pool，而不只是显示“CEX 平均值”和“DEX 平均值”。
+## What the platform does
 
-需求2:
-了解 Token 的市场表现
-用户可以查看所选 Token 在指定市场中的基础事实，包括：
-当前或每日价格；
-成交额；
-不同周期收益率；
-波动率；
-CEX–DEX 价格差及价差比例。
+| Area | Capabilities |
+| --- | --- |
+| Market comparison | Select a token and two exact markets; compare daily prices, returns, volatility, volume, and price spreads across CEX/CEX, CEX/DEX, or DEX/DEX pairs. |
+| Liquidity analysis | Measure directional depth at 10, 25, 50, and 100 bp from CEX order books and supported DEX pool states. Display pool TVL alongside depth. |
+| Execution-cost research | Quote buys and sells at five trade sizes by walking order books or simulating pool swaps; retain quantities, VWAP, fee scope, and source state. |
+| Opportunity evaluation | Match buy and sell legs on a common token quantity, attach cost evidence, apply timing checks, and publish route-level research results. |
+| Historical replay | Preserve block identities and collection evidence; rebuild fixed-state scenarios through dedicated replay and validation workflows. |
+| Data operations | Run incremental collection, quality audits, snapshot publication, health checks, and authenticated token-review workflows. |
 
-需求3：了解流动性与交易成本
-用户可以查看当前数据能够支持的流动性指标，包括：
-DEX pool TVL；
-CEX 成交额或可用的订单簿深度；
-DEX 预估滑点或价格冲击；
-CEX、DEX 交易费率；
-必要时列出 Gas 成本。
+The application workstream has a **30-token configured universe** and **12 public CEX order-book adapters**. Market availability and usable coverage are reported for each collected snapshot.
 
-需求4：突出跨市场差异和异常
-用户可以通过统一时间轴和同口径指标，清晰比较 CEX 与 DEX 的：
-价格及价差；
-成交额及成交额变化；
-收益率和波动率；
-流动性状况。
-系统根据明确规则标注异常值
+## Architecture
 
+```text
+Public CEX APIs                    DEX APIs + EVM JSON-RPC
+      │                                      │
+      └─────────────── Collectors ────────────┘
+                           │
+                Raw responses + manifests
+                           │
+             Identity, schema, and timing checks
+                           │
+          ┌────────────────┼──────────────────┐
+          │                │                  │
+     Daily facts      Depth + quotes     Route evaluation
+          │                │                  │
+       SQLite       Latest snapshots    Immutable bundles
+          └────────────────┼──────────────────┘
+                           │
+                  Python API + dashboard
+```
 
-需求5: 用户选择 Token 和时间窗口后，可以查看该时间范围内与该 Token 相关的市场事件，辅助理解价格、成交量、价差或流动性异常发生时的市场背景。
-事件信息应包括：
-事件发生时间；
-事件标题与简要说明；
-事件类型，例如上币、下币、协议升级、安全事件、监管动态或代币解锁；
-涉及的 Token、交易所、协议或链；
-信息来源及原始链接；
-事件与异常指标在时间上的对应关系。
+**Stack:** Python, SQLite, Decimal/integer arithmetic, JSON-RPC, JavaScript, HTML/CSS, Docker, Nginx, and systemd. The historical replay workstream also integrates Foundry/Anvil.
 
-用户可以：
-自定义事件观察窗口；
-按事件类型筛选；
-在价格、成交量和价差图表上查看事件标记；
-点击事件查看详情和来源；
-对比事件发生前后一定时间内的市场指标变化。
+Daily time series, point-in-time liquidity, and route cohorts have separate storage and publication lifecycles. The dashboard combines them through explicit market identities and source lineage.
 
+## Data quality
 
-需求6：理解数据口径和限制
-用户可以查看每项指标的数据来源、更新时间、计算方法和缺失情况，
-从而判断不同交易所、交易对和 pool 的数据是否具有可比性。
+Quality checks are part of collection, calculation, publication, and API delivery.
 
+### Market identity and units
 
+- CEX observations retain the exchange, spot instrument, base asset, and quote asset.
+- DEX observations retain chain, protocol, pool address, token addresses, token order, and decimals.
+- Quote-to-USD conversions carry their source and method. USDT-based workflows identify the USD-parity proxy explicitly.
 
-需求10: 增加一个仅限管理员使用的数据更新功能。
-管理员登录后，可以在网站后台输入或选择 Token、开始日期和结束日期，并提交数据更新任务。系统随后自动抓取相应的 CEX、DEX 和价格数据，完成数据清洗、质量检查和因子重新计算，再将更新后的结果发布到公开看板。这样以后更新数据不需要再通过 Codex 手动运行脚本和修改 CSV。
-普通用户只能查看和筛选数据，不能执行更新操作。所有数据修改权限都需要在服务器端进行验证，API 密钥也只能保存在服务器中。为了避免异常数据直接影响网站，新数据应先生成待发布版本，通过检查后再由管理员确认发布，同时保留历史版本，以便出现问题时回滚。
-对于已经配置过的 Token，管理员只需选择 Token 和日期范围；如果是新增 Token，还需要补充所属链、合约地址和交易对等基本信息，不能只根据 Token 名称自动判断。
+### Validity and completeness
 
----
+- Validate schemas, positive book levels, bid/ask ordering, exact scenario inventories, and source hashes.
+- Preserve missing numeric values as `null`; distinguish measured zero, partial coverage, unsupported models, and collection failures.
+- Detect truncated order books. A depth band receives a completeness flag; an incomplete measured band is displayed as an observed lower bound.
+- Calculate coverage against an explicit market inventory. Publication checks evaluate current usable coverage and retention of previously usable markets.
 
-## Website V1 framework
+### Time and reproducibility
 
-本仓库的 `website-v1` 分支提供可复用的 CEX/DEX 研究网站框架。它将公开网站、公开数据快照和内部数据采集流程分开，当前不操作腾讯云生产网站。
+- Retain source timestamps, observation times, collection spans, and block identities where applicable.
+- Read a DEX pool's required state at a fixed block. Dedicated exact/replay workstreams add block-hash binding and canonicality checks.
+- Preserve original responses, manifests, normalized facts, and SHA-256 lineage for inspection and replay.
+- Keep gaps visible in daily charts and calculate daily returns only across adjacent valid dates.
 
-### 本地运行
+See the [collection runbook](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/collection-operations.md) and [data lifecycle](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/data/README.md).
+
+## Depth calculation
+
+Depth measures the quote notional available within a specified distance from a reference price. Buy and sell directions are retained separately.
+
+### CEX order books
+
+For best bid `b`, best ask `a`, and band `k` in basis points:
+
+```text
+midpoint = (b + a) / 2
+bid depth = Σ(price × quantity × quote_to_usd), price ≥ midpoint × (1 − k / 10,000)
+ask depth = Σ(price × quantity × quote_to_usd), price ≤ midpoint × (1 + k / 10,000)
+```
+
+The collector checks whether the returned levels reach the relevant boundaries. This distinguishes complete band measurements from depth limited by an API's level count.
+
+### DEX pool states
+
+- **V2-style pools:** read reserves, token metadata, and the applicable pool fee; use the constant-product model to calculate movement to each price boundary.
+- **V3-style pools:** read `slot0`, active liquidity, fee, tick spacing, tick bitmaps, and initialized ticks. Integrate amounts through successive liquidity segments, updating active liquidity at crossed ticks.
+- **V3 exact-swap workstream:** a dedicated integer engine implements exact-input and exact-output swaps, protocol-style rounding, and bounded tick traversal for UNI/USDT and UNI/WETH, with QuoterV2 comparison tooling.
+
+TVL describes total pool assets; depth describes liquidity along a particular price movement. In concentrated-liquidity pools, their relationship depends on the distribution of liquidity across ticks.
+
+## Execution cost
+
+The standard quote inventory uses **$1K, $5K, $10K, $50K, and $100K**, with a buy and sell scenario at each size.
+
+For a reference notional `N` and reference price `P`:
+
+```text
+target quantity q = N / P, adjusted to the applicable quantity precision
+reference notional = q × P
+
+buy shortfall  = quote paid − reference notional
+sell shortfall = reference notional − quote received
+quoted cost bp = shortfall / reference notional × 10,000
+```
+
+CEX quotes consume the original price levels in order. V2 execution uses integer swap arithmetic. The V3 exact workstream traverses initialized ticks. Each method calculates the requested quantity directly.
+
+### Cost layers
+
+| Layer | Treatment |
+| --- | --- |
+| Spread and price impact | Reflected in order-book walks or pool swap quotes. |
+| Pool swap fee | Included in the pool's swap calculation. |
+| CEX trading fee | Added by the opportunity cost layer with an explicit fee source, rate, and evidence lifetime. |
+| Gas, router fees, transfer tax, and rebalancing | Represented as separate route components with values, applicability, and evidence status. |
+| Timing | Recorded through quote ages, source spans, route deadlines, and cohort freshness. |
+
+The ordinary market quote view measures visible-book shortfall for CEX markets and fee-inclusive swap shortfall for supported V2 pools. The dedicated opportunity layer supplies route-specific costs and assumptions; V3 exact execution lives in its own workstream.
+
+## How an opportunity is evaluated
+
+1. **Select exact markets.** Define the token, buy venue, sell venue, quote assets, direction, and requested size.
+2. **Collect a source cohort.** Save books or pool state, instrument rules, timestamps, and raw evidence for both legs.
+3. **Choose a common net token quantity.** Apply quantity increments and fee-asset rules so both legs refer to the same inventory change.
+4. **Quote each leg.** Calculate total buy expenditure and sell proceeds against the captured liquidity.
+5. **Attach cost evidence.** Record each fee or route component, including whether it is already embedded in a quote.
+6. **Evaluate the route.** Calculate the scenario net edge and check timing, completeness, and required evidence.
+7. **Publish and inspect.** Store the complete route bundle, expose results through the API, and retain reasons for unavailable scenarios.
+
+```text
+scenario net edge = sell proceeds after sell fees
+                  − buy expenditure including buy fees
+                  − additional applicable route costs
+```
+
+Every cost is counted once. Current public CEX workflows use a stated pre-positioned-inventory scenario and return `research_estimate` or `unavailable` classifications with supporting cost records.
+
+### Reference workflows
+
+| Workflow | Markets and scenario inventory | Implementation |
+| --- | --- | --- |
+| Public CEX opportunity | Binance and Bybit; UNI/USDT and CAKE/USDT; four directed routes × five sizes | Live collection, quantity matching, public-fee evidence, complete-bundle publication, API, and dashboard. |
+| V3 exact execution | Ethereum UNI/USDT and UNI/WETH; two pools × two directions × five sizes | Shared integer swap engine, fixed-state collection, QuoterV2 checks, and two-pool canary tooling. |
+| SHIB pool comparison | Ethereum Uniswap V2 and ShibaSwap V1 SHIB/WETH; two routes × five sizes | Finalized-block capture, 35 logical reads checked through two providers, and deterministic pool-fee-adjusted edge calculation. |
+| Historical opportunity | Fixed-state route scenarios | Foundry/RPC replay, scanning, evidence validation, and historical presentation tooling. |
+
+### Recorded CEX observation
+
+The [2026-09-05 public collection](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/live-cex-multi-token-acceptance-2026-09-05.md) captured all four configured CEX markets and published 20 scenario rows. At the $1,000 size, the recorded UNI research net edges were **−$3.5735828** for Bybit → Binance and **−$4.35663** for Binance → Bybit. CAKE rows recorded the missing exact fee evidence. The acceptance record includes collection times, source hashes, fee treatment, and freshness checks.
+
+## Quick start
+
+### 1. Get the application and research demos
+
+The default `main` branch provides this project overview. The following branch contains the dashboard, market collectors, live CEX workflow, and historical demo:
 
 ```bash
+git clone --branch codex/historical-foundry-opportunity \
+  https://github.com/lzd705/CEX-DEX-analysis.git
+cd CEX-DEX-analysis
+```
+
+The demo runners use Python's standard library. Use Python 3.8 or later for the application and demos; the Foundry replay toolchain has its own pinned runtime configuration.
+
+### 2. Open an offline workflow demo
+
+```bash
+python3 scripts/run_historical_opportunity_demo.py --port 0
+```
+
+Open the printed URL. This demo builds ten deterministic synthetic scenarios and exercises validation, API delivery, filtering, and historical result presentation.
+
+For the sealed Current Opportunity workflow:
+
+```bash
+python3 scripts/run_current_opportunity_demo.py --port 0
+```
+
+This demo uses two synthetic AAA/WETH V2 pools and five trade sizes. Open the complete printed URL to activate the fixture view. Both runners manage their temporary local data and stop with `Ctrl-C`.
+
+### 3. Collect current public CEX quotes
+
+Review the official fee sources and exact pair rows in [the public fee schedule](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/config/cex_public_fee_schedules.csv), including their check and expiry times. Then select an absolute output directory:
+
+```bash
+python3 scripts/run_live_cex_opportunity.py \
+  --data-dir /absolute/path/to/market-data \
+  --public-fee-schedule config/cex_public_fee_schedules.csv \
+  --serve --port 8765
+```
+
+The command collects public books and instrument rules, publishes a new bundle, verifies a cold reload, and prints the dashboard URL. Each cohort has a 120-second quote lifetime. A new collection generates a fresh cohort.
+
+### 4. Run the market monitor with collected data
+
+```bash
+python3 scripts/run_collection_cycle.py --profile full --publish-local
 npm --prefix dashboard install
 ./scripts/run_dashboard.sh
 ```
 
-浏览器访问 `http://localhost:8765`。可以通过 `PORT` 环境变量修改端口。
+Open `http://127.0.0.1:8765`. The `daily` and `depth` collection profiles support separate update schedules. Existing reviewed CSV inputs can be loaded through `scripts/import_local_snapshot.py`.
 
-### 目录
+## Repository map
+
+| Branch | Role | Entry point |
+| --- | --- | --- |
+| [`main`](https://github.com/lzd705/CEX-DEX-analysis/tree/main) | Project overview and navigation | This README |
+| [`codex/historical-foundry-opportunity`](https://github.com/lzd705/CEX-DEX-analysis/tree/codex/historical-foundry-opportunity) | Application, current CEX research, historical replay, and demos | Recommended quick-start branch |
+| [`codex/executable-opportunity-pipeline`](https://github.com/lzd705/CEX-DEX-analysis/tree/codex/executable-opportunity-pipeline) | Route cohorts, quantity matching, cost components, and publication | [Route contract](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/executable-opportunity-pipeline/docs/route-cohort-data-contract.md) |
+| [`codex/v3-exact-swap-mvp`](https://github.com/lzd705/CEX-DEX-analysis/tree/codex/v3-exact-swap-mvp) | V3 integer math and two-pool exact execution | [Swap engine](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/v3-exact-swap-mvp/scripts/uniswap_v3_math.py) |
+| [`codex/v3-production-resilience`](https://github.com/lzd705/CEX-DEX-analysis/tree/codex/v3-production-resilience) | V3 collection and operational follow-up | [Collection operations](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/v3-production-resilience/docs/collection-operations.md) |
+| [`codex/shib-v2v2-research-loop`](https://github.com/lzd705/CEX-DEX-analysis/tree/codex/shib-v2v2-research-loop) | Fixed-block SHIB pool comparison and replay | [Research contract](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/shib-v2v2-research-loop/docs/shib-v2v2-research-contract.md) |
+| [`website-v1`](https://github.com/lzd705/CEX-DEX-analysis/tree/website-v1) | Original website framework | [Dashboard](https://github.com/lzd705/CEX-DEX-analysis/tree/website-v1/dashboard) |
+
+Earlier feature branches preserve the development history of market facts, collection quality, liquidity, and navigation. Browse the [complete branch directory](https://github.com/lzd705/CEX-DEX-analysis/branches) for those iterations.
+
+Application layout in the quick-start branch:
 
 ```text
-dashboard/          Python 服务和静态前端
-data/public/        允许公开网站读取的数据快照
-scripts/            本地运行与后续发布脚本
-tests/              数据边界和服务测试
-Dockerfile          腾讯云或其他容器环境的运行定义
+config/                 Token universe, route registries, fee evidence, replay policies
+dashboard/              Python API, SQLite queries, and browser interface
+scripts/                Collection, math, quality checks, publication, and demo runners
+data/schema/            Versioned database schemas
+data/curated/           Reviewed events and market-lifecycle evidence
+docs/                   Data contracts, design notes, acceptance records, and runbooks
+tests/                  Calculation, collection, publication, API, and frontend tests
+deploy/                 Service and reverse-proxy templates
+foundry/                Foundry replay harness
 ```
 
-### 腾讯云替换原则
+Collected responses and generated databases live in Git-ignored runtime directories. The [data lifecycle guide](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/data/README.md) explains their structure and publication sequence.
 
-新版最终可以沿用旧网站的腾讯云环境和域名，但部署前应先备份旧网站代码、配置和可恢复数据。先使用临时端口验证新版，再切换原域名；确认稳定后才永久删除旧内容。本分支不执行生产删除或域名切换。
+## Documentation
 
-### 数据边界
+- [Market facts and comparison](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/market-facts-contract.md)
+- [CEX depth](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/cex-depth-data-contract.md)
+- [DEX depth](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/dex-depth-data-contract.md)
+- [Execution cost and route cost components](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/execution-cost-data-contract.md)
+- [Route cohorts and opportunity publication](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/route-cohort-data-contract.md)
+- [Collection schedules and quality gates](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/collection-operations.md)
+- [Event facts](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/event-facts-contract.md)
+- [Administration and token review](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/admin-operations.md)
+- [Deployment operations](https://github.com/lzd705/CEX-DEX-analysis/blob/codex/historical-foundry-opportunity/docs/production-hardening.md)
 
-Docker 镜像只复制 `dashboard/` 和 `data/public/`。`data/raw/`、`data/a_review/`、本地状态、API 密钥和内部研究文件不得进入公开镜像。网站中的异常是研究线索，不代表可执行套利机会。
+## Verification
+
+From an application checkout:
+
+```bash
+python3 -m unittest discover -s tests -v
+git diff --check
+```
+
+Tests cover book normalization, pool calculations, quantity rules, missing-value handling, lineage, publication behavior, API contracts, and frontend state. Acceptance records document dated live-source observations alongside the corresponding code and evidence.
+
+## Next milestones
+
+- Maintain sequenced WebSocket order books for finer-grained opportunity observation.
+- Integrate authenticated account fees and venue-specific settlement precision.
+- Extend route research with transaction-level gas, inclusion delay, and MEV scenarios.
+- Add inventory constraints, rebalancing economics, and execution-feedback measurements.
+- Expand protocol adapters and continuous, multi-window opportunity experiments.
